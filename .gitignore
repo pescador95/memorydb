@@ -1,0 +1,77 @@
+.github/*.md
+.github/**/*.md
+# Binários gerados
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Binários compilados
+/bin/
+/dist/
+/build/
+
+# Arquivos de teste
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Dependências antigas (se usar GOPATH)
+pkg/
+
+# IDEs e editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Variáveis de ambiente
+.env
+.env.*
+
+# Logs
+*.log
+
+# Markdown da pasta .github
+.github/**/*.md
+
+# Secrets e variáveis de ambiente
+.env
+.env.*
+!.env.example
+
+# Chaves e certificados
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+
+# Configurações locais
+config.local.yaml
+config.local.yml
+config.local.json
+config.dev.yaml
+config.dev.yml
+secrets.yaml
+secrets.yml
+secrets.json
+
+# Credenciais de provedores cloud
+credentials.json
+credentials.yaml
+service-account.json
+
+# Terraform (se usar)
+*.tfvars
+*.tfvars.json
+
+# Arquivos de configuração local
+local.*
