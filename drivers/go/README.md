@@ -111,7 +111,7 @@ go mod init minha-api
 Após a publicação de uma versão do driver e de suas dependências, execute:
 
 ```bash
-go get github.com/pescador95/memorydb/drivers/go@vX.Y.Z
+go get github.com/pescador95/memorydb/drivers/go@v0.1.0
 ```
 
 Substitua `vX.Y.Z` pela versão publicada que deseja utilizar.
@@ -465,7 +465,9 @@ func main() {
     mux.HandleFunc("DELETE /memory/{key}", api.Delete)
 
     log.Println("API disponível em :8080")
-    log.Fatal(http.ListenAndServe(":8080", mux))
+    if err := http.ListenAndServe(":8080", mux); err != nil {
+    log.Printf("Erro no servidor HTTP: %v", err)
+}
 }
 ```
 
