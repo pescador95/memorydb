@@ -103,7 +103,7 @@ O `codec.Codec` desacopla a implementação do handler da serialização concret
 
 O transporte TCP genérico é responsável pelo enquadramento das mensagens e pela comunicação com `net.Conn`. Ele não conhece Protocol Buffers nem o modelo interno do servidor.
 
-O `Engine`, por outro lado, ainda depende diretamente de `*storage.Storage`. Não existe atualmente uma interface de armazenamento que permita substituir a implementação sem modificar o engine.
+O `Engine` depende diretamente de `*storage.Storage`, em vez de consumir uma interface que abstraia o armazenamento.
 
 ## Componentes principais
 
@@ -131,9 +131,10 @@ Comportamentos implementados:
 - DELETE retorna sucesso e informa se a chave foi removida.
 - O `RequestID` da solicitação é preservado na resposta.
 
-O engine cria e mantém diretamente uma instância concreta de `storage.Storage`.
+O `Engine` depende diretamente de `*storage.Storage`, sem uma interface intermediária para abstrair o armazenamento.
 
 Arquivos principais:
+
 - `server/internal/engine/engine.go`
 - `server/internal/engine/command.go`
 
@@ -142,6 +143,7 @@ Arquivos principais:
 Armazena os dados em um mapa em memória.
 
 Características:
+
 - Chaves do tipo `string`.
 - Valores do tipo `[]byte`.
 - Proteção de acesso concorrente com `sync.RWMutex`.
@@ -152,6 +154,7 @@ Características:
 A estrutura `Entry` guarda o valor. Não existe atualmente campo de expiração ou mecanismo de persistência.
 
 Arquivos principais:
+
 - `server/internal/storage/storage.go`
 - `server/internal/storage/entry.go`
 
@@ -160,6 +163,7 @@ Arquivos principais:
 Define a interface `codec.Codec`, responsável por converter o modelo interno em bytes e reconstruir o modelo a partir deles.
 
 Operações:
+
 - `EncodeRequest`
 - `DecodeRequest`
 - `EncodeResponse`
@@ -184,6 +188,7 @@ Arquivo principal: `server/internal/codec/protobuf/codec.go`.
 Módulo independente que implementa o framing e encapsula a conexão TCP.
 
 O protocolo de framing utiliza:
+
 - Prefixo de 4 bytes.
 - Tamanho representado por `uint32`.
 - Ordem de bytes Big Endian.
@@ -191,19 +196,23 @@ O protocolo de framing utiliza:
 - Leitura completa com tratamento de fragmentação.
 - Escrita com tratamento de escritas parciais.
 
-A abstração `Connection` utiliza mutexes separados para leitura e escrita, permitindo uma operação de leitura e outra de escrita simultaneamente, enquanto serializa operações concorrentes do mesmo tipo.
+A abstração `Connection` permite leitura e escrita simultâneas, mas serializa operações concorrentes do mesmo tipo por meio de mutexes independentes. O fechamento da conexão interrompe operações de I/O bloqueadas.
 
 Arquivos principais:
+
 - `transport/tcp/go/framing.go`
 - `transport/tcp/go/connection.go`
 
 Esse módulo não depende de Protobuf, do engine ou do servidor.
+
+As funções públicas `ReadFrame` e `WriteFrame` também validam a presença de seus respectivos leitores e escritores, retornando erro quando recebem interfaces nulas.
 
 ### Handler — `server/internal/transport/tcp`
 
 O `Handler` conecta o transporte TCP ao codec e ao engine.
 
 Para cada conexão:
+
 1. Cria a abstração de conexão TCP.
 2. Lê um frame.
 3. Decodifica a solicitação.
@@ -212,7 +221,7 @@ Para cada conexão:
 6. Escreve o frame de resposta.
 7. Repete o processo enquanto a conexão permanecer aberta.
 
-Erros de leitura, decodificação, execução de transporte ou escrita encerram o processamento da conexão. Uma falha de decodificação não gera uma resposta estruturada de aplicação.
+Erros de leitura do frame, decodificação da solicitação, codificação da resposta ou escrita do frame encerram o processamento da conexão. Uma falha de decodificação não gera uma resposta estruturada de aplicação.
 
 Arquivo principal: `server/internal/transport/tcp/handler.go`.
 
@@ -233,6 +242,7 @@ Arquivo principal: `server/internal/transport/tcp/server.go`.
 Biblioteca cliente que permite aplicações Go se conectarem ao MemoryDB sem depender dos pacotes internos do servidor.
 
 Responsabilidades:
+
 - Estabelecer conexão TCP.
 - Enviar e receber frames.
 - Codificar e decodificar mensagens Protobuf.
@@ -240,10 +250,29 @@ Responsabilidades:
 - Expor operações PING, SET, GET e DELETE.
 - Converter respostas de erro do servidor em erros Go.
 - Serializar operações concorrentes do cliente no modelo sequencial de requisição/resposta.
+- Permitir controle de estabelecimento de conexão e de operações por meio de `context.Context`.
+- Gerenciar o ciclo de vida da conexão e impedir a reutilização de clientes encerrados ou que sofreram falhas de comunicação.
 
-A implementação atual não oferece multiplexação de requisições, reconexão automática ou operações com contexto e timeout configurável.
+A API oferece os métodos convencionais `Dial`, `Ping`, `Set`, `Get` e `Delete`, além de suas variantes com contexto: `DialContext`, `PingContext`, `SetContext`, `GetContext` e `DeleteContext`.
+
+`DialContext` utiliza o contexto para controlar o estabelecimento da conexão. O contexto utilizado nessa etapa não fica associado às operações posteriores do cliente.
+
+Nas operações, o contexto permite cancelar a espera para iniciar uma operação ou interromper uma operação de rede em andamento. Quando o cancelamento ocorre durante a comunicação, a conexão é encerrada e o cliente passa para o estado `failed`. Essa decisão evita reutilizar uma conexão cujo estado de execução da solicitação no servidor pode ser desconhecido.
+
+O cliente possui três estados internos:
+
+- `open`: conexão disponível para operações.
+- `closed`: cliente encerrado explicitamente por `Close`.
+- `failed`: conexão invalidada após falha de comunicação ou protocolo.
+
+As operações são serializadas por um mecanismo de exclusão mútua baseado em canal, permitindo que apenas uma solicitação utilize a conexão por vez. Isso evita que respostas de operações concorrentes sejam associadas incorretamente às requisições.
+
+Erros de aplicação retornados pelo servidor não invalidam automaticamente a conexão. Falhas de transporte ou de protocolo, por outro lado, tornam o cliente indisponível.
+
+O cliente não oferece multiplexação de requisições, reconexão automática ou recuperação transparente de operações interrompidas.
 
 Arquivos principais:
+
 - `drivers/go/client.go`
 - `drivers/go/client_test.go`
 
@@ -260,6 +289,7 @@ Arquivo principal: `api/client/main.go`.
 Ponto de composição da aplicação.
 
 Responsabilidades:
+
 - Obter o endereço de escuta da variável `MEMORYDB_ADDR`.
 - Utilizar `:6380` como endereço padrão.
 - Instanciar o codec Protobuf.
@@ -420,7 +450,7 @@ Não há persistência, identificação de tenant, timestamp ou expiração de e
 | Biblioteca padrão `encoding/binary` | Codificação do tamanho dos frames |
 | Biblioteca padrão `io` | Leitura e escrita completas |
 | Biblioteca padrão `sync` | Sincronização de acesso |
-| Biblioteca padrão `context` | Controle do shutdown |
+| Biblioteca padrão `context` | Controle do shutdown e cancelamento de operações no driver Go |
 | `MEMORYDB_ADDR` | Endereço do listener do servidor |
 | `:6380` | Endereço padrão do servidor |
 | `go.work` | Coordenação dos módulos durante o desenvolvimento |
@@ -440,15 +470,15 @@ Não há persistência, identificação de tenant, timestamp ou expiração de e
 2. **Domínio não formalizado:** o modelo interno representa comandos, resultados e mensagens, mas não há uma camada explícita de entidades ou value objects.
 3. **Observabilidade incompleta:** o erro retornado por `Handler.Handle` é descartado pela goroutine do servidor; não há registro estruturado de falhas de conexão nesse ponto.
 4. **Shutdown sem encerramento forçado:** o servidor fecha o listener e aguarda as conexões, mas não mantém uma estratégia de fechamento forçado das conexões ativas.
-5. **Limites operacionais incompletos:** não há timeout configurável de leitura/escrita ou limite de conexões concorrentes.
-6. **Segurança de transporte ausente:** TLS, autenticação e autorização não estão implementados.
+5. **Limites operacionais incompletos:** não há política configurável de timeout de leitura e escrita no servidor ou limite de conexões concorrentes. O driver Go permite utilizar contextos com cancelamento e deadline nas operações, mas o cancelamento durante I/O invalida a conexão.
+6. **Multiplexação ausente:** o protocolo possui `request_id`, mas o driver atual trabalha com uma solicitação por vez em cada conexão. O identificador permite correlacionar requisições e respostas, mas não implementa processamento concorrente de solicitações na mesma conexão.
 7. **Persistência ausente:** os dados são perdidos quando o processo termina.
 8. **TTL não implementado:** o campo existe no contrato, mas valores positivos são rejeitados.
-9. **Multiplexação ausente:** o protocolo possui `request_id`, mas o driver atual trabalha com uma solicitação por vez em cada conexão.
 
 ## Testes e validação
 
 O projeto possui testes para:
+
 - Armazenamento e concorrência.
 - Execução de comandos no engine.
 - Conversão Protobuf.
@@ -466,3 +496,17 @@ Na validação consolidada mais recente, foram executados `go test -race -count=
 - `api`
 
 Todos os testes e verificações de `go vet` passaram nessa execução.
+
+Além dos testes automatizados, foi executada uma validação manual ponta a ponta em 15/11/2026, utilizando o servidor real e a aplicação `api/client`.
+
+O fluxo validado foi:
+
+1. Conexão TCP e PING.
+2. SET de uma chave.
+3. GET e conferência do valor.
+4. DELETE da chave.
+5. Novo GET, confirmando que a chave não foi encontrada.
+
+Resultado: ciclo completo executado com sucesso.
+
+Os testes do driver também cobrem operações com contexto, cancelamento antes da execução, cancelamento durante espera pelo acesso à conexão, interrupção de I/O por cancelamento ou deadline, fechamento concorrente e falhas de comunicação.

@@ -10,16 +10,18 @@ As operações implementadas são PING, SET, GET e DELETE. O campo `ttl_ms` exis
 
 O armazenamento compartilha dados entre as conexões da mesma instância e protege o mapa contra acesso concorrente. Os valores são mantidos exclusivamente em memória e perdidos quando o processo é encerrado.
 
-A arquitetura separa armazenamento, execução de comandos, protocolo interno, codec, transporte TCP, servidor e drivers. O projeto já possui um driver Go inicial e estrutura para evolução de clientes em outras linguagens.
+A arquitetura separa armazenamento, execução de comandos, protocolo interno, codec, transporte TCP, servidor e drivers. O projeto possui um driver Go com operações básicas, suporte a `context.Context`, serialização de operações concorrentes e tratamento de falhas de comunicação e protocolo.
 
-Não há persistência, autenticação ou TLS implementados. O serviço não deve ser exposto a redes não confiáveis sem mecanismos adicionais de proteção.
+O servidor atende múltiplos clientes simultaneamente. Entretanto, o driver Go executa uma operação por vez em cada conexão, sem multiplexação de requisições simultâneas.
+
+Não há persistência, autenticação, autorização ou TLS implementados. O serviço não deve ser exposto a redes não confiáveis sem mecanismos adicionais de proteção.
 
 ## Documentos
 
 - [Arquitetura técnica](./tecnica/ARQUITETURA.md) — visão das camadas, fluxos, contrato TCP/Protobuf, modelo de dados, módulos e dependências.
 - [Catálogo de componentes](./tecnica/COMPONENTES.md) — componentes, responsabilidades, interfaces, arquivos e dependências.
-- [Requisitos retroativos](./requisitos/REQUISITOS.md) — requisitos funcionais e não funcionais, cenários Gherkin, casos de borda e rastreabilidade para código e testes.
-- [Manual do usuário](./usuario/MANUAL.md) — pré-requisitos, inicialização, cliente de demonstração, operações, erros e limitações.
+- [Requisitos e critérios de aceite](./requisitos/REQUISITOS.md) — requisitos funcionais e não funcionais, cenários Gherkin, casos de borda e rastreabilidade para código e testes.
+- [Manual do usuário](./usuario/MANUAL.md) — pré-requisitos, inicialização, cliente de demonstração, operações, utilização do driver Go, erros e limitações.
 
 ## Estrutura modular
 
@@ -35,29 +37,60 @@ O repositório utiliza um workspace Go definido em `go.work`, composto pelos seg
 
 A separação permite evoluir o transporte, o contrato de mensagens e os drivers sem acoplar essas responsabilidades diretamente ao armazenamento e à execução dos comandos.
 
-## Lacunas e próximos passos
+Cada módulo possui seu próprio `go.mod`. O workspace permite desenvolver e testar os módulos locais de forma integrada, sem exigir que estejam publicados como dependências externas.
 
-### P1 — Robustez operacional
+# Lacunas e próximos passos
 
-- **Tratamento e observabilidade de erros:** o servidor ainda descarta erros retornados por `Handler.Handle`. É necessário definir uma estratégia de registro e observabilidade desses erros.
-- **Timeouts e conexões:** implementar timeouts de leitura e escrita, além de avaliar limites de conexões simultâneas e proteção contra clientes lentos.
-- **Encerramento gracioso:** avaliar o comportamento de conexões que permanecem ativas durante o shutdown e definir uma política de encerramento forçado após o timeout.
+As prioridades abaixo representam evoluções possíveis da implementação atual. Não indicam funcionalidades já disponíveis.
+
+## P1 — Robustez operacional
+
+### Tratamento e observabilidade de erros
+
+O servidor ainda descarta erros retornados por `Handler.Handle`. É necessário definir uma estratégia de registro e observabilidade desses erros.
+
+A evolução deve considerar:
+- Registro estruturado de falhas de leitura, escrita e processamento.
+- Diferenciação entre encerramentos esperados e falhas de conexão.
+- Informações suficientes para diagnóstico sem expor dados sensíveis.
+
+### Timeouts e conexões
+
+Implementar políticas configuráveis de timeout de leitura e escrita no servidor, além de avaliar:
+- Limites de conexões simultâneas.
+- Tempo máximo de inatividade.
+- Proteção contra clientes lentos.
+- Comportamento diante de conexões que não concluem o envio de um frame.
+
+### Encerramento gracioso
+
+Avaliar o comportamento de conexões que permanecem ativas durante o shutdown e definir uma política de encerramento forçado após o timeout.
+
+A implementação atual fecha o listener e aguarda as conexões ativas, mas não força seu fechamento quando o contexto expira.
 
 Referências:
+
 - `server/internal/transport/tcp/server.go`
 - `server/internal/transport/tcp/handler.go`
 - `transport/tcp/go/connection.go`
 - `memorydb-roadmap.md`
 
-### P1 — Segurança para implantação
+## P1 — Segurança para implantação
 
 Definir condições seguras de uso antes de disponibilizar o servidor em redes não confiáveis.
 
-Ainda não existem mecanismos de TLS, autenticação ou autorização. Esses recursos precisam ser avaliados e implementados antes de cenários de implantação que exijam proteção das comunicações e controle de acesso.
+Ainda não existem mecanismos de:
+- TLS para proteção da comunicação.
+- Autenticação para identificação de clientes.
+- Autorização para controle das operações permitidas.
+
+Esses recursos precisam ser avaliados e implementados antes de cenários de implantação que exijam proteção das comunicações e controle de acesso.
+
+Também deverá ser avaliada a necessidade de isolamento lógico dos dados por cliente ou tenant.
 
 Referência: `memorydb-roadmap.md`.
 
-### P2 — Completar e estabilizar o contrato externo
+## P2 — Completar e estabilizar o contrato externo
 
 Documentar e definir formalmente:
 
@@ -69,7 +102,9 @@ Documentar e definir formalmente:
 
 O contrato atual está em `protocol/proto/memorydb/v1/memorydb.proto`, e a execução dos comandos está em `server/internal/engine/engine.go`.
 
-### P2 — Avaliar abstração do armazenamento
+A evolução do contrato deve preservar a compatibilidade entre o servidor e os drivers sempre que possível.
+
+## P2 — Avaliar abstração do armazenamento
 
 Atualmente, o Engine depende diretamente de `*storage.Storage`.
 
@@ -78,46 +113,118 @@ Uma interface de armazenamento poderá ser introduzida quando existir uma necess
 A abstração deve ser introduzida sem criar complexidade desnecessária para o MVP.
 
 Referências:
+
 - `server/internal/engine/engine.go`
 - `server/internal/storage/storage.go`
 - `memorydb-roadmap.md`
 
-### P2 — Evoluir os drivers
+## P2 — Evoluir os drivers
 
-O driver Go já possui operações básicas e testes para comunicação, concorrência e tratamento de erros.
+O driver Go possui operações básicas, suporte a `context.Context`, serialização de operações concorrentes e tratamento de falhas de comunicação e protocolo.
 
 Próximos passos incluem avaliar:
-- Timeouts e cancelamento de operações.
+
 - Reconexão e recuperação de falhas.
-- Evolução da API pública do cliente.
+- Evolução e estabilização da API pública do cliente.
 - Implementação e validação de drivers em outras linguagens.
 - Compatibilidade entre diferentes implementações de clientes.
+- Estratégias para lidar com resultados desconhecidos após interrupções de comunicação.
+
+O cancelamento de operações durante comunicação pode invalidar a conexão, pois o resultado da operação no servidor pode ser desconhecido. O cliente deve estabelecer uma nova conexão para continuar operando.
+
+A reconexão automática e a repetição transparente de comandos não fazem parte da implementação atual.
 
 Referências:
+
 - `drivers/go/`
-- `drivers/java/`
 - `memorydb-roadmap.md`
 
-### P3 — Persistência e desempenho
+## P3 — Persistência e desempenho
 
 Persistência, recuperação de dados e benchmarks devem ser avaliados após a consolidação das funcionalidades essenciais do MVP.
 
-Essas evoluções precisam considerar os impactos sobre o modelo de armazenamento, o contrato externo e a arquitetura modular.
+Essas evoluções precisam considerar os impactos sobre:
+
+- O modelo de armazenamento.
+- A consistência e a durabilidade dos dados.
+- O contrato externo.
+- A arquitetura modular.
+- O comportamento concorrente.
+- A recuperação após falhas.
+
+A implementação atual não possui persistência em disco nem metas mensuráveis de latência e throughput.
 
 Referência: `memorydb-roadmap.md`.
 
-## Estado da validação
+## Validação técnica
 
-Em 15/11/2026, os seguintes módulos passaram pela execução de testes com detector de condições de corrida e pela análise estática:
+Na validação registrada em 15/11/2026, foram executados os testes automatizados com detector de condições de corrida e a análise estática nos módulos do workspace:
 
 | Módulo | `go test -race -count=1 ./...` | `go vet ./...` |
 |---|---|---|
-| `protocol/generated/go` | Aprovado | Aprovado |
+| `protocol/generated/go` | Aprovado — sem testes próprios | Aprovado |
 | `transport/tcp/go` | Aprovado | Aprovado |
 | `drivers/go` | Aprovado | Aprovado |
 | `server` | Aprovado | Aprovado |
-| `api` | Aprovado | Aprovado |
+| `api` | Aprovado — sem testes próprios | Aprovado |
 
-A cobertura atual inclui testes de framing, codec Protobuf, engine, storage, handler TCP, servidor, integração e driver Go.
+Os testes automatizados abrangem, entre outros aspectos:
 
-A aprovação desses testes representa o estado validado na data indicada; não significa que as lacunas operacionais, de segurança ou de funcionalidades futuras estejam resolvidas.
+- Operações do engine e do storage.
+- Concorrência no armazenamento.
+- Codificação e decodificação Protobuf.
+- Framing TCP, fragmentação, limites e escritas parciais.
+- Atendimento de múltiplas conexões.
+- Compartilhamento de armazenamento entre clientes.
+- Operações e concorrência no driver Go.
+- Cancelamento, deadlines e falhas de comunicação.
+- Encerramento do servidor.
+
+Todos os comandos terminaram sem falhas na execução registrada.
+
+**Observação:** essa validação comprova o estado dos testes na data da execução. Alterações futuras no código exigem nova execução para manter essa evidência atualizada.
+
+## Validação ponta a ponta
+
+Em 15/11/2026, foi executado um teste manual de integração utilizando o servidor real e a aplicação cliente de demonstração.
+
+Fluxo validado:
+
+1. Estabelecimento da conexão TCP.
+2. Execução de PING.
+3. Armazenamento de uma chave por SET.
+4. Recuperação do valor por GET.
+5. Remoção da chave por DELETE.
+6. Nova consulta por GET, confirmando que a chave não existe mais.
+
+Resultado observado:
+
+```text
+MemoryDB conectado com sucesso!
+SET: chave "user:1" armazenada
+GET: memorydb
+DELETE: chave removida = true
+GET após DELETE: chave encontrada = false
+```
+
+Essa execução valida a integração entre o servidor, o transporte TCP, o protocolo Protobuf e o driver Go.
+
+Trata-se de uma verificação manual complementar aos testes automatizados, não de uma substituição deles.
+
+## Estado geral do projeto
+
+A implementação atual contempla o núcleo funcional do MemoryDB:
+
+- Servidor TCP com conexões persistentes.
+- Protocolo Protobuf com contrato definido.
+- Framing independente da serialização.
+- Engine com PING, SET, GET e DELETE.
+- Storage em memória com proteção concorrente.
+- Driver Go com suporte a contextos.
+- Atendimento concorrente de múltiplos clientes.
+- Shutdown gracioso com contexto.
+- Testes automatizados e validação ponta a ponta.
+
+As lacunas descritas neste documento representam evoluções futuras e limitações conhecidas. Elas não devem ser confundidas com funcionalidades já implementadas.
+
+O roadmap registra o planejamento de desenvolvimento; esta documentação apresenta a arquitetura, o comportamento e o estado verificável da implementação atual.

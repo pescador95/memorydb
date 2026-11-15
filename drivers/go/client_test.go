@@ -1,6 +1,7 @@
 package memorydb
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	memorydbpb "github.com/pescador95/memorydb/protocol/generated/go/memorydb/v1"
 	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
@@ -244,6 +246,10 @@ func TestClientServerError(t *testing.T) {
 	if serverError.Message != "erro simulado pelo servidor" {
 		t.Fatalf("mensagem inesperada: %s", serverError.Message)
 	}
+
+	if err := client.Ping(); err != nil {
+		t.Fatalf("cliente deveria continuar utilizável após ServerError: %v", err)
+	}
 }
 
 func TestClientConcurrentRequests(t *testing.T) {
@@ -425,8 +431,12 @@ func TestClientRejectsUnexpectedResponseType(t *testing.T) {
 		t.Fatal("esperava erro para tipo de resposta inesperado")
 	}
 
-	if !strings.Contains(err.Error(), "unexpected PING response") {
+	if !strings.Contains(err.Error(), "unexpected response") {
 		t.Fatalf("erro inesperado: %v", err)
+	}
+
+	if err := client.checkState(); err == nil {
+		t.Fatal("esperava cliente em estado inválido")
 	}
 }
 
@@ -471,8 +481,12 @@ func TestClientRejectsErrorResponseWithoutDetails(t *testing.T) {
 		t.Fatal("esperava erro para resposta sem detalhes")
 	}
 
-	if !strings.Contains(err.Error(), "request 1 failed") {
+	if !strings.Contains(err.Error(), "missing error details") {
 		t.Fatalf("erro inesperado: %v", err)
+	}
+
+	if err := client.checkState(); err == nil {
+		t.Fatal("esperava cliente em estado inválido")
 	}
 }
 
@@ -529,6 +543,11 @@ func TestClientReadFailureAfterServerDisconnect(t *testing.T) {
 	if !strings.Contains(err.Error(), "read response") {
 		t.Fatalf("esperava falha de leitura, obtido: %v", err)
 	}
+
+	if err := client.checkState(); err == nil ||
+		!strings.Contains(err.Error(), "failed") {
+		t.Fatalf("esperava cliente no estado failed, obtido: %v", err)
+	}
 }
 
 func TestClientWriteFailureAfterServerDisconnect(t *testing.T) {
@@ -547,5 +566,497 @@ func TestClientWriteFailureAfterServerDisconnect(t *testing.T) {
 	err = client.Ping()
 	if err == nil {
 		t.Fatal("esperava erro ao escrever em conexão encerrada")
+	}
+
+	if err := client.checkState(); err == nil ||
+		!strings.Contains(err.Error(), "failed") {
+		t.Fatalf("esperava cliente no estado failed, obtido: %v", err)
+	}
+}
+
+func TestClientCloseInterruptsBlockedOperation(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	releaseServer := make(chan struct{})
+	defer close(releaseServer)
+	defer serverConn.Close()
+
+	client, err := New(clientConn)
+	if err != nil {
+		t.Fatalf("erro ao criar cliente: %v", err)
+	}
+	defer client.Close()
+
+	requestReceived := make(chan struct{})
+	go func() {
+		connection, err := transporttcp.NewConnection(serverConn)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+
+		if _, err := connection.ReadFrame(); err != nil {
+			return
+		}
+
+		close(requestReceived)
+
+		// Mantém a conexão aberta sem responder à requisição.
+		<-releaseServer
+	}()
+
+	operationDone := make(chan error, 1)
+	go func() {
+		operationDone <- client.Ping()
+	}()
+
+	select {
+	case <-requestReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("servidor não recebeu a requisição dentro do prazo")
+	}
+
+	// O cliente está aguardando uma resposta que não será enviada.
+	if err := client.Close(); err != nil {
+		t.Fatalf("erro ao fechar cliente: %v", err)
+	}
+
+	select {
+	case err := <-operationDone:
+		if err == nil {
+			t.Fatal("esperava erro após fechar cliente durante operação")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close não interrompeu a operação bloqueada")
+	}
+
+	if err := client.checkState(); err == nil ||
+		!strings.Contains(err.Error(), "closed") {
+		t.Fatalf("esperava cliente fechado, obtido: %v", err)
+	}
+}
+
+func TestClientDialContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	client, err := DialContext(ctx, "127.0.0.1:6380")
+	if err == nil {
+		if client != nil {
+			client.Close()
+		}
+		t.Fatal("esperava erro para contexto cancelado")
+	}
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("esperava context.Canceled, obtido: %v", err)
+	}
+}
+
+func TestClientDialContextUnavailableAddress(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("criar listener: %v", err)
+	}
+
+	address := listener.Addr().String()
+
+	if err := listener.Close(); err != nil {
+		t.Fatalf("fechar listener: %v", err)
+	}
+
+	client, err := DialContext(context.Background(), address)
+	if err == nil {
+		client.Close()
+		t.Fatal("esperava erro ao conectar em endereço indisponível")
+	}
+}
+
+func TestClientNewWithNilConnection(t *testing.T) {
+	client, err := New(nil)
+
+	if err == nil {
+		if client != nil {
+			client.Close()
+		}
+		t.Fatal("esperava erro ao criar cliente com conexão nil")
+	}
+
+	if client != nil {
+		t.Fatal("cliente deveria ser nil")
+	}
+}
+
+func TestClientRejectsInvalidRequest(t *testing.T) {
+	tests := []struct {
+		name    string
+		request *memorydbpb.Request
+		wantErr string
+	}{
+		{
+			name:    "requisição nula",
+			request: nil,
+			wantErr: "request cannot be nil",
+		},
+		{
+			name:    "comando ausente",
+			request: &memorydbpb.Request{},
+			wantErr: "request command is missing or unsupported",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			defer serverConn.Close()
+
+			client, err := New(clientConn)
+			if err != nil {
+				t.Fatalf("criar cliente: %v", err)
+			}
+			defer client.Close()
+
+			_, err = client.execute(context.Background(), tt.request)
+			if err == nil {
+				t.Fatal("esperava erro para requisição inválida")
+			}
+
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("erro inesperado: %v", err)
+			}
+
+			if err := client.checkState(); err != nil {
+				t.Fatalf("cliente não deveria ser invalidado: %v", err)
+			}
+		})
+	}
+}
+
+func TestClientContextMethods(t *testing.T) {
+	client := newTestClient(t)
+	ctx := context.Background()
+
+	if err := client.PingContext(ctx); err != nil {
+		t.Fatalf("PING com contexto retornou erro: %v", err)
+	}
+
+	if err := client.SetContext(ctx, "user:context", []byte("memorydb")); err != nil {
+		t.Fatalf("SET com contexto retornou erro: %v", err)
+	}
+
+	value, found, err := client.GetContext(ctx, "user:context")
+	if err != nil {
+		t.Fatalf("GET com contexto retornou erro: %v", err)
+	}
+
+	if !found {
+		t.Fatal("GET deveria encontrar a chave")
+	}
+
+	if string(value) != "memorydb" {
+		t.Fatalf("valor inesperado: %q", value)
+	}
+
+	deleted, err := client.DeleteContext(ctx, "user:context")
+	if err != nil {
+		t.Fatalf("DELETE com contexto retornou erro: %v", err)
+	}
+
+	if !deleted {
+		t.Fatal("DELETE deveria indicar que removeu a chave")
+	}
+}
+
+func TestClientOperationWithCanceledContext(t *testing.T) {
+	client := newTestClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := client.PingContext(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("esperava context.Canceled, obtido: %v", err)
+	}
+
+	if err := client.checkState(); err != nil {
+		t.Fatalf("cliente não deveria ser invalidado: %v", err)
+	}
+
+	if err := client.Ping(); err != nil {
+		t.Fatalf("cliente deveria continuar utilizável: %v", err)
+	}
+}
+
+func TestClientOperationCanceledWhileWaiting(t *testing.T) {
+	client := newTestClient(t)
+
+	// Ocupa o semáforo para impedir outra operação de começar.
+	if err := client.acquireOperation(context.Background()); err != nil {
+		t.Fatalf("adquirir semáforo: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	operationDone := make(chan error, 1)
+
+	go func() {
+		operationDone <- client.PingContext(ctx)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-operationDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("esperava context.Canceled, obtido: %v", err)
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("operação não foi cancelada enquanto aguardava o semáforo")
+	}
+
+	client.releaseOperation()
+
+	if err := client.checkState(); err != nil {
+		t.Fatalf("cliente não deveria ser invalidado: %v", err)
+	}
+
+	if err := client.Ping(); err != nil {
+		t.Fatalf("cliente deveria continuar utilizável: %v", err)
+	}
+}
+
+func TestClientContextCancellationInterruptsBlockedOperation(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	defer serverConn.Close()
+
+	releaseServer := make(chan struct{})
+	defer close(releaseServer)
+
+	requestReceived := make(chan struct{})
+
+	client, err := New(clientConn)
+	if err != nil {
+		t.Fatalf("criar cliente: %v", err)
+	}
+	defer client.Close()
+
+	go func() {
+		connection, err := transporttcp.NewConnection(serverConn)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+
+		if _, err := connection.ReadFrame(); err != nil {
+			return
+		}
+
+		close(requestReceived)
+
+		// Mantém a conexão aberta sem enviar resposta.
+		<-releaseServer
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	operationDone := make(chan error, 1)
+
+	go func() {
+		operationDone <- client.PingContext(ctx)
+	}()
+
+	select {
+	case <-requestReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("servidor não recebeu a requisição dentro do prazo")
+	}
+
+	// Cancela enquanto o cliente aguarda a resposta.
+	cancel()
+
+	select {
+	case err := <-operationDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("esperava context.Canceled, obtido: %v", err)
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelamento não interrompeu a operação bloqueada")
+	}
+
+	if err := client.checkState(); err == nil ||
+		!strings.Contains(err.Error(), "failed") {
+		t.Fatalf("esperava cliente no estado failed, obtido: %v", err)
+	}
+
+	if err := client.Ping(); err == nil {
+		t.Fatal("cliente não deveria aceitar operações após o cancelamento")
+	}
+}
+
+func TestClientContextDeadlineInterruptsBlockedOperation(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	defer serverConn.Close()
+
+	releaseServer := make(chan struct{})
+	defer close(releaseServer)
+
+	requestReceived := make(chan struct{})
+
+	client, err := New(clientConn)
+	if err != nil {
+		t.Fatalf("criar cliente: %v", err)
+	}
+	defer client.Close()
+
+	go func() {
+		connection, err := transporttcp.NewConnection(serverConn)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+
+		if _, err := connection.ReadFrame(); err != nil {
+			return
+		}
+
+		close(requestReceived)
+
+		// Mantém a conexão aberta sem enviar resposta.
+		<-releaseServer
+	}()
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		500*time.Millisecond,
+	)
+	defer cancel()
+
+	operationDone := make(chan error, 1)
+
+	go func() {
+		operationDone <- client.PingContext(ctx)
+	}()
+
+	select {
+	case <-requestReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("servidor não recebeu a requisição dentro do prazo")
+	}
+
+	select {
+	case err := <-operationDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("esperava context.DeadlineExceeded, obtido: %v", err)
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("deadline não interrompeu a operação bloqueada")
+	}
+
+	if err := client.checkState(); err == nil ||
+		!strings.Contains(err.Error(), "failed") {
+		t.Fatalf("esperava cliente no estado failed, obtido: %v", err)
+	}
+}
+
+func TestClientDialContextRejectsNilContext(t *testing.T) {
+	_, err := DialContext(nil, "127.0.0.1:6380")
+
+	if err == nil {
+		t.Fatal("DialContext(nil) expected error, got nil")
+	}
+}
+
+type blockingWriteConn struct {
+	net.Conn
+
+	writeStarted chan struct{}
+	closed       chan struct{}
+
+	writeOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newBlockingWriteConn(conn net.Conn) *blockingWriteConn {
+	return &blockingWriteConn{
+		Conn:         conn,
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (c *blockingWriteConn) Write(p []byte) (int, error) {
+	c.writeOnce.Do(func() {
+		close(c.writeStarted)
+	})
+
+	// Simula uma escrita bloqueada até que a conexão seja encerrada.
+	<-c.closed
+
+	return 0, net.ErrClosed
+}
+
+func (c *blockingWriteConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+	})
+
+	return c.Conn.Close()
+}
+
+func TestClientContextCancellationInterruptsBlockedWrite(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	blockingConn := newBlockingWriteConn(clientConn)
+
+	client, err := New(blockingConn)
+	if err != nil {
+		t.Fatalf("criar cliente: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	operationDone := make(chan error, 1)
+
+	go func() {
+		operationDone <- client.PingContext(ctx)
+	}()
+
+	// Aguarda a operação chegar à escrita da requisição.
+	select {
+	case <-blockingConn.writeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cliente não iniciou a escrita dentro do prazo")
+	}
+
+	// A escrita está bloqueada. O cancelamento deve fechar a conexão.
+	cancel()
+
+	select {
+	case err := <-operationDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("esperava context.Canceled, obtido: %v", err)
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelamento não interrompeu a escrita bloqueada")
+	}
+
+	if err := client.checkState(); err == nil ||
+		!strings.Contains(err.Error(), "failed") {
+		t.Fatalf("esperava cliente no estado failed, obtido: %v", err)
+	}
+
+	if err := client.Ping(); err == nil {
+		t.Fatal("cliente não deveria aceitar operações após o cancelamento")
 	}
 }

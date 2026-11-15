@@ -193,3 +193,38 @@ type zeroWriter struct{}
 func (w *zeroWriter) Write(p []byte) (int, error) {
 	return 0, nil
 }
+
+func TestReadFrameRejectsNilReader(t *testing.T) {
+	_, err := ReadFrame(nil)
+
+	if err == nil {
+		t.Fatal("ReadFrame(nil) expected error, got nil")
+	}
+}
+
+func TestWriteFrameRejectsNilWriter(t *testing.T) {
+	err := WriteFrame(nil, []byte("test"))
+
+	if err == nil {
+		t.Fatal("WriteFrame(nil) expected error, got nil")
+	}
+}
+
+func TestWriteAndReadFrameWithMaximumSize(t *testing.T) {
+	payload := bytes.Repeat([]byte("a"), int(MaxFrameSize))
+
+	var buffer bytes.Buffer
+
+	if err := WriteFrame(&buffer, payload); err != nil {
+		t.Fatalf("WriteFrame() error = %v", err)
+	}
+
+	got, err := ReadFrame(&buffer)
+	if err != nil {
+		t.Fatalf("ReadFrame() error = %v", err)
+	}
+
+	if !bytes.Equal(got, payload) {
+		t.Fatal("payload mismatch for maximum frame size")
+	}
+}

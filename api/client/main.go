@@ -53,5 +53,16 @@ func run() error {
 
 	fmt.Printf("DELETE: chave removida = %t\n", deleted)
 
+	_, foundAfterDelete, err := client.Get(key)
+	if err != nil {
+		return fmt.Errorf("executar GET após DELETE: %w", err)
+	}
+
+	if foundAfterDelete {
+		return fmt.Errorf("chave %q ainda existe após DELETE", key)
+	}
+
+	fmt.Printf("GET após DELETE: chave encontrada = %t\n", foundAfterDelete)
+
 	return nil
 }

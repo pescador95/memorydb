@@ -41,36 +41,40 @@ O projeto tem como objetivo principal aprender e implementar os fundamentos de u
 - Sem multiplexação de requisições em uma mesma conexão.
 - Uma requisição por vez por conexão, com resposta correspondente.
 
+O servidor pode atender múltiplas conexões simultaneamente. Dentro de cada conexão, entretanto, o processamento das requisições é sequencial.
+
 Os dados são perdidos quando o processo do servidor é encerrado.
 
-## 4. Arquitetura planejada
+## 4. Arquitetura implementada
 
-O fluxo principal de comunicação é:
+O fluxo atual de comunicação é:
 
 ```text
 Cliente
-  |
-  v
-Driver Go / Driver Java
-  |
-  v
+   |
+   v
+Driver Go
+   |
+   v
 TCP Transport
-  |
-  v
+   |
+   v
 Framing
-  |
-  v
+   |
+   v
 Codec (Protobuf)
-  |
-  v
+   |
+   v
 Modelo interno de protocolo
-  |
-  v
+   |
+   v
 Engine
-  |
-  v
+   |
+   v
 Storage
 ```
+
+O driver Java permanece como uma implementação futura, devendo consumir o mesmo contrato de comunicação.
 
 ### Responsabilidades
 
@@ -218,6 +222,8 @@ Para delimitar as mensagens, o MemoryDB utiliza framing com prefixo de tamanho f
 - Frames vazios e acima do limite são rejeitados.
 - A leitura utiliza `io.ReadFull` para garantir a leitura completa do frame.
 - A escrita trata escritas parciais.
+- A conexão permite leitura e escrita simultâneas, com sincronização independente para cada direção.
+- O fechamento da conexão interrompe operações de I/O bloqueadas.
 
 ### Protocol Buffers
 
@@ -296,6 +302,8 @@ Os arquivos gerados não devem ser editados manualmente. Alterações devem ser 
 - [x] Tratamento de escritas parciais.
 - [x] Sincronização de leitura e escrita.
 - [x] Gerenciamento de conexões.
+- [x] Interrupção de I/O bloqueado pelo fechamento da conexão.
+- [x] Validação de argumentos inválidos no framing.
 - [x] Testes de framing e comunicação.
 
 ### Fase 5 — Codec e integração com o servidor
@@ -307,7 +315,7 @@ Os arquivos gerados não devem ser editados manualmente. Alterações devem ser 
 - [x] Conversão entre Protobuf e modelo interno.
 - [x] Implementação do Handler TCP.
 - [x] Integração entre transporte, Codec, Engine e Storage.
-- [x] Processamento de múltiplas requisições na mesma conexão.
+- [x] Processamento sequencial de múltiplas requisições na mesma conexão.
 - [x] Tratamento de desconexões.
 - [x] Testes unitários do Codec e Handler.
 
@@ -321,10 +329,12 @@ Os arquivos gerados não devem ser editados manualmente. Alterações devem ser 
 - [x] Compartilhamento do Storage entre clientes.
 - [x] Execução concorrente de conexões.
 - [x] Proteção contra inicialização duplicada.
-- [x] Encerramento gracioso.
-- [x] Espera pelo encerramento das conexões ativas.
-- [x] Tratamento de sinais do sistema operacional.
+- [x] Encerramento gracioso com fechamento do listener.
+- [x] Espera pelo encerramento das conexões ativas, respeitando o contexto de shutdown.
+- [x] Tratamento de sinais do sistema operacional no executável.
 - [x] Configuração do endereço por variável de ambiente (`MEMORYDB_ADDR`).
+
+O encerramento gracioso não representa o fechamento forçado de todas as conexões ativas quando o prazo do contexto expira. Essa política permanece como possível evolução operacional.
 
 ### Fase 7 — Driver Go
 
@@ -332,18 +342,31 @@ Os arquivos gerados não devem ser editados manualmente. Alterações devem ser 
 
 - [x] Criação de módulo independente.
 - [x] Implementação de conexão com o servidor.
+- [x] Implementação de `Dial`.
+- [x] Implementação de `DialContext`.
+- [x] Implementação de `New` para construção a partir de uma conexão existente.
 - [x] Implementação de `PING`.
 - [x] Implementação de `SET`.
 - [x] Implementação de `GET`.
 - [x] Implementação de `DELETE`.
+- [x] Implementação de variantes com `context.Context`.
 - [x] Tratamento de erros do servidor.
 - [x] Validação do `request_id` nas respostas.
 - [x] Tratamento de respostas Protobuf inválidas.
 - [x] Sincronização de requisições concorrentes.
 - [x] Gerenciamento de encerramento da conexão.
-- [x] Testes unitários e de falhas de comunicação.
+- [x] Definição de estados internos do cliente (`open`, `closed` e `failed`).
+- [x] Diferenciação entre erros de aplicação e falhas de transporte ou protocolo.
+- [x] Tratamento de cancelamento e deadlines durante operações.
+- [x] Testes unitários, concorrentes e de falhas de comunicação.
 
 O driver Go utiliza o módulo TCP compartilhado, evitando duplicar a implementação de framing.
+
+As operações concorrentes na mesma instância do cliente são serializadas. O driver não implementa multiplexação de requisições em uma mesma conexão.
+
+O `DialContext` utiliza o contexto para estabelecer a conexão inicial. As operações posteriores recebem seus próprios contextos.
+
+Quando uma operação é cancelada enquanto aguarda a execução, a conexão permanece disponível. Quando o cancelamento ocorre durante o I/O, a conexão é encerrada e o cliente passa para o estado `failed`, pois não é possível garantir se o servidor chegou a executar a operação antes da interrupção da resposta.
 
 ### Fase 8 — API cliente e validação integrada
 
@@ -356,6 +379,7 @@ O driver Go utiliza o módulo TCP compartilhado, evitando duplicar a implementa�
 - [x] Testes de operações concorrentes.
 - [x] Testes de desconexão de clientes.
 - [x] Testes do encerramento do servidor com conexões ativas.
+- [x] Validação manual do fluxo completo de operações.
 
 ### Validação técnica atual
 
@@ -367,12 +391,8 @@ Comandos executados:
 
 ```bash
 for module in protocol/generated/go transport/tcp/go drivers/go server api; do
+    echo "========== TESTANDO $module =========="
     (cd "$module" && go test -race -count=1 ./...) || exit 1
-done
-```
-
-```bash
-for module in protocol/generated/go transport/tcp/go drivers/go server api; do
     (cd "$module" && go vet ./...) || exit 1
 done
 ```
@@ -389,21 +409,29 @@ go vet ./...
 
 Todos os comandos concluíram sem falhas.
 
+Foi realizada também uma validação manual ponta a ponta, iniciando o servidor e utilizando a aplicação cliente para executar `PING`, `SET`, `GET`, `DELETE` e uma leitura posterior à remoção.
+
+A validação integrada foi realizada em 15/11/2026.
+
 ## 9. Próximas fases
 
 ### Fase 9 — Consolidação da arquitetura e documentação
 
-**Status: em andamento**
+**Status: concluída**
 
-- [ ] Revisar a documentação de arquitetura em relação à implementação atual.
-- [ ] Revisar a documentação dos componentes.
-- [ ] Atualizar os requisitos funcionais e não funcionais.
-- [ ] Atualizar o manual de utilização.
-- [ ] Documentar o contrato de framing TCP.
-- [ ] Documentar o fluxo de comunicação entre driver e servidor.
-- [ ] Documentar a utilização do Go Workspace.
-- [ ] Documentar como executar testes em cada módulo.
-- [ ] Revisar as decisões arquiteturais e registrar as justificativas relevantes.
+- [x] Revisar a documentação de arquitetura em relação à implementação atual.
+- [x] Revisar a documentação dos componentes.
+- [x] Atualizar os requisitos funcionais e não funcionais.
+- [x] Atualizar o manual de utilização.
+- [x] Documentar o contrato de framing TCP.
+- [x] Documentar o fluxo de comunicação entre driver e servidor.
+- [x] Documentar a utilização do Go Workspace.
+- [x] Documentar como executar testes nos módulos.
+- [x] Revisar as decisões arquiteturais e registrar as justificativas relevantes.
+
+A documentação foi alinhada ao comportamento implementado, incluindo as limitações atuais do servidor, do transporte e do driver Go.
+
+Novas decisões arquiteturais e mudanças de contrato deverão continuar sendo documentadas conforme o projeto evoluir.
 
 ### Fase 10 — Driver Java
 
@@ -416,6 +444,8 @@ Todos os comandos concluíram sem falhas.
 - [ ] Implementar serialização e desserialização Protobuf.
 - [ ] Implementar `PING`, `SET`, `GET` e `DELETE`.
 - [ ] Implementar tratamento de erros.
+- [ ] Definir o gerenciamento de conexões e operações concorrentes.
+- [ ] Avaliar suporte a cancelamento e deadlines.
 - [ ] Criar testes unitários.
 - [ ] Criar testes de integração com o servidor Go.
 - [ ] Validar interoperabilidade entre os drivers Go e Java.
@@ -442,15 +472,21 @@ A implementação deverá considerar precisão, custo de limpeza e impacto sobre
 
 **Status: planejada**
 
-- [ ] Definir configuração por variáveis de ambiente.
+- [ ] Definir e documentar configurações operacionais adicionais.
 - [ ] Padronizar logs.
-- [ ] Melhorar mensagens e códigos de erro.
-- [ ] Avaliar timeouts de conexão e operações.
+- [ ] Melhorar observabilidade de erros de processamento no servidor.
+- [ ] Revisar e evoluir mensagens e códigos de erro.
+- [ ] Avaliar timeouts de conexão e operações no lado do servidor.
 - [ ] Avaliar limites de conexões simultâneas.
 - [ ] Avaliar limites de tamanho de chave e valor.
-- [ ] Melhorar a API pública dos drivers.
+- [ ] Definir política para encerramento forçado de conexões durante shutdown.
+- [ ] Melhorar a API pública dos drivers conforme novos requisitos.
+- [ ] Avaliar estratégia de reconexão do cliente.
 - [ ] Criar exemplos de utilização.
 - [ ] Criar ferramenta CLI para interação com o servidor.
+- [ ] Avaliar métricas e instrumentação para monitoramento.
+
+A fase deverá priorizar robustez operacional e previsibilidade. O suporte a contextos, deadlines, serialização de operações concorrentes e gerenciamento de estados já faz parte do driver Go atual e não constitui uma pendência desta fase.
 
 ### Fase 13 — Segurança
 
@@ -518,6 +554,8 @@ Essa fase depende de decisões específicas de consistência, disponibilidade e 
 - Não editar manualmente arquivos gerados pelo Protobuf.
 - Preservar compatibilidade entre os drivers e o contrato de comunicação.
 - Registrar limitações conhecidas em vez de implementar comportamentos implícitos.
+- Separar funcionalidades implementadas de evoluções planejadas.
+- Validar alterações nos módulos afetados e, quando necessário, executar a suíte completa do workspace.
 
 ## 11. Critérios de conclusão do MVP
 
@@ -535,9 +573,7 @@ O MVP será considerado concluído quando:
 - [x] Os módulos passarem pelo `go test -race`.
 - [x] Os módulos passarem pelo `go vet`.
 
-**Situação atual:** os critérios técnicos do MVP estão atendidos pela implementação e pelas validações executadas. A consolidação documental e a revisão final da arquitetura permanecem como trabalho da Fase 9.
-
----
+**Situação atual:** os critérios técnicos do MVP estão atendidos pela implementação e pelas validações executadas. A consolidação documental também foi concluída. O projeto pode avançar para as próximas evoluções sem depender de novas funcionalidades para considerar o MVP atual concluído.
 
 ## 12. Visão geral do progresso
 
@@ -551,7 +587,7 @@ O MVP será considerado concluído quando:
 | 6 | Servidor TCP | Concluída |
 | 7 | Driver Go | Concluída |
 | 8 | API e integração | Concluída |
-| 9 | Consolidação e documentação | Em andamento |
+| 9 | Consolidação e documentação | Concluída |
 | 10 | Driver Java | Planejada |
 | 11 | TTL | Planejada |
 | 12 | Robustez e utilização | Planejada |

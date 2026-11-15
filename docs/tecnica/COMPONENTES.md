@@ -9,7 +9,7 @@ Este catálogo descreve os componentes presentes no código atual do MemoryDB. A
 | `Request`, `Response`, comandos e resultados | Modelo interno | Modelo / contrato | `server/internal/protocol/message.go` | Representa solicitações e respostas sem depender de transporte ou Protobuf. | Biblioteca padrão Go |
 | `Engine` | Aplicação / núcleo | Serviço de aplicação | `server/internal/engine/engine.go` | Valida e executa PING, SET, GET e DELETE. | `protocol`; implementação concreta `storage.Storage` |
 | Códigos e resposta de erro | Aplicação / núcleo | Constantes / helper | `server/internal/engine/command.go` | Define `INVALID_REQUEST`, `INVALID_ARGUMENT`, `UNSUPPORTED_FEATURE` e helper de resposta. | `protocol` |
-| `Storage` | Infraestrutura | Adaptador de armazenamento | `server/internal/storage/storage.go` | Mantém mapa chave-valor em memória, protegido por `sync.RWMutex`, copiando bytes na entrada e saída. | Biblioteca padrão `sync`; `Entry` |
+| `Storage` | Infraestrutura | Armazenamento em memória | `server/internal/storage/storage.go` | Mantém mapa chave-valor em memória, protegido por `sync.RWMutex`, copiando bytes na entrada e saída. | Biblioteca padrão `sync`; `Entry` |
 | `Entry` | Modelo de armazenamento | Estrutura de dados | `server/internal/storage/entry.go` | Guarda os bytes de um valor. Não possui campo de TTL. | Biblioteca padrão Go |
 | `Codec` | Port / contrato | Port | `server/internal/codec/codec.go` | Define operações de codificação e decodificação das mensagens internas. | `protocol` |
 | `protobuf.Codec` | Adaptadores | Adapter | `server/internal/codec/protobuf/codec.go` | Converte entre o modelo interno e as mensagens Protobuf geradas. | `codec.Codec`, `protocol`, tipos gerados e runtime Protobuf |
@@ -21,21 +21,31 @@ Este catálogo descreve os componentes presentes no código atual do MemoryDB. A
 
 | Nome | Camada | Tipo | Arquivo | Descrição | Depende de |
 |---|---|---|---|---|---|
-| `Connection` | Transporte | Abstração de conexão | `transport/tcp/go/connection.go` | Encapsula `net.Conn`, serializando leituras e escritas com mutexes separados. | `net.Conn`, `sync` e framing |
-| `ReadFrame` / `WriteFrame` | Transporte | Framing | `transport/tcp/go/framing.go` | Lê e escreve frames com prefixo de tamanho Big Endian e máximo de 1 MiB. | `encoding/binary`, `io` |
+| `Connection` | Transporte | Abstração de conexão | `transport/tcp/go/connection.go` | Encapsula `net.Conn`, permitindo leitura e escrita simultâneas e serializando operações concorrentes do mesmo tipo com mutexes separados. | `net.Conn`, `sync` e framing |
+| `ReadFrame` / `WriteFrame` | Transporte | Framing | `transport/tcp/go/framing.go` | Lê e escreve frames com prefixo de tamanho Big Endian, payload entre 1 byte e 1 MiB e tratamento de operações parciais. | `encoding/binary`, `io` |
 | Schema Protobuf | Integração externa | Contrato de protocolo | `protocol/proto/memorydb/v1/memorydb.proto` | Define envelopes, comandos, resultados, `request_id`, bytes, TTL e erros. | Protocol Buffers |
 | Código Go Protobuf gerado | Integração externa | Código gerado | `protocol/generated/go/memorydb/v1/memorydb.pb.go` | Contém os tipos Go gerados a partir do schema externo. | Schema Protobuf e runtime Protobuf |
+
+O módulo de transporte TCP não depende de Protobuf, do engine ou dos componentes internos do servidor.
+
+As funções públicas `ReadFrame` e `WriteFrame` validam a presença de seus respectivos leitores e escritores, retornando erro quando recebem interfaces nulas.
+
+A abstração `Connection` utiliza mutexes independentes para leitura e escrita. O fechamento da conexão interrompe operações de I/O bloqueadas.
 
 ## Driver Go e cliente de demonstração
 
 | Nome | Camada | Tipo | Arquivo | Descrição | Depende de |
 |---|---|---|---|---|---|
-| `Client` | Integração / cliente | Driver | `drivers/go/client.go` | Expõe operações Go para comunicação com o servidor. | Transporte TCP, tipos Protobuf e biblioteca padrão |
+| `Client` | Integração / cliente | Driver | `drivers/go/client.go` | Expõe operações Go para comunicação com o servidor, controlando o estado e o ciclo de vida da conexão. | Transporte TCP, tipos Protobuf e biblioteca padrão |
 | `ServerError` | Integração / cliente | Tipo de erro | `drivers/go/client.go` | Representa erros estruturados retornados pelo servidor. | Biblioteca padrão Go |
-| Testes do driver | Testes | Testes automatizados | `drivers/go/client_test.go` | Verifica operações, concorrência, erros e desconexões. | Driver Go |
+| Testes do driver | Testes | Testes automatizados | `drivers/go/client_test.go` | Verifica operações, concorrência, contextos, erros e desconexões. | Driver Go |
 | Executável cliente | Apresentação / demonstração | Entry point | `api/client/main.go` | Demonstra o uso do driver Go. | `drivers/go` |
 
-## Interfaces e contratos públicos relevantes
+O driver Go utiliza o módulo de transporte TCP para realizar a comunicação e o módulo de tipos Protobuf gerados para serializar e desserializar as mensagens.
+
+As operações do cliente são sequenciais por conexão. O driver impede que duas operações utilizem simultaneamente a mesma conexão para enviar e receber solicitações.
+
+## Interfaces e APIs públicas relevantes
 
 | Interface ou método | Assinatura / comportamento | Evidência |
 |---|---|---|
@@ -49,11 +59,18 @@ Este catálogo descreve os componentes presentes no código atual do MemoryDB. A
 | `Handler.Handle` | `Handle(net.Conn) error` | `server/internal/transport/tcp/handler.go` |
 | `Server.Serve` | `Serve() error` | `server/internal/transport/tcp/server.go` |
 | `Server.Shutdown` | `Shutdown(context.Context) error` | `server/internal/transport/tcp/server.go` |
-| `Client.Ping` | Envia PING e valida a resposta correspondente. | `drivers/go/client.go` |
-| `Client.Set` | Envia SET com chave, valor e TTL. | `drivers/go/client.go` |
-| `Client.Get` | Consulta uma chave e retorna valor, existência e erro. | `drivers/go/client.go` |
-| `Client.Delete` | Envia DELETE e informa se a chave foi removida. | `drivers/go/client.go` |
-| `Client.Close` | Encerra a conexão do cliente. | `drivers/go/client.go` |
+| `Dial` | Estabelece uma conexão TCP e cria um cliente. | `drivers/go/client.go` |
+| `DialContext` | Estabelece uma conexão TCP utilizando contexto para controlar a conexão inicial. | `drivers/go/client.go` |
+| `New` | Cria um cliente a partir de uma conexão `net.Conn` existente. | `drivers/go/client.go` |
+| `Client.Ping` / `Client.PingContext` | Envia PING e valida a resposta correspondente, com ou sem contexto. | `drivers/go/client.go` |
+| `Client.Set` / `Client.SetContext` | Envia SET com chave, valor e TTL, com ou sem contexto. | `drivers/go/client.go` |
+| `Client.Get` / `Client.GetContext` | Consulta uma chave e retorna valor, existência e erro, com ou sem contexto. | `drivers/go/client.go` |
+| `Client.Delete` / `Client.DeleteContext` | Envia DELETE e informa se a chave foi removida, com ou sem contexto. | `drivers/go/client.go` |
+| `Client.Close` | Encerra a conexão do cliente e impede novas operações. | `drivers/go/client.go` |
+
+Os métodos com contexto permitem controlar o início e a execução das operações. Quando o cancelamento interrompe uma comunicação de rede em andamento, a conexão é encerrada e o cliente passa para o estado `failed`, pois o resultado da solicitação no servidor pode ser desconhecido.
+
+O contexto utilizado em `DialContext` controla apenas o estabelecimento da conexão. Ele não fica associado automaticamente às operações posteriores.
 
 ## Organização dos módulos Go
 
@@ -94,11 +111,11 @@ Dentro do servidor, `codec.Codec` é a única interface explícita que funciona 
 
 ## Observações sobre os componentes
 
-1. **Storage concreto:** o engine instancia e mantém diretamente `storage.Storage`. A substituição do backend exige alteração no engine.
+1. **Storage concreto:** o engine depende diretamente de `*storage.Storage`. A substituição do backend exige alteração no engine. A criação e a composição das dependências são responsabilidades do ponto de entrada da aplicação.
 2. **Modelo interno independente:** os tipos internos não utilizam diretamente os tipos gerados Protobuf.
 3. **Transporte independente:** framing e conexão TCP não conhecem o formato Protobuf.
 4. **Driver desacoplado do servidor:** o driver Go depende dos módulos compartilhados, não dos pacotes internos do servidor.
-5. **Execução sequencial no driver:** um mutex serializa as operações de requisição/resposta. Não há multiplexação de solicitações simultâneas na mesma conexão.
+5. **Execução sequencial no driver:** um mecanismo de exclusão mútua baseado em canal serializa as operações de requisição/resposta. Não há multiplexação de solicitações simultâneas na mesma conexão.
 6. **Erros de conexão:** o `Server.Serve` descarta o erro retornado por `Handler.Handle`; essa falha não é registrada nesse ponto.
 7. **Shutdown:** o servidor aguarda conexões ativas, mas não as fecha diretamente quando o contexto expira.
 8. **TTL:** o contrato Protobuf possui `ttl_ms`, mas a funcionalidade de expiração não está implementada.
@@ -109,13 +126,13 @@ Os testes estão distribuídos junto aos módulos e componentes:
 
 | Área | Local dos testes | Cobertura observada |
 |---|---|---|
-| Framing TCP | `transport/tcp/go/framing_test.go` | Prefixo Big Endian, fragmentação, limites, truncamento e escritas parciais |
-| Driver Go | `drivers/go/client_test.go` | Operações, concorrência, erros e desconexões |
+| Framing TCP | `transport/tcp/go/framing_test.go` | Prefixo Big Endian, fragmentação, limites, truncamento, interfaces nulas e escritas parciais |
+| Driver Go | `drivers/go/client_test.go` | Operações, concorrência, contextos, erros e desconexões |
 | Codec Protobuf | `server/internal/codec/protobuf/codec_test.go` | Round-trip, conversões e mensagens inválidas |
 | Engine | `server/internal/engine/engine_test.go` | Comandos, validações e erros |
 | Storage | `server/internal/storage/storage_test.go` | Operações, cópia de bytes e concorrência |
 | Handler | `server/internal/transport/tcp/handler_test.go` | Processamento sequencial de requisições |
 | Server TCP | `server/internal/transport/tcp/server_test.go` | Aceitação de clientes, concorrência e shutdown |
-| Integração | `server/internal/integration/server_test.go` | Comunicação real entre driver e servidor |
+| Integração | `server/internal/integration/server_test.go` | Comunicação entre driver e servidor |
 
 Na validação consolidada mais recente, todos os módulos passaram por `go test -race -count=1 ./...` e `go vet ./...`.

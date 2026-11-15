@@ -27,6 +27,10 @@ var (
 func ReadFrame(r io.Reader) ([]byte, error) {
 	var header [HeaderSize]byte
 
+	if r == nil {
+		return nil, fmt.Errorf("reader cannot be nil")
+	}
+
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, fmt.Errorf("failed to read frame header: %w", err)
 	}
@@ -58,6 +62,10 @@ func ReadFrame(r io.Reader) ([]byte, error) {
 // WriteFrame escreve um quadro composto por cabeçalho e payload.
 func WriteFrame(w io.Writer, payload []byte) error {
 	size := len(payload)
+
+	if w == nil {
+		return fmt.Errorf("writer cannot be nil")
+	}
 
 	if size == 0 {
 		return ErrInvalidFrameSize
