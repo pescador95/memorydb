@@ -6,6 +6,7 @@ import (
 
 	"github.com/pescador95/memorydb/server/internal/codec/protobuf"
 	"github.com/pescador95/memorydb/server/internal/protocol"
+	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
 
 func TestRequestCommunication(t *testing.T) {
@@ -15,12 +16,12 @@ func TestRequestCommunication(t *testing.T) {
 
 	messageCodec := protobuf.New()
 
-	client, err := NewConnection(clientSocket, messageCodec)
+	client, err := transporttcp.NewConnection(clientSocket)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	server, err := NewConnection(serverSocket, messageCodec)
+	server, err := transporttcp.NewConnection(serverSocket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,19 +31,29 @@ func TestRequestCommunication(t *testing.T) {
 		Command:   &protocol.PingCommand{},
 	}
 
+	payload, err := messageCodec.EncodeRequest(original)
+	if err != nil {
+		t.Fatalf("EncodeRequest() error = %v", err)
+	}
+
 	writeErr := make(chan error, 1)
 
 	go func() {
-		writeErr <- client.WriteRequest(original)
+		writeErr <- client.WriteFrame(payload)
 	}()
 
-	received, err := server.ReadRequest()
+	receivedPayload, err := server.ReadFrame()
 	if err != nil {
-		t.Fatalf("ReadRequest() error = %v", err)
+		t.Fatalf("ReadFrame() error = %v", err)
 	}
 
 	if err := <-writeErr; err != nil {
-		t.Fatalf("WriteRequest() error = %v", err)
+		t.Fatalf("WriteFrame() error = %v", err)
+	}
+
+	received, err := messageCodec.DecodeRequest(receivedPayload)
+	if err != nil {
+		t.Fatalf("DecodeRequest() error = %v", err)
 	}
 
 	if received.RequestID != original.RequestID {
@@ -62,12 +73,12 @@ func TestResponseCommunication(t *testing.T) {
 
 	messageCodec := protobuf.New()
 
-	client, err := NewConnection(clientSocket, messageCodec)
+	client, err := transporttcp.NewConnection(clientSocket)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	server, err := NewConnection(serverSocket, messageCodec)
+	server, err := transporttcp.NewConnection(serverSocket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,19 +89,29 @@ func TestResponseCommunication(t *testing.T) {
 		Result:    &protocol.PongResult{},
 	}
 
+	payload, err := messageCodec.EncodeResponse(original)
+	if err != nil {
+		t.Fatalf("EncodeResponse() error = %v", err)
+	}
+
 	writeErr := make(chan error, 1)
 
 	go func() {
-		writeErr <- server.WriteResponse(original)
+		writeErr <- server.WriteFrame(payload)
 	}()
 
-	received, err := client.ReadResponse()
+	receivedPayload, err := client.ReadFrame()
 	if err != nil {
-		t.Fatalf("ReadResponse() error = %v", err)
+		t.Fatalf("ReadFrame() error = %v", err)
 	}
 
 	if err := <-writeErr; err != nil {
-		t.Fatalf("WriteResponse() error = %v", err)
+		t.Fatalf("WriteFrame() error = %v", err)
+	}
+
+	received, err := messageCodec.DecodeResponse(receivedPayload)
+	if err != nil {
+		t.Fatalf("DecodeResponse() error = %v", err)
 	}
 
 	if received.RequestID != original.RequestID {

@@ -2,102 +2,274 @@
 
 ## Visão geral
 
-MemoryDB é um servidor chave-valor em memória que aceita comandos PING, SET, GET e DELETE por TCP. O processo compartilha um único armazenamento entre as conexões ativas; não há persistência, portanto os dados são perdidos ao reiniciar o servidor. Evidências: [Engine.Execute](../../internal/engine/engine.go), [Storage](../../internal/storage/storage.go), [main.run](../../cmd/memorydb/main.go).
+MemoryDB é um banco de dados chave-valor em memória, implementado inicialmente em Go. O servidor aceita os comandos PING, SET, GET e DELETE por TCP, utilizando Protocol Buffers como formato de serialização das mensagens.
 
-O módulo declara Go 1.27.0 e depende de `google.golang.org/protobuf` v1.36.12. O transporte usa a biblioteca padrão `net`; o protocolo externo é definido em Protocol Buffers. Evidências: [go.mod](../../go.mod), [memorydb.proto](../../api/proto/memorydb.proto).
+A implementação separa armazenamento, execução de comandos, modelo interno, serialização e transporte. O transporte TCP reutilizável e o driver Go são módulos independentes do servidor. Essa organização permite evoluir os componentes sem acoplar diretamente o mecanismo de execução a um protocolo de rede específico.
 
-O repositório não contém pacotes chamados `domain`, `application`, `infra` ou `presentation`. As camadas no diagrama abaixo são uma classificação das responsabilidades atuais, não uma estrutura de pastas implementada.
+O servidor compartilha uma única instância de armazenamento entre as conexões ativas. Os dados existem somente na memória do processo e são perdidos quando o servidor é encerrado.
 
-## Diagrama de camadas e Ports
+O projeto utiliza múltiplos módulos Go coordenados por um workspace (`go.work`).
+
+## Estrutura modular
+
+| Módulo | Caminho | Responsabilidade |
+|---|---|---|
+| Servidor | `server/` | Composição do servidor, engine, storage, codec e integração com TCP |
+| Transporte TCP | `transport/tcp/go/` | Framing e abstração de conexão TCP reutilizável |
+| Driver Go | `drivers/go/` | Cliente Go para comunicação com o servidor |
+| Protocolo gerado | `protocol/generated/go/` | Tipos Go gerados a partir do schema Protobuf |
+| Contrato Protobuf | `protocol/proto/` | Definição independente da linguagem do protocolo externo |
+| API de demonstração | `api/` | Executável de demonstração que utiliza o driver Go |
+
+O arquivo `go.work`, na raiz do repositório, coordena os módulos durante o desenvolvimento local. Cada módulo possui seu próprio `go.mod`.
+
+## Diagrama de módulos e responsabilidades
+
+```mermaid
+flowchart TB
+    subgraph Workspace["Workspace Go"]
+        API["api/client"]
+        Driver["drivers/go"]
+        Server["server"]
+        TCP["transport/tcp/go"]
+        Proto["protocol/generated/go"]
+    end
+
+    Schema["protocol/proto"]
+
+    API --> Driver
+    Driver --> TCP
+    Driver --> Proto
+    Server --> TCP
+    Server --> Proto
+    Proto -. gerado a partir de .-> Schema
+```
+
+O servidor e o driver compartilham os módulos de transporte TCP e de tipos Protobuf gerados. O driver não depende dos pacotes internos do servidor.
+
+O contrato Protobuf é mantido separado do código gerado. O arquivo `.proto` é a fonte do contrato; os arquivos gerados não devem ser editados manualmente.
+
+## Diagrama de camadas e dependências internas do servidor
+
+As camadas abaixo representam responsabilidades observadas na implementação. Não significam que o projeto adote formalmente uma estrutura Clean Architecture ou DDD.
 
 ```mermaid
 flowchart LR
-    Client[Cliente TCP]
-    subgraph Domain["Domínio (não explícito no código atual)"]
-        DomainGap[Sem entidades ou value objects identificados]
-    end
-    subgraph Presentation["Apresentação e transporte"]
-        Server[Server]
-        Handler[Handler]
-        Connection[Connection]
-        Framing[Framing TCP]
-    end
-    subgraph Application["Execução de comandos"]
-        Engine[Engine]
-    end
-    subgraph Core["Modelo interno"]
-        Protocol[Request / Response / Commands / Results]
-    end
-    subgraph Adapters["Adaptadores"]
-        CodecPort["Port: codec.Codec"]
-        ProtoCodec["Adaptador Protobuf"]
-        ProtoSchema["memorydb.proto / tipos gerados"]
-        Storage[Storage em memória]
+    Client["Cliente / Driver Go"]
+
+    subgraph Server["Módulo server"]
+        subgraph Transport["Transporte e entrada"]
+            TCPServer["Server"]
+            Handler["Handler"]
+            Framing["Framing / Connection"]
+        end
+
+        subgraph Serialization["Serialização"]
+            CodecPort["Port: codec.Codec"]
+            ProtoCodec["Adaptador Protobuf"]
+        end
+
+        subgraph Application["Execução de comandos"]
+            Engine["Engine"]
+        end
+
+        subgraph InternalModel["Modelo interno"]
+            Protocol["Request / Response / Commands / Results"]
+        end
+
+        subgraph StorageLayer["Armazenamento"]
+            Storage["Storage em memória"]
+            Entry["Entry"]
+        end
     end
 
-    Client --> Server --> Handler
-    Handler --> Connection
-    Connection --> Framing
-    Connection --> CodecPort
+    ProtoTypes["Tipos Protobuf gerados"]
+    TCPModule["Módulo transport/tcp/go"]
+
+    Client --> TCPServer
+    TCPServer --> Handler
+    Handler --> Framing
+    Framing --> TCPModule
+    Handler --> CodecPort
     CodecPort -. implementada por .-> ProtoCodec
-    ProtoCodec --> ProtoSchema
+    ProtoCodec --> ProtoTypes
     Handler --> Engine
     Engine --> Protocol
     Engine --> Storage
+    Storage --> Entry
 ```
 
-O contrato `codec.Codec` desacopla a conexão da implementação de serialização. O adaptador Protobuf implementa esse contrato. Em contraste, `Engine` referencia diretamente `*storage.Storage`: ainda não há uma Port de armazenamento. Evidências: [codec.Codec](../../internal/codec/codec.go), [protobuf.Codec](../../internal/codec/protobuf/codec.go), [Engine](../../internal/engine/engine.go).
+O `codec.Codec` desacopla a implementação do handler da serialização concreta. O adaptador Protobuf implementa esse contrato.
 
-## Catálogo de componentes
+O transporte TCP genérico é responsável pelo enquadramento das mensagens e pela comunicação com `net.Conn`. Ele não conhece Protocol Buffers nem o modelo interno do servidor.
 
-### Modelo interno — `internal/protocol`
+O `Engine`, por outro lado, ainda depende diretamente de `*storage.Storage`. Não existe atualmente uma interface de armazenamento que permita substituir a implementação sem modificar o engine.
 
-Responsável por representar solicitações e respostas sem usar tipos Protobuf. `Request` contém `RequestID` e um `Command`; `Response` contém `RequestID`, `Success` e um `Result`. Os comandos são PING, SET, GET e DELETE. Os resultados incluem PONG, SET, GET, DELETE e erro. Evidência: [message.go](../../internal/protocol/message.go).
+## Componentes principais
 
-### Engine — `internal/engine`
+### Modelo interno — `server/internal/protocol`
 
-`New() *Engine` cria o mecanismo com seu armazenamento; `(*Engine).Execute(request *protocol.Request) *protocol.Response` valida e executa comandos. Regras observadas:
+Representa solicitações e respostas sem depender dos tipos gerados pelo Protobuf ou de detalhes do transporte.
 
-- Request nulo, comando ausente/desconhecido ou comando tipado nulo resulta em `INVALID_REQUEST`.
+`Request` contém o identificador da solicitação e um comando. `Response` contém o identificador, o estado de sucesso e o resultado.
+
+Os comandos internos representam PING, SET, GET e DELETE. Os resultados representam PONG, SET, GET, DELETE e erro.
+
+Arquivo principal: `server/internal/protocol/message.go`.
+
+### Engine — `server/internal/engine`
+
+O `Engine` executa os comandos e aplica as validações da aplicação.
+
+Comportamentos implementados:
+
+- Requisição nula, comando ausente/desconhecido ou comando tipado nulo resulta em `INVALID_REQUEST`.
 - Chave vazia em SET, GET ou DELETE resulta em `INVALID_ARGUMENT`.
-- SET com `TTLMillis > 0` resulta em `UNSUPPORTED_FEATURE`; TTL igual a zero permite gravar sem expiração.
-- GET preserva a distinção entre chave inexistente (`Found == false`) e valor vazio (`Found == true`, slice vazia).
-- DELETE retorna sucesso com `Deleted == false` quando a chave não existe.
-- O `RequestID` é copiado para a resposta.
+- SET com `TTLMillis > 0` resulta em `UNSUPPORTED_FEATURE`.
+- SET com TTL igual a zero grava o valor sem expiração.
+- GET distingue chave inexistente de chave existente com valor vazio.
+- DELETE retorna sucesso e informa se a chave foi removida.
+- O `RequestID` da solicitação é preservado na resposta.
 
-Evidência: [engine.go](../../internal/engine/engine.go), [command.go](../../internal/engine/command.go).
+O engine cria e mantém diretamente uma instância concreta de `storage.Storage`.
 
-### Storage — `internal/storage`
+Arquivos principais:
+- `server/internal/engine/engine.go`
+- `server/internal/engine/command.go`
 
-`New() *Storage` cria o mapa em memória. Os métodos públicos são `Set(key string, value []byte)`, `Get(key string) ([]byte, bool)` e `Delete(key string) bool`. Um `sync.RWMutex` protege o mapa, e SET/GET copiam os bytes para evitar compartilhamento dos slices com o chamador. `Entry` armazena o valor; não há campo de expiração. Evidências: [storage.go](../../internal/storage/storage.go), [entry.go](../../internal/storage/entry.go).
+### Storage — `server/internal/storage`
 
-### Codec — `internal/codec` e `internal/codec/protobuf`
+Armazena os dados em um mapa em memória.
 
-A Port `codec.Codec` define:
+Características:
+- Chaves do tipo `string`.
+- Valores do tipo `[]byte`.
+- Proteção de acesso concorrente com `sync.RWMutex`.
+- Cópia dos bytes recebidos em SET.
+- Cópia dos bytes retornados em GET.
+- Remoção de chaves por DELETE.
 
-```go
-EncodeRequest(*protocol.Request) ([]byte, error)
-DecodeRequest([]byte) (*protocol.Request, error)
-EncodeResponse(*protocol.Response) ([]byte, error)
-DecodeResponse([]byte) (*protocol.Response, error)
-```
+A estrutura `Entry` guarda o valor. Não existe atualmente campo de expiração ou mecanismo de persistência.
 
-`protobuf.New() *protobuf.Codec` implementa essas operações, convertendo entre os modelos internos e os tipos gerados. Nil, mensagem Protobuf inválida e command/result ausente ou não suportado retornam erro de Go. Evidências: [codec.go](../../internal/codec/codec.go), [protobuf/codec.go](../../internal/codec/protobuf/codec.go).
+Arquivos principais:
+- `server/internal/storage/storage.go`
+- `server/internal/storage/entry.go`
 
-### Transporte TCP — `internal/transport/tcp`
+### Codec — `server/internal/codec`
 
-- `ReadFrame(io.Reader) ([]byte, error)` e `WriteFrame(io.Writer, []byte) error` leem/escrevem um frame com prefixo de 4 bytes, inteiro `uint32` Big Endian. Tamanho zero é inválido; o máximo é 1 MiB. Evidência: [framing.go](../../internal/transport/tcp/framing.go).
-- `NewConnection(net.Conn, codec.Codec) (*Connection, error)` valida dependências. `ReadRequest`, `WriteRequest`, `ReadResponse`, `WriteResponse` combinam framing e codec; mutexes separados serializam leituras e escritas. Evidência: [connection.go](../../internal/transport/tcp/connection.go).
-- `NewHandler(*engine.Engine, codec.Codec) (*Handler, error)` valida as dependências. `Handle(net.Conn) error` processa requisições sequencialmente até EOF/erro e fecha a conexão ao terminar. Erros de leitura, decodificação ou escrita retornam ao chamador; não é enviada uma resposta de protocolo quando a decodificação falha. Evidência: [handler.go](../../internal/transport/tcp/handler.go).
-- `NewServer(net.Listener, *Handler) (*Server, error)` valida dependências. `Serve() error` aceita clientes e inicia uma goroutine por conexão. Uma segunda chamada simultânea retorna `ErrServerAlreadyServing`. `Shutdown(context.Context) error` fecha o listener e aguarda conexões ativas ou o cancelamento do contexto. Evidência: [server.go](../../internal/transport/tcp/server.go).
+Define a interface `codec.Codec`, responsável por converter o modelo interno em bytes e reconstruir o modelo a partir deles.
 
-### Entradas executáveis
+Operações:
+- `EncodeRequest`
+- `DecodeRequest`
+- `EncodeResponse`
+- `DecodeResponse`
 
-`cmd/memorydb` compõe codec, engine, handler e servidor. `MEMORYDB_ADDR` configura o endereço; o padrão é `:6380`. O processo trata `os.Interrupt` e `SIGTERM` e usa timeout de 10 segundos para shutdown. Evidência: [cmd/memorydb/main.go](../../cmd/memorydb/main.go).
+O contrato não exige uma serialização específica. Isso permite implementar outros codecs sem alterar o modelo interno ou a interface consumidora.
 
-`cmd/client` conecta a `127.0.0.1:6380` e executa um cenário de demonstração de PING, SET, GET e DELETE. Ele valida o ID da resposta e transforma respostas de erro em erro local. Evidência: [cmd/client/main.go](../../cmd/client/main.go).
+Arquivo principal: `server/internal/codec/codec.go`.
 
-Não foram encontrados endpoints HTTP, filas, jobs ou eventos no código analisado.
+### Adaptador Protobuf — `server/internal/codec/protobuf`
+
+Implementa `codec.Codec` utilizando Protocol Buffers.
+
+Converte os tipos internos de solicitação e resposta para os tipos gerados a partir do schema Protobuf e realiza a conversão inversa.
+
+O adaptador depende do módulo `protocol/generated/go`, mas o modelo interno não depende dos tipos gerados.
+
+Arquivo principal: `server/internal/codec/protobuf/codec.go`.
+
+### Transporte TCP reutilizável — `transport/tcp/go`
+
+Módulo independente que implementa o framing e encapsula a conexão TCP.
+
+O protocolo de framing utiliza:
+- Prefixo de 4 bytes.
+- Tamanho representado por `uint32`.
+- Ordem de bytes Big Endian.
+- Payload entre 1 byte e 1 MiB.
+- Leitura completa com tratamento de fragmentação.
+- Escrita com tratamento de escritas parciais.
+
+A abstração `Connection` utiliza mutexes separados para leitura e escrita, permitindo uma operação de leitura e outra de escrita simultaneamente, enquanto serializa operações concorrentes do mesmo tipo.
+
+Arquivos principais:
+- `transport/tcp/go/framing.go`
+- `transport/tcp/go/connection.go`
+
+Esse módulo não depende de Protobuf, do engine ou do servidor.
+
+### Handler — `server/internal/transport/tcp`
+
+O `Handler` conecta o transporte TCP ao codec e ao engine.
+
+Para cada conexão:
+1. Cria a abstração de conexão TCP.
+2. Lê um frame.
+3. Decodifica a solicitação.
+4. Executa o comando no engine.
+5. Codifica a resposta.
+6. Escreve o frame de resposta.
+7. Repete o processo enquanto a conexão permanecer aberta.
+
+Erros de leitura, decodificação, execução de transporte ou escrita encerram o processamento da conexão. Uma falha de decodificação não gera uma resposta estruturada de aplicação.
+
+Arquivo principal: `server/internal/transport/tcp/handler.go`.
+
+### Server — `server/internal/transport/tcp`
+
+O `Server` controla o listener TCP e o ciclo de vida das conexões.
+
+`Serve()` aceita conexões e inicia uma goroutine para processar cada cliente. O servidor mantém um controle das conexões ativas.
+
+`Shutdown(context.Context)` fecha o listener e aguarda as conexões ativas terminarem ou o contexto ser cancelado.
+
+O servidor não fecha diretamente as conexões ativas durante o shutdown. Assim, uma conexão que não termina pode manter a operação aguardando até o cancelamento do contexto.
+
+Arquivo principal: `server/internal/transport/tcp/server.go`.
+
+### Driver Go — `drivers/go`
+
+Biblioteca cliente que permite aplicações Go se conectarem ao MemoryDB sem depender dos pacotes internos do servidor.
+
+Responsabilidades:
+- Estabelecer conexão TCP.
+- Enviar e receber frames.
+- Codificar e decodificar mensagens Protobuf.
+- Correlacionar solicitações e respostas por `request_id`.
+- Expor operações PING, SET, GET e DELETE.
+- Converter respostas de erro do servidor em erros Go.
+- Serializar operações concorrentes do cliente no modelo sequencial de requisição/resposta.
+
+A implementação atual não oferece multiplexação de requisições, reconexão automática ou operações com contexto e timeout configurável.
+
+Arquivos principais:
+- `drivers/go/client.go`
+- `drivers/go/client_test.go`
+
+### API de demonstração — `api/client`
+
+Executável que utiliza o driver Go para demonstrar a comunicação com o servidor.
+
+O executável não implementa outro protocolo de comunicação nem acessa diretamente os componentes internos do servidor. Ele utiliza a API pública do driver.
+
+Arquivo principal: `api/client/main.go`.
+
+### Executável do servidor — `server/cmd/memorydb`
+
+Ponto de composição da aplicação.
+
+Responsabilidades:
+- Obter o endereço de escuta da variável `MEMORYDB_ADDR`.
+- Utilizar `:6380` como endereço padrão.
+- Instanciar o codec Protobuf.
+- Instanciar o engine.
+- Criar o handler TCP.
+- Criar e iniciar o servidor.
+- Tratar sinais de encerramento.
+- Solicitar shutdown gracioso com timeout de 10 segundos.
+
+Arquivo principal: `server/cmd/memorydb/main.go`.
 
 ## Fluxos principais
 
@@ -105,123 +277,192 @@ Não foram encontrados endpoints HTTP, filas, jobs ou eventos no código analisa
 
 ```mermaid
 sequenceDiagram
-    participant C as Cliente
-    participant S as TCP Server
+    participant C as Driver Go
+    participant S as Server
     participant H as Handler
-    participant Conn as Connection/Codec
+    participant T as Transporte TCP
+    participant P as Codec Protobuf
     participant E as Engine
     participant St as Storage
-    C->>S: conecta por TCP
-    S->>H: delega conexão
-    C->>Conn: frame + Request SET
-    Conn->>H: decodifica Request
+
+    C->>S: Conexão TCP
+    S->>H: Delega conexão
+    C->>T: Frame com Request SET
+    T->>H: Payload
+    H->>P: DecodeRequest
+    P-->>H: Request interno
     H->>E: Execute(SET)
     E->>St: Set(key, value)
-    St-->>E: concluído
-    E-->>H: Response SET (request_id preservado)
-    H-->>C: frame + Response SET
-    C->>Conn: frame + Request GET
-    Conn->>H: decodifica Request
+    St-->>E: Concluído
+    E-->>H: Response SET
+    H->>P: EncodeResponse
+    P-->>H: Payload Protobuf
+    H->>T: WriteFrame
+    T-->>C: Frame de resposta
+
+    C->>T: Frame com Request GET
+    T->>H: Payload
+    H->>P: DecodeRequest
+    P-->>H: Request interno
     H->>E: Execute(GET)
     E->>St: Get(key)
     St-->>E: value, found
     E-->>H: Response GET
-    H-->>C: frame + Response GET
+    H->>P: EncodeResponse
+    P-->>H: Payload Protobuf
+    H->>T: WriteFrame
+    T-->>C: Frame de resposta
 ```
-
-Evidências: [Handler.Handle](../../internal/transport/tcp/handler.go), [Engine.Execute](../../internal/engine/engine.go), [Storage](../../internal/storage/storage.go), [Connection](../../internal/transport/tcp/connection.go).
 
 ### PING
 
 ```mermaid
 sequenceDiagram
-    participant C as Cliente
+    participant C as Driver Go
     participant H as Handler
+    participant P as Codec
     participant E as Engine
-    C->>H: Request PING enquadrada e decodificada
-    H->>E: Execute(PING)
-    E-->>H: Response de sucesso com PongResult
-    H-->>C: Response enquadrada e codificada
-```
 
-Evidência: [Engine.Execute](../../internal/engine/engine.go).
+    C->>H: Request PING enquadrada
+    H->>P: DecodeRequest
+    P-->>H: Request interno
+    H->>E: Execute(PING)
+    E-->>H: Response com PongResult
+    H->>P: EncodeResponse
+    P-->>H: Payload
+    H-->>C: Frame com PONG
+```
 
 ### Erro de argumento
 
 ```mermaid
 sequenceDiagram
-    participant C as Cliente
+    participant C as Driver Go
     participant H as Handler
+    participant P as Codec
     participant E as Engine
-    C->>H: Request SET com chave vazia
-    H->>E: Execute(SET)
-    E-->>H: Response success=false, INVALID_ARGUMENT
-    H-->>C: Response de erro
-```
 
-Evidência: [Engine.Execute](../../internal/engine/engine.go), [ErrorResult](../../internal/protocol/message.go).
+    C->>H: Request SET com chave vazia
+    H->>P: DecodeRequest
+    P-->>H: Request interno
+    H->>E: Execute(SET)
+    E-->>H: Response success=false
+    Note over E,H: Código INVALID_ARGUMENT
+    H->>P: EncodeResponse
+    P-->>H: Payload
+    H-->>C: Frame com resposta de erro
+```
 
 ## Contrato de comunicação
 
-O projeto não expõe API HTTP. As operações abaixo são comandos enviados em mensagens Protobuf sobre TCP. O frame é um tamanho `uint32` Big Endian seguido pelo payload Protobuf; o payload permitido tem de 1 byte a 1 MiB. Evidências: [framing.go](../../internal/transport/tcp/framing.go), [memorydb.proto](../../api/proto/memorydb.proto).
+O MemoryDB não expõe uma API HTTP na implementação atual. Os comandos são transmitidos por TCP utilizando frames com prefixo de tamanho e payload Protobuf.
 
-| Comando | Campos da requisição | Resposta de sucesso | Erros de aplicação | Autenticação |
-|---|---|---|---|---|
-| PING | `request_id`; `ping` vazio | `success=true`, resultado `pong`; mesmo `request_id` | `INVALID_REQUEST` para requisição/comando inválido | Não implementada |
-| SET | `request_id`; `set.key` string; `set.value` bytes; `set.ttl_ms` uint64 | `success=true`, resultado `set`; valor substitui o anterior | Chave vazia: `INVALID_ARGUMENT`; TTL positivo: `UNSUPPORTED_FEATURE`; requisição/comando inválido: `INVALID_REQUEST` | Não implementada |
-| GET | `request_id`; `get.key` string | `success=true`, `get.found` e, quando encontrado, `get.value` bytes | Chave vazia: `INVALID_ARGUMENT`; requisição/comando inválido: `INVALID_REQUEST` | Não implementada |
-| DELETE | `request_id`; `delete.key` string | `success=true`, `delete.deleted` indica se havia chave | Chave vazia: `INVALID_ARGUMENT`; requisição/comando inválido: `INVALID_REQUEST` | Não implementada |
+O contrato externo está definido em `protocol/proto/memorydb/v1/memorydb.proto`.
 
-O envelope de erro contém `success=false` e `error.code`/`error.message`. `INVALID_REQUEST`, `INVALID_ARGUMENT` e `UNSUPPORTED_FEATURE` são definidos em [command.go](../../internal/engine/command.go); as condições de uso estão em [engine.go](../../internal/engine/engine.go). Erros de frame ou Protobuf inválido são retornados pelo handler e encerram a conexão, sem resposta estruturada de aplicação. Evidências: [handler.go](../../internal/transport/tcp/handler.go), [framing.go](../../internal/transport/tcp/framing.go), [protobuf/codec.go](../../internal/codec/protobuf/codec.go).
+| Comando | Campos da requisição | Resposta de sucesso | Erros de aplicação |
+|---|---|---|---|
+| PING | `request_id`; comando `ping` | `success=true`, resultado `pong` | `INVALID_REQUEST` |
+| SET | `request_id`; `key`; `value`; `ttl_ms` | `success=true`, resultado `set` | `INVALID_ARGUMENT`, `UNSUPPORTED_FEATURE`, `INVALID_REQUEST` |
+| GET | `request_id`; `key` | `success=true`, resultado `get`, com `found` e `value` | `INVALID_ARGUMENT`, `INVALID_REQUEST` |
+| DELETE | `request_id`; `key` | `success=true`, resultado `delete`, com `deleted` | `INVALID_ARGUMENT`, `INVALID_REQUEST` |
 
-O esquema externo usa `oneof` para selecionar comando e resultado e define `request_id` também na resposta. Evidência: [memorydb.proto](../../api/proto/memorydb.proto).
+O envelope de resposta contém `request_id`, `success` e um resultado selecionado por `oneof`.
+
+Quando há erro de aplicação, o resultado contém `ErrorResult`, com código e mensagem.
+
+Erros de framing ou de decodificação Protobuf encerram o processamento da conexão. Não há garantia de resposta estruturada de aplicação nesses casos.
 
 ## Modelo de dados
 
 ```mermaid
 classDiagram
     class Storage {
-        map~string, Entry~ entries
+        map[string]Entry entries
         RWMutex mu
+        Set(key, value)
+        Get(key)
+        Delete(key)
     }
+
     class Entry {
         []byte value
     }
+
     class Request {
         uint64 RequestID
         Command Command
     }
+
     class Response {
         uint64 RequestID
         bool Success
         Result Result
     }
+
     Storage "1" o-- "*" Entry : chave -> valor
     Request --> Command
     Response --> Result
 ```
 
-O armazenamento é um mapa chave-valor em processo. Chaves são strings e valores são bytes; não há entidade persistida, identificador de tenant, timestamp ou expiração. `Entry.value` é privado ao pacote. `Request` e `Response` são modelos de mensagem, não entidades de domínio com identidade ou ciclo de vida. Evidências: [storage.go](../../internal/storage/storage.go), [entry.go](../../internal/storage/entry.go), [message.go](../../internal/protocol/message.go).
+O armazenamento é um mapa em memória. As chaves são strings e os valores são bytes.
 
-## Dependências e observações operacionais
+Não há persistência, identificação de tenant, timestamp ou expiração de entradas na implementação atual.
 
-| Dependência / configuração | Uso observado | Evidência |
-|---|---|---|
-| `google.golang.org/protobuf` v1.36.12 | Serialização Protobuf. | [go.mod](../../go.mod), [protobuf/codec.go](../../internal/codec/protobuf/codec.go) |
-| Biblioteca padrão `net`, `encoding/binary`, `io`, `sync`, `context`, `os/signal` | TCP, framing, sincronização e ciclo de vida. | [framing.go](../../internal/transport/tcp/framing.go), [server.go](../../internal/transport/tcp/server.go), [main.go](../../cmd/memorydb/main.go) |
-| `MEMORYDB_ADDR` | Configura o endereço do listener; padrão `:6380`. | [main.go](../../cmd/memorydb/main.go) |
-| Segurança de transporte | TLS e autenticação não aparecem na implementação; o roadmap os registra como trabalho futuro. Não se deve presumir proteção de rede. | [server.go](../../internal/transport/tcp/server.go), [roadmap](../../memorydb-roadmap.md) |
-| Recursos | Há limite de 1 MiB por frame. Não identifiquei timeouts de leitura/escrita ou limite de conexões. | [framing.go](../../internal/transport/tcp/framing.go), [server.go](../../internal/transport/tcp/server.go) |
+`Request` e `Response` são modelos de mensagens internas, não entidades de domínio com identidade ou ciclo de vida.
 
-## Desvios Arquiteturais Detectados
+## Dependências e configurações
 
-1. **Port de armazenamento ausente:** `Engine` instancia e mantém `*storage.Storage` concretamente, limitando a substituição do backend sem alterar o engine. Evidência: [engine.go](../../internal/engine/engine.go).
-2. **Camadas não explicitadas por pacote:** domínio e aplicação estão combinados em `internal/protocol` e `internal/engine`; adaptadores e apresentação estão sob `internal/codec` e `internal/transport/tcp`, sem separação formal por diretórios. Evidências: [protocol](../../internal/protocol/message.go), [engine](../../internal/engine/engine.go), [transport/tcp](../../internal/transport/tcp/server.go).
-3. **Erro do handler descartado:** a goroutine em `Server.Serve` ignora o erro retornado por `Handler.Handle`, então falhas de conexão/processamento não são registradas ali. Evidência: [server.go](../../internal/transport/tcp/server.go).
-4. **Ciclo de vida de conexões no shutdown:** `Shutdown` fecha o listener e aguarda o `WaitGroup`; não fecha diretamente conexões ativas. Clientes que não encerram a conexão podem manter o shutdown aguardando até o contexto expirar. Evidências: [server.go](../../internal/transport/tcp/server.go), timeout configurado em [main.go](../../cmd/memorydb/main.go).
+| Dependência ou configuração | Utilização |
+|---|---|
+| Go 1.27.0 | Versão declarada nos módulos |
+| `google.golang.org/protobuf` v1.36.12 | Serialização e desserialização Protobuf |
+| Biblioteca padrão `net` | Comunicação TCP |
+| Biblioteca padrão `encoding/binary` | Codificação do tamanho dos frames |
+| Biblioteca padrão `io` | Leitura e escrita completas |
+| Biblioteca padrão `sync` | Sincronização de acesso |
+| Biblioteca padrão `context` | Controle do shutdown |
+| `MEMORYDB_ADDR` | Endereço do listener do servidor |
+| `:6380` | Endereço padrão do servidor |
+| `go.work` | Coordenação dos módulos durante o desenvolvimento |
 
-## Testes existentes e lacunas
+## Decisões arquiteturais atuais
 
-Há testes de unidade para engine e storage; testes de round-trip e falhas do codec; testes de framing; testes de comunicação, handler e server, incluindo listener TCP real e múltiplos clientes. Evidências: [engine_test.go](../../internal/engine/engine_test.go), [storage_test.go](../../internal/storage/storage_test.go), [codec_test.go](../../internal/codec/protobuf/codec_test.go), [framing_test.go](../../internal/transport/tcp/framing_test.go), [handler_test.go](../../internal/transport/tcp/handler_test.go), [server_test.go](../../internal/transport/tcp/server_test.go).
+1. **Separação entre transporte e serialização:** o módulo TCP não depende de Protobuf. O framing pode ser reutilizado por outros protocolos.
+2. **Modelo interno independente:** o engine e os componentes internos não utilizam diretamente os tipos Protobuf gerados.
+3. **Driver independente do servidor:** aplicações Go consomem a biblioteca cliente sem importar pacotes internos do servidor.
+4. **Módulos independentes:** cada componente possui seu próprio `go.mod`; o workspace facilita o desenvolvimento conjunto.
+5. **Execução sequencial por conexão:** o driver serializa as operações e o handler processa uma solicitação por vez em cada conexão.
+6. **Armazenamento compartilhado:** todas as conexões atendidas pela mesma instância do servidor utilizam o mesmo storage.
 
-Não encontrei testes para os executáveis em `cmd`; o roadmap também lista como pendentes testes automatizados completos de integração para as operações e alguns casos de desconexão, bem como a validação consolidada com `go test -race ./...`. Isso descreve o estado documentado no roadmap e não substitui uma execução atual dos testes. Evidência: [roadmap](../../memorydb-roadmap.md).
+## Lacunas arquiteturais identificadas
+
+1. **Port de armazenamento ausente:** o engine depende de `*storage.Storage`, não de uma interface.
+2. **Domínio não formalizado:** o modelo interno representa comandos, resultados e mensagens, mas não há uma camada explícita de entidades ou value objects.
+3. **Observabilidade incompleta:** o erro retornado por `Handler.Handle` é descartado pela goroutine do servidor; não há registro estruturado de falhas de conexão nesse ponto.
+4. **Shutdown sem encerramento forçado:** o servidor fecha o listener e aguarda as conexões, mas não mantém uma estratégia de fechamento forçado das conexões ativas.
+5. **Limites operacionais incompletos:** não há timeout configurável de leitura/escrita ou limite de conexões concorrentes.
+6. **Segurança de transporte ausente:** TLS, autenticação e autorização não estão implementados.
+7. **Persistência ausente:** os dados são perdidos quando o processo termina.
+8. **TTL não implementado:** o campo existe no contrato, mas valores positivos são rejeitados.
+9. **Multiplexação ausente:** o protocolo possui `request_id`, mas o driver atual trabalha com uma solicitação por vez em cada conexão.
+
+## Testes e validação
+
+O projeto possui testes para:
+- Armazenamento e concorrência.
+- Execução de comandos no engine.
+- Conversão Protobuf.
+- Framing TCP e tratamento de fragmentação.
+- Comunicação e ciclo de vida das conexões.
+- Driver Go e tratamento de erros.
+- Integração entre cliente e servidor.
+
+Na validação consolidada mais recente, foram executados `go test -race -count=1 ./...` e `go vet ./...` separadamente nos módulos:
+
+- `protocol/generated/go`
+- `transport/tcp/go`
+- `drivers/go`
+- `server`
+- `api`
+
+Todos os testes e verificações de `go vet` passaram nessa execução.

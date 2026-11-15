@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pescador95/memorydb/server/internal/codec"
 	"github.com/pescador95/memorydb/server/internal/codec/protobuf"
 	"github.com/pescador95/memorydb/server/internal/engine"
 	"github.com/pescador95/memorydb/server/internal/protocol"
+	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
 
 func newTestServer(t *testing.T) (*Server, net.Listener) {
@@ -35,6 +37,44 @@ func newTestServer(t *testing.T) (*Server, net.Listener) {
 	return server, listener
 }
 
+func writeTestRequest(
+	t *testing.T,
+	conn *transporttcp.Connection,
+	messageCodec codec.Codec,
+	request *protocol.Request,
+) {
+	t.Helper()
+
+	payload, err := messageCodec.EncodeRequest(request)
+	if err != nil {
+		t.Fatalf("EncodeRequest() error = %v", err)
+	}
+
+	if err := conn.WriteFrame(payload); err != nil {
+		t.Fatalf("WriteFrame() error = %v", err)
+	}
+}
+
+func readTestResponse(
+	t *testing.T,
+	conn *transporttcp.Connection,
+	messageCodec codec.Codec,
+) *protocol.Response {
+	t.Helper()
+
+	payload, err := conn.ReadFrame()
+	if err != nil {
+		t.Fatalf("ReadFrame() error = %v", err)
+	}
+
+	response, err := messageCodec.DecodeResponse(payload)
+	if err != nil {
+		t.Fatalf("DecodeResponse() error = %v", err)
+	}
+
+	return response
+}
+
 func TestServerAcceptsMultipleClients(t *testing.T) {
 	server, listener := newTestServer(t)
 
@@ -49,27 +89,22 @@ func TestServerAcceptsMultipleClients(t *testing.T) {
 			t.Fatalf("Dial() error = %v", err)
 		}
 
-		client, err := NewConnection(conn, protobuf.New())
+		client, err := transporttcp.NewConnection(conn)
 		if err != nil {
 			conn.Close()
 			t.Fatalf("NewConnection() error = %v", err)
 		}
+
+		messageCodec := protobuf.New()
 
 		request := &protocol.Request{
 			RequestID: i,
 			Command:   &protocol.PingCommand{},
 		}
 
-		if err := client.WriteRequest(request); err != nil {
-			conn.Close()
-			t.Fatalf("WriteRequest() error = %v", err)
-		}
+		writeTestRequest(t, client, messageCodec, request)
 
-		response, err := client.ReadResponse()
-		if err != nil {
-			conn.Close()
-			t.Fatalf("ReadResponse() error = %v", err)
-		}
+		response := readTestResponse(t, client, messageCodec)
 
 		if response.RequestID != i {
 			t.Errorf("RequestID = %d, want %d", response.RequestID, i)
@@ -83,7 +118,7 @@ func TestServerAcceptsMultipleClients(t *testing.T) {
 			t.Errorf("Result type = %T, want *protocol.PongResult", response.Result)
 		}
 
-		if err := conn.Close(); err != nil {
+		if err := client.Close(); err != nil {
 			t.Errorf("Close() error = %v", err)
 		}
 	}
@@ -109,6 +144,7 @@ func TestServerRejectsSecondServe(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(time.Second)
+
 	for {
 		server.mu.Lock()
 		serving := server.serving
@@ -117,9 +153,11 @@ func TestServerRejectsSecondServe(t *testing.T) {
 		if serving {
 			break
 		}
+
 		if time.Now().After(deadline) {
 			t.Fatal("server did not start serving")
 		}
+
 		time.Sleep(time.Millisecond)
 	}
 
@@ -153,21 +191,21 @@ func TestServerShutdownWaitsForActiveConnections(t *testing.T) {
 	}
 	defer conn.Close()
 
-	client, err := NewConnection(conn, protobuf.New())
+	client, err := transporttcp.NewConnection(conn)
 	if err != nil {
 		t.Fatalf("NewConnection() error = %v", err)
 	}
 
-	if err := client.WriteRequest(&protocol.Request{
+	messageCodec := protobuf.New()
+
+	request := &protocol.Request{
 		RequestID: 1,
 		Command:   &protocol.PingCommand{},
-	}); err != nil {
-		t.Fatalf("WriteRequest() error = %v", err)
 	}
 
-	if _, err := client.ReadResponse(); err != nil {
-		t.Fatalf("ReadResponse() error = %v", err)
-	}
+	writeTestRequest(t, client, messageCodec, request)
+
+	readTestResponse(t, client, messageCodec)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -176,7 +214,7 @@ func TestServerShutdownWaitsForActiveConnections(t *testing.T) {
 		t.Fatalf("Shutdown() error = %v, want context deadline exceeded", err)
 	}
 
-	if err := conn.Close(); err != nil {
+	if err := client.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
 
@@ -205,5 +243,20 @@ func TestNewServerRejectsNilDependencies(t *testing.T) {
 
 	if _, err := NewServer(listener, nil); err == nil {
 		t.Error("NewServer() with nil handler error = nil, want error")
+	}
+}
+
+func TestServerShutdownBeforeServe(t *testing.T) {
+	server, _ := newTestServer(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	if err := server.Serve(); err != nil {
+		t.Fatalf("Serve() após Shutdown() error = %v, want nil", err)
 	}
 }

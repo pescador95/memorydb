@@ -4,14 +4,15 @@ import (
 	"net"
 	"testing"
 
+	"github.com/pescador95/memorydb/server/internal/codec"
 	"github.com/pescador95/memorydb/server/internal/codec/protobuf"
 	"github.com/pescador95/memorydb/server/internal/engine"
 	"github.com/pescador95/memorydb/server/internal/protocol"
+	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
 
 func TestHandlerProcessesMultipleRequests(t *testing.T) {
 	serverSocket, clientSocket := net.Pipe()
-	defer clientSocket.Close()
 
 	messageCodec := protobuf.New()
 
@@ -25,6 +26,13 @@ func TestHandlerProcessesMultipleRequests(t *testing.T) {
 	go func() {
 		handlerDone <- handler.Handle(serverSocket)
 	}()
+
+	connection, err := transporttcp.NewConnection(clientSocket)
+	if err != nil {
+		t.Fatalf("NewConnection() error = %v", err)
+	}
+
+	defer connection.Close()
 
 	requests := []*protocol.Request{
 		{
@@ -52,19 +60,24 @@ func TestHandlerProcessesMultipleRequests(t *testing.T) {
 		},
 	}
 
-	client, err := NewConnection(clientSocket, messageCodec)
-	if err != nil {
-		t.Fatalf("NewConnection() error = %v", err)
-	}
-
 	for _, request := range requests {
-		if err := client.WriteRequest(request); err != nil {
-			t.Fatalf("WriteRequest() error = %v", err)
+		requestPayload, err := messageCodec.EncodeRequest(request)
+		if err != nil {
+			t.Fatalf("EncodeRequest() error = %v", err)
 		}
 
-		response, err := client.ReadResponse()
+		if err := connection.WriteFrame(requestPayload); err != nil {
+			t.Fatalf("WriteFrame() error = %v", err)
+		}
+
+		responsePayload, err := connection.ReadFrame()
 		if err != nil {
-			t.Fatalf("ReadResponse() error = %v", err)
+			t.Fatalf("ReadFrame() error = %v", err)
+		}
+
+		response, err := messageCodec.DecodeResponse(responsePayload)
+		if err != nil {
+			t.Fatalf("DecodeResponse() error = %v", err)
 		}
 
 		if response.RequestID != request.RequestID {
@@ -76,7 +89,11 @@ func TestHandlerProcessesMultipleRequests(t *testing.T) {
 		}
 
 		if !response.Success {
-			t.Errorf("request %d failed: %+v", request.RequestID, response.Result)
+			t.Errorf(
+				"request %d failed: %+v",
+				request.RequestID,
+				response.Result,
+			)
 		}
 
 		switch request.RequestID {
@@ -117,7 +134,7 @@ func TestHandlerProcessesMultipleRequests(t *testing.T) {
 	}
 
 	// O encerramento do cliente deve finalizar o Handler normalmente.
-	if err := clientSocket.Close(); err != nil {
+	if err := connection.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
 
@@ -127,7 +144,7 @@ func TestHandlerProcessesMultipleRequests(t *testing.T) {
 }
 
 func TestNewHandlerRejectsNilDependencies(t *testing.T) {
-	messageCodec := protobuf.New()
+	var messageCodec codec.Codec = protobuf.New()
 
 	if _, err := NewHandler(nil, messageCodec); err == nil {
 		t.Error("expected error for nil engine")

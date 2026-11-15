@@ -8,9 +8,10 @@ import (
 
 	"github.com/pescador95/memorydb/server/internal/codec"
 	"github.com/pescador95/memorydb/server/internal/engine"
+	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
 
-// Handler coordena a comunicação TCP e a execução dos comandos.
+// Handler coordena o transporte TCP, a decodificação e a execução dos comandos.
 type Handler struct {
 	engine *engine.Engine
 	codec  codec.Codec
@@ -38,26 +39,36 @@ func (h *Handler) Handle(conn net.Conn) error {
 		return fmt.Errorf("connection cannot be nil")
 	}
 
-	connection, err := NewConnection(conn, h.codec)
+	connection, err := transporttcp.NewConnection(conn)
 	if err != nil {
 		return fmt.Errorf("create connection: %w", err)
 	}
 	defer connection.Close()
 
 	for {
-		request, err := connection.ReadRequest()
+		payload, err := connection.ReadFrame()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 
-			return fmt.Errorf("read request: %w", err)
+			return fmt.Errorf("read request frame: %w", err)
+		}
+
+		request, err := h.codec.DecodeRequest(payload)
+		if err != nil {
+			return fmt.Errorf("decode request: %w", err)
 		}
 
 		response := h.engine.Execute(request)
 
-		if err := connection.WriteResponse(response); err != nil {
-			return fmt.Errorf("write response: %w", err)
+		responsePayload, err := h.codec.EncodeResponse(response)
+		if err != nil {
+			return fmt.Errorf("encode response: %w", err)
+		}
+
+		if err := connection.WriteFrame(responsePayload); err != nil {
+			return fmt.Errorf("write response frame: %w", err)
 		}
 	}
 }
