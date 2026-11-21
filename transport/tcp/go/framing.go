@@ -100,6 +100,10 @@ func writeFull(w io.Writer, data []byte) error {
 	for len(data) > 0 {
 		n, err := w.Write(data)
 
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("invalid write count: %d", n)
+		}
+
 		if n > 0 {
 			data = data[n:]
 		}
