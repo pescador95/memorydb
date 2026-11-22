@@ -1,57 +1,80 @@
 # Requisitos e Critérios de Aceite — MemoryDB
 
-Este documento descreve retrospectivamente os requisitos funcionais e não funcionais observáveis na implementação atual do MemoryDB.
+## 1. Objetivo
 
-Os requisitos são classificados com base no código e nos testes existentes. Funcionalidades planejadas no roadmap, mas ainda não implementadas, são identificadas explicitamente como pendências.
+Este documento registra os requisitos funcionais e as características não funcionais verificáveis na implementação atual do MemoryDB.
 
-## 1. Escopo da implementação atual
+A documentação é retrospectiva: os requisitos são descritos a partir do comportamento implementado no código e dos testes identificados no repositório.
 
-O MemoryDB é um banco de dados chave-valor em memória, implementado inicialmente em Go, com comunicação TCP e serialização Protocol Buffers.
+O documento também registra limitações e lacunas que devem ser consideradas em evoluções futuras.
 
-A implementação atual contempla:
+Os estados utilizados são:
 
-- Armazenamento de chaves do tipo `string` e valores do tipo `[]byte`.
-- Operações PING, SET, GET e DELETE.
+| Estado | Significado |
+|---|---|
+| Implementado e testado | Comportamento presente no código e coberto por testes identificados |
+| Implementado, cobertura parcial | Comportamento presente no código, mas sem cobertura de teste suficiente para todos os cenários descritos |
+| Implementado, validação histórica | Há registro de execução bem-sucedida, mas não necessariamente uma validação completa do estado atual |
+| Parcial | Parte do comportamento está implementada, mas há limitações conhecidas |
+| Não implementado | Não há implementação funcional identificada |
+
+## 2. Escopo atual
+
+MemoryDB é um banco de dados chave-valor em memória, implementado em Go, com comunicação TCP e serialização Protocol Buffers.
+
+O escopo funcional atual contempla:
+
+- Armazenamento de chaves do tipo `string`.
+- Armazenamento de valores binários do tipo `[]byte`.
+- Operações `PING`, `SET`, `GET` e `DELETE`.
 - Protocolo de comunicação baseado em Protocol Buffers.
 - Delimitação de mensagens TCP por frames.
 - Conexões TCP persistentes.
 - Atendimento concorrente de múltiplos clientes.
+- Compartilhamento do armazenamento entre conexões da mesma instância.
 - Driver cliente em Go.
-- Operações context-aware no driver Go, com suporte a cancelamento e deadlines.
-- Sinalização de resultados indeterminados por meio de `OperationOutcomeUnknownError`.
+- Operações context-aware no driver Go.
+- Sinalização de resultados indeterminados por `OperationOutcomeUnknownError`.
 - Encerramento gracioso do servidor.
-- Workspace Go com módulos independentes.
+- Workspace Go composto por módulos independentes.
 
-**Limitações conhecidas:**
+### 2.1 Limitações do escopo
 
-- Não há persistência em disco.
-- TTL está presente no contrato, mas ainda não é funcional.
-- Não há autenticação, autorização ou isolamento por tenant.
-- Não há TLS.
-- Não há multiplexação de requisições na mesma conexão.
-- Não há idempotência ou deduplicação de operações no servidor.
-- Não há retry automático nem recuperação de resultados de operações cujo desfecho seja indeterminado.
-- Não há driver Java implementado e validado nesta etapa.
+A implementação atual não oferece:
 
-## 2. Requisitos funcionais
+- Persistência em disco.
+- Recuperação de dados após reinicialização.
+- TTL funcional.
+- Autenticação ou autorização.
+- TLS.
+- Isolamento por tenant.
+- Replicação ou distribuição entre instâncias.
+- Multiplexação de requisições na mesma conexão.
+- Idempotência ou deduplicação server-side.
+- Recuperação de resultados indeterminados.
+- Retry automático no driver.
+- Driver Java implementado e validado.
+
+## 3. Requisitos funcionais
 
 ### FR-001 — Responder ao comando PING
 
-**Descrição:** Para uma solicitação PING válida, o servidor retorna sucesso com resultado PONG e preserva o `request_id`.
+**Descrição:** Para uma solicitação PING válida, o servidor deve retornar sucesso com resultado PONG e preservar o `request_id`.
 
-**Componente:** `Engine`.
+**Componentes:** `Engine`, modelo interno e codec.
 
-**Evidência:**
-- [Engine.Execute](../../server/internal/engine/engine.go) trata `PingCommand` e produz `PongResult`.
-- [TestPing](../../server/internal/engine/engine_test.go).
+**Evidências:**
+- `server/internal/engine/engine.go` — `Engine.Execute`.
+- `server/internal/engine/engine_test.go` — `TestPing`.
 
-**Critério de aceite**
+**Critérios de aceite**
 
 ```gherkin
 Cenário: Verificar disponibilidade
   Dado que o engine recebeu uma solicitação PING com request_id 1
   Quando executar a solicitação
-  Então deve retornar uma resposta de sucesso com PongResult
+  Então deve retornar uma resposta de sucesso
+  E o resultado deve ser PongResult
   E deve preservar request_id 1
 ```
 
@@ -59,17 +82,19 @@ Cenário: Verificar disponibilidade
 
 ### FR-002 — Gravar e substituir valores
 
-**Descrição:** SET com chave não vazia e TTL igual a zero grava bytes associados à chave. Uma nova gravação para a mesma chave substitui o valor anterior.
+**Descrição:** SET com chave não vazia e `ttl_ms` igual a zero deve armazenar os bytes associados à chave.
+
+Uma nova gravação para a mesma chave deve substituir o valor anterior.
 
 **Componentes:** `Engine` e `Storage`.
 
-**Evidência:**
-- [Engine.Execute](../../server/internal/engine/engine.go) valida os argumentos e executa a gravação.
-- [Storage.Set](../../server/internal/storage/storage.go) realiza o armazenamento e copia os bytes recebidos.
-- [TestSetAndGet](../../server/internal/engine/engine_test.go).
-- [TestSetOverwritesExistingValue](../../server/internal/storage/storage_test.go).
+**Evidências:**
+- `server/internal/engine/engine.go` — `Engine.Execute`.
+- `server/internal/storage/storage.go` — `Storage.Set`.
+- `server/internal/engine/engine_test.go` — `TestSetAndGet`.
+- `server/internal/storage/storage_test.go` — `TestSetOverwritesExistingValue`.
 
-**Critério de aceite**
+**Critérios de aceite**
 
 ```gherkin
 Cenário: Gravar um valor
@@ -89,43 +114,49 @@ Cenário: Substituir valor existente
 
 ### FR-003 — Rejeitar TTL ainda não suportado
 
-**Descrição:** SET com `ttl_ms` maior que zero não grava a entrada e retorna `UNSUPPORTED_FEATURE`.
+**Descrição:** SET com `ttl_ms` maior que zero deve ser rejeitado com `UNSUPPORTED_FEATURE`, sem gravar a entrada.
+
+O campo existe no contrato externo, mas a expiração automática de entradas não está implementada.
 
 **Componentes:** Contrato Protobuf e `Engine`.
 
-**Evidência:**
-- [SetCommand](../../protocol/proto/memorydb/v1/memorydb.proto) declara o campo `ttl_ms`.
-- [Engine.Execute](../../server/internal/engine/engine.go) rejeita valores positivos.
-- [TestRejectsUnsupportedTTL](../../server/internal/engine/engine_test.go).
+**Evidências:**
+- `protocol/proto/memorydb/v1/memorydb.proto` — campo `ttl_ms`.
+- `server/internal/engine/engine.go` — validação de `TTLMillis`.
+- `server/internal/engine/engine_test.go` — `TestRejectsUnsupportedTTL`.
 
-**Critério de aceite**
+**Critérios de aceite**
 
 ```gherkin
 Cenário: Rejeitar SET com TTL positivo
-  Dado que SET recebe uma chave não vazia e ttl_ms maior que zero
+  Dado que SET recebe uma chave não vazia
+  E que ttl_ms é maior que zero
   Quando o engine executar a solicitação
   Então deve responder com success=false
   E o código do erro deve ser UNSUPPORTED_FEATURE
   E a entrada não deve ser gravada
 ```
 
-**Estado:** Implementado e testado como rejeição. A funcionalidade de expiração continua não implementada.
+**Estado:** Implementado e testado quanto à rejeição.
+
+**Limitação:** A funcionalidade de expiração continua não implementada.
 
 ### FR-004 — Consultar chave existente ou ausente
 
-**Descrição:** GET retorna os bytes e `found=true` para uma chave existente. Para uma chave inexistente, retorna `found=false`, sem confundir ausência com valor vazio.
+**Descrição:** GET deve retornar os bytes e `found=true` para uma chave existente.
+
+Para uma chave inexistente, deve retornar `found=false`, sem confundir ausência com valor vazio.
 
 **Componentes:** `Engine` e `Storage`.
 
-**Evidência:**
-- [Engine.Execute](../../server/internal/engine/engine.go).
-- [Storage.Get](../../server/internal/storage/storage.go).
-- [TestSetAndGet](../../server/internal/engine/engine_test.go).
-- [TestGetMissingKey](../../server/internal/engine/engine_test.go).
-- [TestEmptyValue](../../server/internal/storage/storage_test.go).
-- [TestServerEmptyValueAndMissingKey](../../server/internal/integration/server_test.go).
+**Evidências:**
+- `server/internal/engine/engine.go` — `Engine.Execute`.
+- `server/internal/storage/storage.go` — `Storage.Get`.
+- `server/internal/engine/engine_test.go` — `TestSetAndGet` e `TestGetMissingKey`.
+- `server/internal/storage/storage_test.go` — `TestEmptyValue`.
+- `server/internal/integration/server_test.go` — `TestServerEmptyValueAndMissingKey`.
 
-**Critério de aceite**
+**Critérios de aceite**
 
 ```gherkin
 Cenário: Consultar chave existente
@@ -150,18 +181,20 @@ Cenário: Consultar valor vazio
 
 ### FR-005 — Remover chave
 
-**Descrição:** DELETE remove a chave e informa `deleted=true`. Se ela não existir, a operação continua sendo uma resposta de sucesso e informa `deleted=false`.
+**Descrição:** DELETE deve remover a chave e informar `deleted=true`.
+
+Se a chave não existir, a operação deve continuar sendo uma resposta de sucesso e informar `deleted=false`.
 
 **Componentes:** `Engine` e `Storage`.
 
-**Evidência:**
-- [Engine.Execute](../../server/internal/engine/engine.go).
-- [Storage.Delete](../../server/internal/storage/storage.go).
-- [TestDelete](../../server/internal/engine/engine_test.go).
-- [TestDelete](../../server/internal/storage/storage_test.go).
-- [TestServerSetGetDelete](../../server/internal/integration/server_test.go).
+**Evidências:**
+- `server/internal/engine/engine.go` — `Engine.Execute`.
+- `server/internal/storage/storage.go` — `Storage.Delete`.
+- `server/internal/engine/engine_test.go` — `TestDelete`.
+- `server/internal/storage/storage_test.go` — `TestDelete`.
+- `server/internal/integration/server_test.go` — `TestServerSetGetDelete`.
 
-**Critério de aceite**
+**Critérios de aceite**
 
 ```gherkin
 Cenário: Remover chave existente
@@ -181,21 +214,32 @@ Cenário: Remover chave ausente
 
 ### FR-006 — Validar requisições e argumentos
 
-**Descrição:** Requisição nula, comando ausente ou comando tipado nulo é rejeitado como `INVALID_REQUEST`. Chave vazia em SET, GET ou DELETE é rejeitada como `INVALID_ARGUMENT`.
+**Descrição:** O engine deve rejeitar:
 
-**Componente:** `Engine`.
+- solicitação nula;
+- comando ausente;
+- comando desconhecido;
+- comando representado por ponteiro tipado nulo;
+- chave vazia em SET, GET ou DELETE.
 
-**Evidência:**
-- [Engine.Execute](../../server/internal/engine/engine.go).
-- [errorResponse](../../server/internal/engine/command.go).
-- [TestRejectsNilRequest](../../server/internal/engine/engine_test.go).
-- [TestRejectsMissingCommand](../../server/internal/engine/engine_test.go).
-- [TestRejectsEmptyKey](../../server/internal/engine/engine_test.go).
+Os erros devem ser representados por:
 
-**Critério de aceite**
+| Condição | Código |
+|---|---|
+| Solicitação ou comando inválido | `INVALID_REQUEST` |
+| Chave vazia | `INVALID_ARGUMENT` |
+
+**Componentes:** `Engine` e `errorResponse`.
+
+**Evidências:**
+- `server/internal/engine/engine.go` — `Engine.Execute`.
+- `server/internal/engine/command.go` — `errorResponse`.
+- `server/internal/engine/engine_test.go` — `TestRejectsNilRequest`, `TestRejectsMissingCommand` e `TestRejectsEmptyKey`.
+
+**Critérios de aceite**
 
 ```gherkin
-Cenário: Rejeitar uma solicitação nula
+Cenário: Rejeitar solicitação nula
   Dado que o engine recebeu uma solicitação nula
   Quando tentar executá-la
   Então deve responder com INVALID_REQUEST
@@ -211,27 +255,30 @@ Cenário: Rejeitar chave vazia
   Então deve responder com INVALID_ARGUMENT
 ```
 
-**Estado:** Implementado. A cobertura de testes para chave vazia é parcial: o teste identificado cobre SET, enquanto GET e DELETE possuem validação no código, mas não possuem testes específicos identificados.
+**Estado:** Implementado, cobertura parcial.
+
+**Lacuna de testes:** O teste identificado para chave vazia cobre SET. GET e DELETE possuem validação no código, mas não foram identificados testes específicos equivalentes para essas operações.
 
 ### FR-007 — Correlacionar respostas com solicitações
 
-**Descrição:** O engine copia o `request_id` da solicitação para a resposta. O contrato externo também define esse campo nos envelopes de requisição e resposta.
+**Descrição:** O engine deve copiar o `request_id` da solicitação para a resposta.
 
-O identificador permite correlacionar uma resposta com sua solicitação correspondente. Não representa, por si só, uma chave de idempotência e não impede que uma operação seja executada mais de uma vez.
+O codec deve preservar o identificador durante a serialização e desserialização.
 
-**Componentes:** `Engine`, protocolo interno e codec Protobuf.
+O identificador permite correlacionar uma resposta com sua solicitação correspondente. Não representa uma chave de idempotência e não impede a execução repetida de uma operação.
 
-**Evidência:**
-- [Request e Response](../../protocol/proto/memorydb/v1/memorydb.proto).
-- [Engine.Execute](../../server/internal/engine/engine.go).
-- [TestPing](../../server/internal/engine/engine_test.go).
-- [TestRequestRoundTrip](../../server/internal/codec/protobuf/codec_test.go).
-- [TestResponseRoundTrip](../../server/internal/codec/protobuf/codec_test.go).
+**Componentes:** `Engine`, modelo interno e codec Protobuf.
 
-**Critério de aceite**
+**Evidências:**
+- `protocol/proto/memorydb/v1/memorydb.proto` — envelopes `Request` e `Response`.
+- `server/internal/engine/engine.go` — `Engine.Execute`.
+- `server/internal/engine/engine_test.go` — `TestPing`.
+- `server/internal/codec/protobuf/codec_test.go` — `TestRequestRoundTrip` e `TestResponseRoundTrip`.
+
+**Critérios de aceite**
 
 ```gherkin
-Cenário: Preservar o identificador da solicitação
+Cenário: Preservar identificador no engine
   Dado que uma solicitação válida tem request_id 42
   Quando for executada pelo engine
   Então a resposta deve conter request_id 42
@@ -244,27 +291,29 @@ Cenário: Preservar identificador na serialização
 
 **Estado:** Implementado e testado.
 
+**Limitação:** Não existe deduplicação baseada nesse identificador.
+
 ### FR-008 — Delimitar mensagens TCP
 
-**Descrição:** Cada frame utiliza um cabeçalho de 4 bytes com tamanho `uint32` em Big Endian. O payload deve possuir entre 1 byte e 1 MiB.
+**Descrição:** Cada frame deve utilizar:
+
+- cabeçalho de 4 bytes;
+- tamanho `uint32`;
+- ordem de bytes Big Endian;
+- payload mínimo de 1 byte;
+- payload máximo de 1 MiB.
 
 A leitura deve reconstruir mensagens mesmo quando os bytes chegam fragmentados. A escrita deve tratar escritas parciais.
 
 Cabeçalhos ou payloads truncados, tamanho zero e tamanho acima do limite devem retornar erro.
 
-**Componente:** Módulo de transporte TCP.
+**Componente:** Módulo `transport/tcp/go`.
 
-**Evidência:**
-- [Framing TCP](../../transport/tcp/go/framing.go).
-- [TestFrameHeaderUsesBigEndian](../../transport/tcp/go/framing_test.go).
-- [TestReadFrameWithFragmentedInput](../../transport/tcp/go/framing_test.go).
-- [TestReadFrameRejectsZeroSize](../../transport/tcp/go/framing_test.go).
-- [TestReadFrameRejectsOversizedFrame](../../transport/tcp/go/framing_test.go).
-- [TestReadFrameRejectsIncompleteHeader](../../transport/tcp/go/framing_test.go).
-- [TestReadFrameRejectsIncompletePayload](../../transport/tcp/go/framing_test.go).
-- [TestWriteFrameHandlesPartialWrites](../../transport/tcp/go/framing_test.go).
+**Evidências:**
+- `transport/tcp/go/framing.go` — `ReadFrame` e `WriteFrame`.
+- `transport/tcp/go/framing_test.go` — testes de Big Endian, fragmentação, limites, truncamento e escrita parcial.
 
-**Critério de aceite**
+**Critérios de aceite**
 
 ```gherkin
 Cenário: Ler frame fragmentado
@@ -275,35 +324,37 @@ Cenário: Ler frame fragmentado
 Cenário: Rejeitar frame acima do limite
   Dado que o cabeçalho declara tamanho superior a 1 MiB
   Quando ReadFrame validar o tamanho
-  Então deve retornar erro sem aceitar o payload
+  Então deve retornar erro
 
 Cenário: Tratar escrita parcial
-  Dado que a conexão realiza escritas parciais
+  Dado que o writer realiza escritas parciais
   Quando WriteFrame transmitir o frame
   Então todos os bytes devem ser escritos corretamente
+  Ou deve retornar o erro ocorrido
 ```
 
 **Estado:** Implementado e testado.
 
 ### FR-009 — Atender várias requisições e clientes
 
-**Descrição:** O handler processa várias requisições sequenciais em uma mesma conexão TCP. O servidor aceita conexões de múltiplos clientes simultaneamente, compartilhando a mesma instância de armazenamento.
+**Descrição:** O handler deve processar várias requisições sequenciais em uma mesma conexão TCP.
 
-O driver Go serializa o ciclo de requisição e resposta por conexão, garantindo a correspondência entre cada solicitação e sua resposta.
+O servidor deve aceitar conexões de múltiplos clientes simultaneamente. As conexões de uma mesma instância devem compartilhar o mesmo armazenamento.
 
-**Componentes:** `Handler`, `Server`, transporte TCP e driver Go.
+O driver Go deve serializar o ciclo de requisição e resposta por conexão, garantindo a correspondência entre cada solicitação e sua resposta.
 
-**Evidência:**
-- [Handler.Handle](../../server/internal/transport/tcp/handler.go).
-- [Server.Serve](../../server/internal/transport/tcp/server.go).
-- [Connection](../../transport/tcp/go/connection.go).
-- [Driver Go](../../drivers/go/client.go).
-- [TestHandlerProcessesMultipleRequests](../../server/internal/transport/tcp/handler_test.go).
-- [TestServerAcceptsMultipleClients](../../server/internal/transport/tcp/server_test.go).
-- [TestServerMultipleClientsShareStorage](../../server/internal/integration/server_test.go).
-- [TestServerConcurrentClients](../../server/internal/integration/server_test.go).
+**Componentes:** `Handler`, `Server`, transporte TCP, `Engine`, `Storage` e driver Go.
 
-**Critério de aceite**
+**Evidências:**
+- `server/internal/transport/tcp/handler.go` — `Handler.Handle`.
+- `server/internal/transport/tcp/server.go` — `Server.Serve`.
+- `transport/tcp/go/connection.go` — `Connection`.
+- `drivers/go/client.go` — `Client.execute`.
+- `server/internal/transport/tcp/handler_test.go` — `TestHandlerProcessesMultipleRequests`.
+- `server/internal/transport/tcp/server_test.go` — `TestServerAcceptsMultipleClients`.
+- `server/internal/integration/server_test.go` — testes de compartilhamento de storage e clientes concorrentes.
+
+**Critérios de aceite**
 
 ```gherkin
 Cenário: Enviar mais de uma solicitação pela conexão
@@ -324,23 +375,23 @@ Cenário: Atender clientes simultaneamente
 
 **Estado:** Implementado e testado.
 
-**Limitação:** Não existe multiplexação de múltiplas requisições simultâneas na mesma conexão. O driver Go utiliza sincronização para executar um ciclo de requisição e resposta por vez.
+**Limitação:** Não existe multiplexação de requisições simultâneas na mesma conexão. O driver Go executa um ciclo de requisição e resposta por vez.
 
 ### FR-010 — Encerrar servidor graciosamente
 
-**Descrição:** `Shutdown` fecha o listener e aguarda as conexões ativas terminarem ou o contexto ser cancelado.
+**Descrição:** `Shutdown` deve fechar o listener e aguardar as conexões ativas terminarem ou o contexto ser cancelado.
 
-O executável solicita o encerramento ao receber SIGINT ou SIGTERM, utilizando timeout de 10 segundos.
+O executável deve solicitar encerramento ao receber SIGINT ou SIGTERM, utilizando timeout de 10 segundos.
 
 **Componentes:** `Server` e executável do servidor.
 
-**Evidência:**
-- [Server.Shutdown](../../server/internal/transport/tcp/server.go).
-- [main.go](../../server/cmd/memorydb/main.go).
-- [TestServerShutdownWaitsForActiveConnections](../../server/internal/transport/tcp/server_test.go).
-- [TestServerShutdownWaitsForActiveConnections — integração](../../server/internal/integration/server_test.go).
+**Evidências:**
+- `server/internal/transport/tcp/server.go` — `Server.Shutdown`.
+- `server/cmd/memorydb/main.go` — inicialização e tratamento de sinais.
+- `server/internal/transport/tcp/server_test.go` — `TestServerShutdownWaitsForActiveConnections`.
+- `server/internal/integration/server_test.go` — teste de shutdown com conexões ativas.
 
-**Critério de aceite**
+**Critérios de aceite**
 
 ```gherkin
 Cenário: Aguardar conexão ativa durante shutdown
@@ -357,32 +408,33 @@ Cenário: Encerrar após sinal do sistema operacional
   E deve respeitar o timeout configurado
 ```
 
-**Estado:** Implementado. O encerramento do servidor possui testes; o fluxo de sinais do executável não possui teste automatizado específico identificado.
+**Estado:** Implementado, cobertura parcial.
 
-**Limitação:** O servidor não força o fechamento das conexões ativas quando o contexto de shutdown expira. Nesse caso, `Shutdown` retorna o erro de contexto, mas as conexões permanecem sob responsabilidade de seus respectivos handlers.
+**Limitações:**
+- O servidor não força o fechamento das conexões ativas quando o contexto expira.
+- O fluxo de sinais do executável não possui teste automatizado específico identificado.
 
 ### FR-011 — Controlar operações do driver por contexto
 
-**Descrição:** O driver Go oferece métodos baseados em `context.Context` para controlar o prazo e o cancelamento de operações. Também oferece `DialContext` para controlar o estabelecimento inicial da conexão.
+**Descrição:** O driver Go deve oferecer métodos baseados em `context.Context` para controlar cancelamento e deadlines das operações.
 
-O comportamento do cancelamento depende da fase em que a operação se encontra:
+`DialContext` deve permitir controlar o estabelecimento inicial da conexão. O contexto utilizado para estabelecer a conexão não permanece associado ao cliente após a conexão ser criada.
 
-- Se o contexto for cancelado enquanto a operação aguarda acesso ao mecanismo de serialização, a operação não iniciou o I/O. O driver retorna o erro do contexto e mantém a conexão utilizável.
-- Se o contexto for cancelado durante o I/O, o driver interrompe a operação fechando a conexão. Como não é possível determinar com segurança se o servidor executou o comando antes da interrupção, o driver retorna `OperationOutcomeUnknownError`.
-- Quando uma operação termina normalmente, o resultado recebido é retornado conforme o contrato do comando.
-- O erro `OperationOutcomeUnknownError` preserva o identificador da solicitação e a causa original, permitindo inspeção com `errors.As` e `errors.Is`.
+O comportamento do cancelamento depende da fase da operação:
 
-O estado do cliente é atualizado de acordo com o resultado da operação. Após uma interrupção durante I/O, a conexão não é reutilizada.
+1. Se o contexto for cancelado enquanto a operação aguarda acesso ao mecanismo de serialização, a operação ainda não iniciou o I/O. O driver retorna o erro de contexto e mantém a conexão utilizável.
+2. Se o contexto for cancelado durante o I/O, o driver interrompe a comunicação fechando a conexão. O resultado pode ser indeterminado, pois o servidor pode já ter executado o comando.
+3. Se a comunicação e a recepção da resposta forem concluídas antes da interrupção, o resultado é processado normalmente.
+
+O erro `OperationOutcomeUnknownError` deve preservar o identificador da solicitação e a causa original, permitindo inspeção por `errors.As` e `errors.Is`.
 
 **Componente:** Driver Go.
 
-**Evidência:**
-- [Driver Go](../../drivers/go/client.go).
-- [TestClientPartialWriteReturnsUnknownOutcome](../../drivers/go/client_test.go).
-- [TestClientSetReturnsUnknownOutcomeAfterServerExecution](../../drivers/go/client_test.go).
-- [TestClientCancellationDuringFinalResponseRead](../../drivers/go/client_test.go).
+**Evidências:**
+- `drivers/go/client.go` — `DialContext`, métodos context-aware e `Client.execute`.
+- `drivers/go/client_test.go` — testes de escrita parcial, execução no servidor seguida de perda da resposta e cancelamento durante a leitura da resposta.
 
-**Critério de aceite**
+**Critérios de aceite**
 
 ```gherkin
 Cenário: Cancelar operação antes do início do I/O
@@ -397,10 +449,10 @@ Cenário: Cancelar operação durante o I/O
   Quando seu contexto for cancelado
   Então o driver deve interromper a conexão
   E deve retornar OperationOutcomeUnknownError
-  E deve preservar o RequestID e a causa do cancelamento
+  E deve preservar o RequestID e a causa
   E o cliente não deve reutilizar a conexão interrompida
 
-Cenário: Preservar a causa original do erro
+Cenário: Preservar a causa original
   Dado que uma operação retorna OperationOutcomeUnknownError
   Quando a aplicação inspecionar o erro
   Então deve conseguir identificar seu tipo com errors.As
@@ -409,62 +461,81 @@ Cenário: Preservar a causa original do erro
 
 **Estado:** Implementado e testado no driver Go.
 
-**Limitação:** O controle por contexto não oferece garantia de que uma operação cancelada durante I/O não tenha sido executada no servidor. Também não existe mecanismo server-side para consultar ou recuperar o resultado dessa operação. O driver não realiza retry automático.
+**Limitação:** O controle por contexto não garante que uma operação cancelada durante I/O deixou de ser executada no servidor. Não existe mecanismo server-side para consultar ou recuperar seu resultado. O driver não realiza retry automático.
 
-## 3. Requisitos não funcionais
+## 4. Requisitos não funcionais e características verificáveis
 
-| ID | Requisito / observação verificável | Estado | Evidência |
+Esta seção registra características observáveis da implementação atual. Itens não implementados representam lacunas, não garantias oferecidas pelo sistema.
+
+| ID | Requisito ou característica | Estado | Evidência |
 |---|---|---|---|
-| NFR-001 | Operações concorrentes de armazenamento são protegidas por `sync.RWMutex`. | Implementado | [Storage](../../server/internal/storage/storage.go), [TestConcurrentAccess](../../server/internal/storage/storage_test.go) |
-| NFR-002 | Valores são tratados como bytes, incluindo dados binários, no modelo interno e no contrato Protobuf. | Implementado | [memorydb.proto](../../protocol/proto/memorydb/v1/memorydb.proto), [TestRequestRoundTrip](../../server/internal/codec/protobuf/codec_test.go) |
-| NFR-003 | Frames de entrada e saída são limitados a 1 MiB e utilizam Big Endian. | Implementado | [framing.go](../../transport/tcp/go/framing.go), [framing_test.go](../../transport/tcp/go/framing_test.go) |
-| NFR-004 | O servidor pode fechar o listener e aguardar conexões ativas. O executável limita o shutdown a 10 segundos. | Parcial | [server.go](../../server/internal/transport/tcp/server.go), [main.go](../../server/cmd/memorydb/main.go) |
-| NFR-005 | Dados sobrevivem à reinicialização do processo. | Não implementado | O armazenamento é exclusivamente em memória. [storage.go](../../server/internal/storage/storage.go) |
-| NFR-006 | Comunicação autenticada e criptografada por TLS. | Não implementado | O servidor utiliza listener TCP sem TLS. [main.go](../../server/cmd/memorydb/main.go) |
-| NFR-007 | Timeout de leitura/escrita no servidor, limite de conexões concorrentes e proteção contra clientes lentos. | Não implementado | Não há políticas operacionais específicas identificadas em [connection.go](../../transport/tcp/go/connection.go) e [server.go](../../server/internal/transport/tcp/server.go). |
-| NFR-008 | Meta mensurável de latência e throughput para operações. | Não implementado | Não há metas ou benchmarks de performance identificados. |
-| NFR-009 | Erros de processamento de conexão devem ser observáveis em log. | Não implementado | O erro retornado por `Handler.Handle` é descartado pela goroutine do servidor. [server.go](../../server/internal/transport/tcp/server.go) |
-| NFR-010 | Separação entre armazenamento, execução de comandos, protocolo interno, serialização e transporte. | Implementado | [Engine](../../server/internal/engine), [Storage](../../server/internal/storage), [Protocol](../../server/internal/protocol), [Codec](../../server/internal/codec), [Transporte TCP](../../server/internal/transport/tcp) |
-| NFR-011 | O transporte TCP deve ser reutilizável sem dependência direta do Protobuf. | Implementado | [Módulo TCP](../../transport/tcp/go), [Driver Go](../../drivers/go), [Handler](../../server/internal/transport/tcp/handler.go) |
-| NFR-012 | O driver Go deve permitir que aplicações utilizem o MemoryDB sem implementar manualmente o protocolo de comunicação. | Implementado | [Driver Go](../../drivers/go/client.go), [Testes do driver](../../drivers/go/client_test.go) |
-| NFR-013 | Os módulos Go devem permitir desenvolvimento e testes independentes dentro do workspace. | Implementado | [go.work](../../go.work), arquivos `go.mod` dos módulos |
-| NFR-014 | O código deve passar pelos testes com detector de condições de corrida e pela análise estática `go vet`. | Validado nas execuções registradas | Validação dos módulos em 15/11/2026 e validações posteriores do driver Go, incluindo `go test -race -count=20 ./drivers/go` e `go vet ./drivers/go`. |
+| NFR-001 | Operações concorrentes de armazenamento devem ser sincronizadas. | Implementado e testado | `server/internal/storage/storage.go`, `storage_test.go` |
+| NFR-002 | Valores devem ser tratados como bytes, inclusive dados binários. | Implementado | `memorydb.proto`, modelo interno e codec |
+| NFR-003 | Frames devem respeitar limite de 1 MiB e codificação Big Endian. | Implementado e testado | `transport/tcp/go/framing.go`, `framing_test.go` |
+| NFR-004 | O servidor deve interromper a aceitação e aguardar conexões durante shutdown. | Parcial | `server/internal/transport/tcp/server.go` |
+| NFR-005 | Dados devem sobreviver à reinicialização do processo. | Não implementado | `server/internal/storage/storage.go` |
+| NFR-006 | Comunicação deve oferecer criptografia TLS. | Não implementado | `server/cmd/memorydb/main.go` |
+| NFR-007 | O servidor deve impor timeouts de I/O e limites operacionais de conexões. | Não implementado | `server/internal/transport/tcp/server.go`, `transport/tcp/go/connection.go` |
+| NFR-008 | O projeto deve possuir metas mensuráveis de latência e throughput. | Não identificado | Não foram identificadas metas ou benchmarks de performance |
+| NFR-009 | Falhas de processamento de conexões devem ser observáveis em logs. | Não implementado no fluxo atual | `server/internal/transport/tcp/server.go` |
+| NFR-010 | Execução de comandos, storage, protocolo, codec e transporte devem possuir responsabilidades separadas. | Implementado | Pacotes internos do módulo `server` |
+| NFR-011 | O transporte TCP deve ser reutilizável sem dependência direta do Protobuf. | Implementado | `transport/tcp/go`, `drivers/go`, handler do servidor |
+| NFR-012 | Aplicações Go devem consumir o serviço por meio de uma API cliente. | Implementado e testado | `drivers/go/client.go`, `drivers/go/client_test.go` |
+| NFR-013 | Os módulos Go devem permitir desenvolvimento e testes independentes no workspace. | Implementado | `go.work` e arquivos `go.mod` |
+| NFR-014 | O código deve passar pelos testes com detector de condições de corrida e análise estática. | Validação histórica | Registros de validação por módulo descritos na seção 8 |
 
-**Observações sobre NFR-007:** O suporte a `context.Context` no driver permite controlar operações do lado cliente, mas não equivale à implementação de políticas server-side de timeout de leitura, timeout de escrita, inatividade ou proteção contra clientes lentos.
+### 4.1 Observações sobre os requisitos não funcionais
 
-**Observações sobre NFR-014:** A validação é uma evidência vinculada à versão do código e à data de execução. Não representa garantia permanente de que alterações futuras continuarão passando pelos mesmos testes e verificações.
+**NFR-004 — Shutdown**
 
-## 4. Casos de borda implementados
+O servidor fecha o listener e aguarda as conexões ativas. O executável utiliza timeout de 10 segundos. A expiração do contexto não implica fechamento forçado das conexões.
+
+**NFR-007 — Limites operacionais**
+
+O limite de tamanho dos frames não equivale a um limite de conexões, timeout de leitura, timeout de escrita ou proteção contra clientes lentos.
+
+Os contextos do driver controlam operações no lado cliente, mas não substituem políticas operacionais aplicadas pelo servidor.
+
+**NFR-009 — Observabilidade**
+
+A goroutine criada por `Server.Serve()` descarta o erro retornado por `Handler.Handle`. Portanto, falhas individuais de conexão não são registradas de forma estruturada nesse ponto.
+
+**NFR-014 — Validação**
+
+A aprovação em testes é uma evidência associada a uma versão do código e a uma execução específica. Não representa garantia permanente para alterações futuras.
+
+## 5. Casos de borda e comportamento observado
 
 | Caso | Comportamento atual | Evidência |
 |---|---|---|
-| Requisição nula ou comando ausente | Retorna `INVALID_REQUEST` no engine. | [engine.go](../../server/internal/engine/engine.go), [engine_test.go](../../server/internal/engine/engine_test.go) |
-| Comando tipado nulo | Rejeitado como requisição inválida. | [engine.go](../../server/internal/engine/engine.go), [engine_test.go](../../server/internal/engine/engine_test.go) |
-| Chave vazia | SET, GET e DELETE rejeitam a operação com `INVALID_ARGUMENT`. | [engine.go](../../server/internal/engine/engine.go), [TestRejectsEmptyKey](../../server/internal/engine/engine_test.go) |
-| TTL maior que zero | SET retorna `UNSUPPORTED_FEATURE`; não há expiração. | [engine.go](../../server/internal/engine/engine.go), [TestRejectsUnsupportedTTL](../../server/internal/engine/engine_test.go) |
-| Valor vazio | Pode ser armazenado; GET informa que a chave foi encontrada. | [storage.go](../../server/internal/storage/storage.go), [TestEmptyValue](../../server/internal/storage/storage_test.go) |
-| Chave inexistente | GET retorna `found=false`; DELETE retorna `deleted=false`. | [engine.go](../../server/internal/engine/engine.go), [engine_test.go](../../server/internal/engine/engine_test.go) |
-| Substituição de valor | SET substitui o valor anterior da mesma chave. | [TestSetOverwritesExistingValue](../../server/internal/storage/storage_test.go) |
-| Mutação de slice pelo chamador | SET e GET copiam os bytes para proteger o conteúdo armazenado. | [storage.go](../../server/internal/storage/storage.go), [storage_test.go](../../server/internal/storage/storage_test.go) |
-| Frame com tamanho zero | Rejeitado pelo framing. | [framing.go](../../transport/tcp/go/framing.go), [framing_test.go](../../transport/tcp/go/framing_test.go) |
-| Frame acima de 1 MiB | Rejeitado pelo framing. | [framing.go](../../transport/tcp/go/framing.go), [framing_test.go](../../transport/tcp/go/framing_test.go) |
-| Frame truncado | Cabeçalho ou payload incompleto retorna erro. | [framing_test.go](../../transport/tcp/go/framing_test.go) |
-| Escrita parcial | O framing continua escrevendo até transmitir o frame completo ou encontrar erro. | [framing_test.go](../../transport/tcp/go/framing_test.go) |
-| Protobuf inválido | Decode retorna erro Go. | [codec.go](../../server/internal/codec/protobuf/codec.go), [codec_test.go](../../server/internal/codec/protobuf/codec_test.go) |
-| Comando ou resultado ausente no codec | Encode/Decode rejeita estruturas inválidas. | [codec.go](../../server/internal/codec/protobuf/codec.go), [codec_test.go](../../server/internal/codec/protobuf/codec_test.go) |
-| Cliente desconecta por EOF | Handler encerra sem tratar EOF como erro de protocolo para o chamador. | [handler.go](../../server/internal/transport/tcp/handler.go), [TestServerClientDisconnectDoesNotStopServer](../../server/internal/integration/server_test.go) |
-| Concorrência no storage | Operações são sincronizadas por lock de leitura/escrita. | [storage.go](../../server/internal/storage/storage.go), [TestConcurrentAccess](../../server/internal/storage/storage_test.go) |
-| Múltiplos clientes | Conexões distintas podem utilizar a mesma instância do servidor e compartilhar o armazenamento. | [server_test.go](../../server/internal/transport/tcp/server_test.go), [server_test.go — integração](../../server/internal/integration/server_test.go) |
-| Desconexão durante operação | Falhas de leitura e escrita são propagadas pelo driver. | [client_test.go](../../drivers/go/client_test.go) |
-| Cancelamento antes do início do I/O | A operação retorna o erro de contexto sem invalidar a conexão. | [client_test.go](../../drivers/go/client_test.go) |
-| Cancelamento durante o I/O | A conexão é interrompida e o driver sinaliza resultado indeterminado. | [client.go](../../drivers/go/client.go), [client_test.go](../../drivers/go/client_test.go) |
-| Escrita parcial seguida de falha | O driver não presume que a operação deixou de ser executada; retorna resultado indeterminado. | [client_test.go](../../drivers/go/client_test.go) |
-| Servidor executa SET, mas a resposta não chega ao cliente | O cliente não consegue determinar se o comando foi aplicado e retorna resultado indeterminado quando detecta a falha. | [TestClientSetReturnsUnknownOutcomeAfterServerExecution](../../drivers/go/client_test.go) |
-| Identificador da operação | `RequestID` identifica a solicitação e permite correlacionar a resposta; não realiza deduplicação. | [client.go](../../drivers/go/client.go), [memorydb.proto](../../protocol/proto/memorydb/v1/memorydb.proto) |
+| Solicitação nula | Retorna `INVALID_REQUEST` no engine | `engine.go`, `engine_test.go` |
+| Comando ausente | Retorna `INVALID_REQUEST` | `engine.go`, `engine_test.go` |
+| Comando tipado nulo | Rejeitado como requisição inválida | `engine.go`, `engine_test.go` |
+| Chave vazia | SET, GET e DELETE rejeitam com `INVALID_ARGUMENT` | `engine.go`, `engine_test.go` |
+| TTL maior que zero | SET retorna `UNSUPPORTED_FEATURE` | `engine.go`, `engine_test.go` |
+| Valor vazio | Pode ser armazenado; GET informa `found=true` | `storage.go`, `storage_test.go` |
+| Chave inexistente | GET retorna `found=false`; DELETE retorna `deleted=false` | `engine.go`, `engine_test.go` |
+| Substituição de valor | SET substitui o valor anterior | `storage_test.go` |
+| Mutação de slice pelo chamador | SET e GET copiam bytes | `storage.go`, `storage_test.go` |
+| Frame com tamanho zero | Rejeitado pelo framing | `framing.go`, `framing_test.go` |
+| Frame acima de 1 MiB | Rejeitado pelo framing | `framing.go`, `framing_test.go` |
+| Frame truncado | Cabeçalho ou payload incompleto retorna erro | `framing_test.go` |
+| Escrita parcial | O framing tenta completar a escrita ou retorna erro | `framing_test.go` |
+| Protobuf inválido | Decode retorna erro | `codec.go`, `codec_test.go` |
+| Comando ou resultado ausente no codec | Estrutura inválida é rejeitada | `codec.go`, `codec_test.go` |
+| Cliente desconecta por EOF | Handler encerra sem tratar EOF como falha de aplicação | `handler.go`, testes de integração |
+| Concorrência no storage | Operações são sincronizadas por `RWMutex` | `storage.go`, `storage_test.go` |
+| Múltiplos clientes | Conexões distintas compartilham o storage da instância | Testes do servidor e integração |
+| Desconexão durante operação | Driver propaga falha de comunicação | `client.go`, `client_test.go` |
+| Cancelamento antes do I/O | Retorna erro de contexto sem invalidar a conexão | `client.go`, `client_test.go` |
+| Cancelamento durante o I/O | Interrompe conexão e sinaliza resultado indeterminado | `client.go`, `client_test.go` |
+| Escrita parcial seguida de falha | Driver não presume que a operação deixou de ser executada | `client_test.go` |
+| Servidor executa SET, mas resposta não chega | Driver pode retornar resultado indeterminado | `TestClientSetReturnsUnknownOutcomeAfterServerExecution` |
+| Identificador da solicitação | `request_id` correlaciona solicitação e resposta; não deduplica | `memorydb.proto`, `client.go` |
 
-## 5. Rastreabilidade requisito–componente–teste
+## 6. Rastreabilidade requisito–componente–teste
 
-| Requisito | Componente principal | Testes existentes | Cobertura |
+| Requisito | Componente principal | Testes identificados | Cobertura |
 |---|---|---|---|
 | FR-001 | Engine | `TestPing` | Coberto |
 | FR-002 | Engine / Storage | `TestSetAndGet`, `TestSetOverwritesExistingValue` | Coberto |
@@ -474,27 +545,31 @@ Cenário: Preservar a causa original do erro
 | FR-006 | Engine | `TestRejectsEmptyKey`, `TestRejectsNilRequest`, `TestRejectsMissingCommand` | Parcial: faltam testes específicos de chave vazia em GET e DELETE |
 | FR-007 | Engine / Codec | `TestPing`, `TestRequestRoundTrip`, `TestResponseRoundTrip` | Coberto |
 | FR-008 | Framing TCP | Testes de endian, fragmentação, limites, truncamento e escrita parcial | Coberto |
-| FR-009 | Handler / Server / Driver | `TestHandlerProcessesMultipleRequests`, `TestServerAcceptsMultipleClients`, `TestServerMultipleClientsShareStorage`, `TestServerConcurrentClients` | Coberto para conexões distintas e requisições sequenciais |
-| FR-010 | Server / Executável | `TestServerShutdownWaitsForActiveConnections` | Parcial: fluxo de sinais do executável sem teste específico |
-| FR-011 | Driver Go | `TestClientPartialWriteReturnsUnknownOutcome`, `TestClientSetReturnsUnknownOutcomeAfterServerExecution`, `TestClientCancellationDuringFinalResponseRead` | Coberto para os cenários identificados |
+| FR-009 | Handler / Server / Driver | `TestHandlerProcessesMultipleRequests`, `TestServerAcceptsMultipleClients`, testes de integração | Coberto para conexões distintas e requisições sequenciais |
+| FR-010 | Server / Executável | `TestServerShutdownWaitsForActiveConnections` | Parcial: fluxo de sinais sem teste específico identificado |
+| FR-011 | Driver Go | Testes de escrita parcial, execução no servidor com perda da resposta e cancelamento durante leitura | Coberto para os cenários identificados |
 
-## 6. Lacunas de especificação e comportamento
+## 7. Lacunas de especificação e comportamento
+
+Os itens desta seção não são requisitos funcionais já disponíveis. São limitações identificadas que precisam de decisões de produto e engenharia antes de serem transformadas em novas especificações.
 
 ### GAP-001 — TTL funcional não implementado
 
-O contrato Protobuf declara `ttl_ms`, mas qualquer valor positivo é rejeitado pelo engine. Não existe expiração automática de entradas.
+O contrato Protobuf declara `ttl_ms`, mas qualquer valor positivo é rejeitado pelo engine.
 
-**Impacto:** as aplicações não podem solicitar expiração temporária de chaves.
+Não existe expiração automática de entradas.
 
-**Referências:** [memorydb.proto](../../protocol/proto/memorydb/v1/memorydb.proto), [engine.go](../../server/internal/engine/engine.go).
+**Impacto:** aplicações não podem solicitar expiração temporária de chaves.
+
+**Referências:** `protocol/proto/memorydb/v1/memorydb.proto`, `server/internal/engine/engine.go`.
 
 ### GAP-002 — Persistência não implementada
 
-O armazenamento é mantido exclusivamente em memória. A reinicialização do processo elimina os dados.
+O armazenamento é mantido exclusivamente em memória.
 
-**Impacto:** não há durabilidade nem recuperação de dados após falhas ou reinicializações.
+**Impacto:** a reinicialização do processo elimina os dados. Não há durabilidade nem recuperação após falhas.
 
-**Referência:** [storage.go](../../server/internal/storage/storage.go).
+**Referência:** `server/internal/storage/storage.go`.
 
 ### GAP-003 — Autenticação e autorização não implementadas
 
@@ -506,13 +581,13 @@ O servidor não identifica clientes nem valida permissões para execução de co
 
 A comunicação utiliza TCP sem criptografia.
 
-**Impacto:** os dados trafegam sem proteção criptográfica no transporte.
+**Impacto:** os dados não possuem proteção criptográfica no transporte.
 
-**Referência:** [main.go](../../server/cmd/memorydb/main.go).
+**Referência:** `server/cmd/memorydb/main.go`.
 
 ### GAP-005 — Isolamento por tenant não implementado
 
-O armazenamento atual é compartilhado entre todos os clientes conectados à mesma instância.
+O armazenamento é compartilhado entre todos os clientes conectados à mesma instância.
 
 **Impacto:** não existe separação lógica de dados por organização ou cliente.
 
@@ -520,25 +595,23 @@ O armazenamento atual é compartilhado entre todos os clientes conectados à mes
 
 O tamanho dos frames é limitado a 1 MiB, mas não foram identificados limites específicos para:
 
-- Quantidade de conexões simultâneas.
-- Tempo máximo de leitura no servidor.
-- Tempo máximo de escrita no servidor.
-- Tempo máximo de inatividade de uma conexão.
-- Proteção contra clientes que enviam dados lentamente.
+- quantidade de conexões simultâneas;
+- tempo máximo de leitura no servidor;
+- tempo máximo de escrita no servidor;
+- tempo máximo de inatividade de uma conexão;
+- proteção contra clientes que enviam dados lentamente.
 
 **Impacto:** conexões lentas ou excessivas podem consumir recursos do servidor.
 
-**Referências:** [connection.go](../../transport/tcp/go/connection.go), [server.go](../../server/internal/transport/tcp/server.go), [framing.go](../../transport/tcp/go/framing.go).
-
-**Observação:** os métodos context-aware do driver permitem ao cliente controlar o prazo de suas operações, mas não substituem limites e timeouts operacionais aplicados pelo servidor.
+**Referências:** `transport/tcp/go/connection.go`, `transport/tcp/go/framing.go`, `server/internal/transport/tcp/server.go`.
 
 ### GAP-007 — Observabilidade de erros de conexão incompleta
 
-O servidor executa `Handler.Handle` em goroutines, mas o erro retornado pelo handler é descartado.
+O servidor executa `Handler.Handle` em goroutines, mas descarta o erro retornado pelo handler.
 
 **Impacto:** falhas de processamento de conexões não são registradas de maneira estruturada pelo servidor.
 
-**Referência:** [server.go](../../server/internal/transport/tcp/server.go).
+**Referência:** `server/internal/transport/tcp/server.go`.
 
 ### GAP-008 — Multiplexação de requisições não implementada
 
@@ -546,56 +619,58 @@ O driver Go utiliza sincronização para garantir que uma solicitação seja env
 
 **Impacto:** uma conexão não permite múltiplas requisições simultâneas em trânsito, embora o servidor atenda várias conexões simultaneamente.
 
-**Referência:** [client.go](../../drivers/go/client.go).
+**Referência:** `drivers/go/client.go`.
 
-### GAP-009 — Resultado indeterminado não possui recuperação server-side
+### GAP-009 — Resultado indeterminado sem recuperação server-side
 
-O driver Go implementa operações baseadas em `context.Context` e identifica situações nas quais o resultado de uma operação não pode ser confirmado pelo cliente.
+O driver Go identifica situações nas quais o resultado de uma operação não pode ser confirmado pelo cliente.
 
 Quando o cancelamento acontece antes do início do I/O, o driver retorna o erro de contexto sem invalidar a conexão.
 
-Quando o cancelamento ou uma falha de comunicação acontece durante o I/O, o servidor pode já ter executado o comando, mesmo que o cliente não tenha recebido a resposta. Nesse cenário, o driver interrompe a conexão e retorna `OperationOutcomeUnknownError`, preservando o `RequestID` e a causa original.
+Quando o cancelamento ou uma falha de comunicação acontece durante o I/O, o servidor pode já ter executado o comando, mesmo que o cliente não tenha recebido a resposta.
+
+Nesse cenário, o driver interrompe a conexão e retorna `OperationOutcomeUnknownError`, preservando o `RequestID` e a causa original.
 
 Entretanto, o servidor ainda não oferece:
 
-- Identificador de operação estável para deduplicação.
-- Registro de operações executadas e seus resultados.
-- Consulta posterior do resultado de uma operação.
-- Reenvio seguro de uma operação com garantia de não duplicação.
-- Recuperação de resultados após desconexão.
+- identificador estável de operação para deduplicação;
+- registro de operações executadas e seus resultados;
+- consulta posterior do resultado de uma operação;
+- reenvio seguro com garantia de não duplicação;
+- recuperação de resultados após desconexão.
 
 **Impacto:** aplicações precisam tratar explicitamente resultados indeterminados. Repetir automaticamente uma operação após esse erro pode executar o comando novamente. O driver não realiza retry automático.
 
-**Referência:** [client.go](../../drivers/go/client.go).
+**Referência:** `drivers/go/client.go`.
 
-### GAP-010 — Driver Java não validado nesta etapa
+### GAP-010 — Driver Java não implementado e validado
 
-A arquitetura prevê drivers independentes do servidor, mas a implementação e a validação do driver Java não fazem parte do estado funcional documentado aqui.
+A arquitetura permite evolução para outros drivers, mas não há implementação e validação de driver Java consideradas parte do escopo funcional atual.
 
-**Impacto:** a integração por Java ainda não deve ser considerada um requisito implementado.
+**Impacto:** a integração por Java não deve ser considerada requisito implementado.
 
 ### GAP-011 — Idempotência e deduplicação não implementadas
 
 O protocolo possui `request_id`, utilizado para correlacionar requisições e respostas. Entretanto, esse identificador não constitui uma chave de idempotência.
 
-O servidor não mantém um registro de operações já executadas, não identifica reenvios de uma mesma operação lógica e não reproduz resultados anteriores.
+O servidor não mantém registro de operações executadas, não identifica reenvios de uma mesma operação lógica e não reproduz resultados anteriores.
 
 **Impacto:** em caso de perda de resposta ou resultado indeterminado, o cliente não consegue reenviar uma operação com garantia de que ela será executada no máximo uma vez.
 
-A implementação futura deverá definir, entre outros aspectos:
+A implementação futura deverá definir:
 
-- Identificador estável da operação, independente do identificador de transporte.
-- Escopo e período de retenção dos identificadores.
-- Armazenamento do resultado associado à operação.
-- Comportamento para identificadores repetidos com conteúdo divergente.
-- Política de concorrência para requisições com o mesmo identificador.
-- Relação entre deduplicação, persistência e recuperação após reinicialização.
+- identificador estável da operação, independente do identificador de transporte;
+- escopo e período de retenção dos identificadores;
+- armazenamento do resultado associado à operação;
+- comportamento para identificadores repetidos com conteúdo divergente;
+- política de concorrência para requisições com o mesmo identificador;
+- relação entre deduplicação, persistência e recuperação após reinicialização.
 
-**Referência:** [memorydb.proto](../../protocol/proto/memorydb/v1/memorydb.proto), [client.go](../../drivers/go/client.go).
+**Referências:** `protocol/proto/memorydb/v1/memorydb.proto`, `drivers/go/client.go`.
 
-## 7. Validação técnica da implementação
+## 8. Histórico de validação técnica
 
-Na validação registrada em 15/11/2026, foram executados os testes e a análise estática nos seguintes módulos:
+Os registros disponíveis indicam uma validação integral dos módulos em 15/11/2026, com os seguintes resultados:
 
 | Módulo | `go test -race -count=1 ./...` | `go vet ./...` |
 |---|---|---|
@@ -616,16 +691,18 @@ go test -race -count=20 ./drivers/go
 go vet ./drivers/go
 ```
 
-Os testes adicionais contemplaram, entre outros cenários:
+Os cenários adicionais contemplaram:
 
-- Falha durante escrita parcial.
-- Servidor executando SET antes de a resposta ser perdida.
-- Cancelamento durante a leitura da resposta final.
-- Preservação do identificador e da causa do resultado indeterminado.
+- falha durante escrita parcial;
+- servidor executando SET antes de a resposta ser perdida;
+- cancelamento durante a leitura da resposta final;
+- preservação do identificador e da causa do resultado indeterminado.
 
-**Observação:** a validação de 15/11 comprova o estado dos módulos naquela execução. A validação posterior comprova os cenários adicionais do driver Go, mas não substitui uma nova execução completa de todos os módulos após as alterações. Alterações futuras no código também exigem nova execução para manter essas evidências atualizadas.
+**Observação:** a validação integral de 15/11 comprova o estado dos módulos naquela execução. As validações posteriores comprovam cenários adicionais do driver Go, mas não substituem uma nova execução completa de todos os módulos após as alterações.
 
-## 8. Critério geral de conclusão do escopo atual
+Para atualizar a evidência do estado atual, executar novamente os testes e a análise estática em cada módulo do workspace.
+
+## 9. Critério geral de conclusão do escopo atual
 
 O escopo funcional inicial do MemoryDB é considerado implementado quando:
 
@@ -637,9 +714,14 @@ O escopo funcional inicial do MemoryDB é considerado implementado quando:
 6. O servidor atende múltiplos clientes e conexões persistentes.
 7. O driver Go permite consumir as operações sem implementar manualmente o protocolo.
 8. O driver Go oferece operações context-aware e sinaliza resultados indeterminados quando não é possível confirmar o desfecho de uma operação.
-9. O servidor oferece encerramento gracioso.
-10. Os testes automatizados e a análise estática passam em todos os módulos.
+9. O servidor oferece encerramento gracioso dentro das limitações documentadas.
+10. Os testes automatizados e a análise estática passam nos módulos do workspace.
 
 Os GAPs documentados neste arquivo não impedem a conclusão do escopo inicial, pois representam evoluções planejadas e limitações conhecidas da implementação atual.
 
-**Este documento não substitui o roadmap:** o roadmap registra o que será desenvolvido; este documento registra o que existe, como pode ser verificado e quais limitações permanecem.
+Este documento não substitui o roadmap:
+
+- `REQUISITOS.md` registra o comportamento implementado, os critérios de aceite e as lacunas.
+- `memorydb-roadmap.md` registra as evoluções planejadas.
+- `ARQUITETURA.md` registra a organização arquitetural e as dependências.
+- `COMPONENTES.md` registra responsabilidades e contratos dos componentes.

@@ -1,180 +1,162 @@
 # Documentação do MemoryDB
 
-## Sumário executivo
+Esta pasta reúne a documentação técnica, os requisitos e o manual de utilização do MemoryDB.
 
-MemoryDB é um servidor chave-valor em memória, implementado em Go e organizado como um workspace com módulos independentes. O executável do servidor está em `server/cmd/memorydb/main.go`.
+MemoryDB é um servidor chave-valor em memória, implementado em Go, com comunicação TCP e mensagens Protocol Buffers (Protobuf).
 
-Clientes se comunicam por TCP utilizando frames com prefixo de tamanho e mensagens Protocol Buffers. O framing é implementado de forma independente da serialização, no módulo `transport/tcp/go`, enquanto o contrato externo está definido em `protocol/proto/memorydb/v1/memorydb.proto`.
+O projeto separa armazenamento, execução de comandos, protocolo interno, serialização, transporte e drivers. Essa organização permite evoluir os componentes sem acoplar diretamente o núcleo do banco às tecnologias de comunicação.
 
-As operações implementadas são PING, SET, GET e DELETE. O campo `ttl_ms` existe no contrato, mas valores positivos são rejeitados como recurso ainda não suportado.
+## 1. Estado atual
 
-O armazenamento compartilha dados entre as conexões da mesma instância e protege o mapa contra acesso concorrente. Os valores são mantidos exclusivamente em memória e perdidos quando o processo é encerrado.
+A implementação atual contempla:
 
-A arquitetura separa armazenamento, execução de comandos, protocolo interno, codec, transporte TCP, servidor e drivers. O projeto possui um driver Go com operações básicas, suporte a `context.Context`, serialização de operações concorrentes e tratamento de falhas de comunicação e protocolo.
+- Servidor TCP com conexões persistentes.
+- Comandos PING, SET, GET e DELETE.
+- Armazenamento de chaves `string` e valores `[]byte`.
+- Compartilhamento dos dados entre conexões da mesma instância.
+- Proteção concorrente do armazenamento.
+- Framing TCP independente da serialização.
+- Contrato externo definido em Protobuf.
+- Driver cliente Go.
+- Operações do driver com suporte a `context.Context`.
+- Tratamento de erros de comunicação e resultados indeterminados.
+- Atendimento concorrente de múltiplos clientes.
+- Workspace Go composto por módulos independentes.
 
-O driver também identifica situações em que uma operação pode ter sido executada pelo servidor, mas sua resposta não foi confirmada pelo cliente. Nesses casos, retorna `OperationOutcomeUnknownError`, preservando o identificador da solicitação e a causa da falha.
+### Limitações importantes
 
-O servidor atende múltiplos clientes simultaneamente. Entretanto, o driver Go executa uma operação por vez em cada conexão, sem multiplexação de requisições simultâneas.
+A implementação atual não possui:
 
-Não há persistência, autenticação, autorização, isolamento por tenant ou TLS implementados. O serviço não deve ser exposto a redes não confiáveis sem mecanismos adicionais de proteção.
+- Persistência em disco.
+- Expiração funcional por TTL.
+- Autenticação ou autorização.
+- TLS.
+- Isolamento de dados por tenant.
+- Multiplexação de solicitações na mesma conexão.
+- Pool de conexões integrado ao driver Go.
+- Reconexão ou retry automático.
+- Deduplicação ou idempotência server-side.
+- Recuperação posterior de resultados de operações indeterminadas.
 
-## Documentos
+O campo `ttl_ms` existe no contrato Protobuf, mas valores positivos são rejeitados como funcionalidade não suportada.
 
-- [Arquitetura técnica](./tecnica/ARQUITETURA.md) — visão das camadas, fluxos, contrato TCP/Protobuf, modelo de dados, módulos e dependências.
-- [Catálogo de componentes](./tecnica/COMPONENTES.md) — componentes, responsabilidades, interfaces, arquivos e dependências.
-- [Requisitos e critérios de aceite](./requisitos/REQUISITOS.md) — requisitos funcionais e não funcionais, cenários Gherkin, casos de borda e rastreabilidade para código e testes.
-- [Manual do usuário](./usuario/MANUAL.md) — pré-requisitos, inicialização, cliente de demonstração, operações, utilização do driver Go, erros e limitações.
+O `request_id` permite correlacionar solicitações e respostas, mas não é uma chave de idempotência. Quando a comunicação é interrompida durante uma operação, o cliente pode não conseguir determinar se o servidor executou o comando.
 
-## Estrutura modular
+**Segurança:** o servidor não deve ser exposto a redes não confiáveis sem mecanismos adicionais de proteção.
 
-O repositório utiliza um workspace Go definido em `go.work`, composto pelos seguintes módulos:
+## 2. Documentação disponível
 
-| Módulo | Responsabilidade |
-|---|---|
-| `server` | Executável do servidor, engine, storage, codec e integração com TCP. |
-| `transport/tcp/go` | Comunicação TCP genérica, conexão e framing, independente de serialização. |
-| `protocol/generated/go` | Código Go gerado a partir do contrato Protobuf. |
-| `drivers/go` | Biblioteca cliente Go para comunicação com o servidor. |
-| `api` | Aplicação cliente de demonstração que utiliza o driver Go. |
+| Documento | Conteúdo | Público principal |
+|---|---|---|
+| [Arquitetura técnica](./tecnica/ARQUITETURA.md) | Camadas, módulos, fluxos, contratos, dependências e decisões arquiteturais observáveis. | Desenvolvedores e arquitetos |
+| [Catálogo de componentes](./tecnica/COMPONENTES.md) | Responsabilidades, interfaces, arquivos, dependências e comportamentos dos componentes. | Desenvolvedores e mantenedores |
+| [Requisitos e critérios de aceite](./requisitos/REQUISITOS.md) | Requisitos funcionais e não funcionais, cenários, casos de borda, lacunas e rastreabilidade. | Desenvolvimento e QA |
+| [Manual do usuário](./usuario/MANUAL.md) | Pré-requisitos, inicialização, demonstração, comandos, driver Go, erros e limitações. | Desenvolvedores consumidores, QA e suporte |
+| [Guia do driver Go](../drivers/go/README.md) | Instalação e integração do driver Go em aplicações independentes. | Desenvolvedores consumidores |
 
-A separação permite evoluir o transporte, o contrato de mensagens e os drivers sem acoplar essas responsabilidades diretamente ao armazenamento e à execução dos comandos.
+## 3. Por onde começar
+
+### Quero executar o MemoryDB
+
+Consulte o [Manual do usuário](./usuario/MANUAL.md).
+
+O documento apresenta os pré-requisitos, a inicialização do servidor, a configuração do endereço TCP e a execução do cliente de demonstração.
+
+### Quero integrar uma aplicação Go
+
+Consulte o [Manual do usuário](./usuario/MANUAL.md) e o [Guia do driver Go](../drivers/go/README.md).
+
+Eles apresentam a conexão, os comandos disponíveis, as operações com contexto, o tratamento de erros e as limitações do driver.
+
+### Quero entender a arquitetura
+
+Comece por [Arquitetura técnica](./tecnica/ARQUITETURA.md).
+
+Em seguida, consulte o [Catálogo de componentes](./tecnica/COMPONENTES.md) para localizar responsabilidades e arquivos específicos.
+
+### Quero verificar o que está implementado
+
+Consulte [Requisitos e critérios de aceite](./requisitos/REQUISITOS.md).
+
+O documento diferencia comportamentos implementados, critérios de aceite, limitações e funcionalidades pendentes.
+
+### Quero conhecer as próximas evoluções
+
+Consulte o [Roadmap de implementação](../memorydb-roadmap.md).
+
+O roadmap apresenta objetivos, princípios, etapas e evoluções planejadas. Itens descritos como planejados não devem ser interpretados como funcionalidades disponíveis.
+
+## 4. Estrutura modular do projeto
+
+O MemoryDB utiliza um workspace Go definido em `go.work`, composto por módulos independentes.
+
+| Módulo | Caminho | Responsabilidade |
+|---|---|---|
+| Servidor | `server/` | Executável, engine, storage, codec e integração com TCP. |
+| Transporte TCP | `transport/tcp/go/` | Conexão TCP e framing, independentes da serialização. |
+| Protocolo gerado | `protocol/generated/go/` | Tipos Go gerados a partir do schema Protobuf. |
+| Driver Go | `drivers/go/` | Biblioteca cliente para comunicação com o servidor. |
+| API de demonstração | `api/` | Aplicação executável que utiliza o driver Go. |
+
+O contrato Protobuf está definido em:
+
+`protocol/proto/memorydb/v1/memorydb.proto`
 
 Cada módulo possui seu próprio `go.mod`. O workspace permite desenvolver e testar os módulos locais de forma integrada, sem exigir que estejam publicados como dependências externas.
 
-# Lacunas e próximos passos
+## 5. Fluxo geral de comunicação
 
-As prioridades abaixo representam evoluções possíveis da implementação atual. Não indicam funcionalidades já disponíveis nem estabelecem, por si só, uma ordem definitiva de implementação.
+O fluxo de uma operação segue esta sequência:
 
-## P1 — Robustez operacional
+```mermaid
+flowchart LR
+    Client["Aplicação cliente"]
+    Driver["Driver Go"]
+    TCP["Transporte TCP"]
+    Codec["Codec Protobuf"]
+    Handler["Handler TCP"]
+    Engine["Engine"]
+    Storage["Storage em memória"]
 
-### Tratamento e observabilidade de erros
+    Client --> Driver
+    Driver --> TCP
+    TCP --> Codec
+    Codec --> Handler
+    Handler --> Engine
+    Engine --> Storage
 
-O servidor ainda descarta erros retornados por `Handler.Handle`. É necessário definir uma estratégia de registro e observabilidade desses erros.
+    Storage --> Engine
+    Engine --> Handler
+    Handler --> Codec
+    Codec --> TCP
+    TCP --> Driver
+    Driver --> Client
+```
 
-A evolução deve considerar:
+O transporte delimita as mensagens em frames TCP. O codec converte entre o modelo interno e o contrato Protobuf. O handler encaminha as solicitações ao engine, que executa os comandos sobre o storage.
 
-- Registro estruturado de falhas de leitura, escrita e processamento.
-- Diferenciação entre encerramentos esperados e falhas de conexão.
-- Informações suficientes para diagnóstico sem expor dados sensíveis.
-- Métricas de erros e encerramentos de conexão.
+A resposta percorre o caminho inverso até o cliente.
 
-### Timeouts e conexões
+## 6. Validação técnica
 
-Implementar políticas configuráveis de timeout de leitura e escrita no servidor, além de avaliar:
+O projeto possui testes automatizados para os principais componentes e fluxos:
 
-- Limites de conexões simultâneas.
-- Tempo máximo de inatividade.
-- Proteção contra clientes lentos.
-- Comportamento diante de conexões que não concluem o envio de um frame.
+- Engine e validação de comandos.
+- Storage e concorrência.
+- Codificação e decodificação Protobuf.
+- Framing TCP, fragmentação, limites e escritas parciais.
+- Atendimento de múltiplas conexões.
+- Compartilhamento de armazenamento entre clientes.
+- Operações e concorrência no driver Go.
+- Cancelamento, deadlines e falhas de comunicação.
+- Resultados indeterminados.
+- Encerramento do servidor.
 
-O driver Go já oferece operações baseadas em `context.Context`, permitindo controlar o cancelamento e o prazo das operações no lado cliente. Isso não substitui políticas operacionais de timeout e proteção no servidor.
+### Evidências registradas
 
-### Encerramento gracioso
+Na validação registrada em 15/11/2026, foram executados testes com detector de condições de corrida e análise estática nos módulos do workspace:
 
-Avaliar o comportamento de conexões que permanecem ativas durante o shutdown e definir uma política de encerramento forçado após o timeout.
-
-A implementação atual fecha o listener e aguarda as conexões ativas, mas não força seu fechamento quando o contexto expira.
-
-Referências:
-
-- `server/internal/transport/tcp/server.go`
-- `server/internal/transport/tcp/handler.go`
-- `transport/tcp/go/connection.go`
-- `memorydb-roadmap.md`
-
-## P1 — Segurança para implantação
-
-Definir condições seguras de uso antes de disponibilizar o servidor em redes não confiáveis.
-
-Ainda não existem mecanismos de:
-
-- TLS para proteção da comunicação.
-- Autenticação para identificação de clientes.
-- Autorização para controle das operações permitidas.
-
-Esses recursos precisam ser avaliados e implementados antes de cenários de implantação que exijam proteção das comunicações e controle de acesso.
-
-Também deverá ser avaliada a necessidade de isolamento lógico dos dados por cliente ou tenant.
-
-Referência: `memorydb-roadmap.md`.
-
-## P2 — Completar e estabilizar o contrato externo
-
-Documentar e definir formalmente:
-
-- Limites de tamanho de chaves e valores.
-- Códigos e condições de erro.
-- Semântica e comportamento esperado de `ttl_ms`.
-- Regras de evolução e compatibilidade do schema Protobuf.
-- Comportamento esperado diante de mensagens inválidas e versões incompatíveis.
-
-O contrato atual está em `protocol/proto/memorydb/v1/memorydb.proto`, e a execução dos comandos está em `server/internal/engine/engine.go`.
-
-A evolução do contrato deve preservar a compatibilidade entre o servidor e os drivers sempre que possível.
-
-## P2 — Avaliar abstração do armazenamento
-
-Atualmente, o Engine depende diretamente de `*storage.Storage`.
-
-Uma interface de armazenamento poderá ser introduzida quando existir uma necessidade concreta de substituir ou adicionar implementações de backend, como armazenamento persistente ou distribuído.
-
-A abstração deve ser introduzida sem criar complexidade desnecessária para o MVP.
-
-Referências:
-
-- `server/internal/engine/engine.go`
-- `server/internal/storage/storage.go`
-- `memorydb-roadmap.md`
-
-## P2 — Evoluir os drivers e a confiabilidade das operações
-
-O driver Go possui operações básicas, suporte a `context.Context`, serialização de operações concorrentes e tratamento de falhas de comunicação e protocolo.
-
-Próximos passos incluem avaliar:
-
-- Reconexão e recuperação de falhas.
-- Evolução e estabilização da API pública do cliente.
-- Implementação e validação de drivers em outras linguagens.
-- Compatibilidade entre diferentes implementações de clientes.
-- Estratégias para lidar com resultados desconhecidos após interrupções de comunicação.
-- Mecanismos de idempotência e deduplicação no servidor.
-
-O cancelamento de operações durante a comunicação pode invalidar a conexão, pois o resultado da operação no servidor pode ser desconhecido. O driver sinaliza essa condição por meio de `OperationOutcomeUnknownError`.
-
-O `request_id` atual permite correlacionar solicitações e respostas, mas não funciona como identificador de idempotência. O servidor ainda não possui deduplicação, registro de operações executadas ou recuperação de resultados.
-
-A reconexão automática e a repetição transparente de comandos não fazem parte da implementação atual. Uma futura estratégia de retry deverá considerar a semântica de idempotência para evitar execuções duplicadas.
-
-Referências:
-
-- `drivers/go/`
-- `protocol/proto/memorydb/v1/memorydb.proto`
-- `server/internal/engine/`
-- `memorydb-roadmap.md`
-
-## P3 — Persistência e desempenho
-
-Persistência, recuperação de dados e benchmarks devem ser avaliados após a consolidação das funcionalidades essenciais do MVP.
-
-Essas evoluções precisam considerar os impactos sobre:
-
-- O modelo de armazenamento.
-- A consistência e a durabilidade dos dados.
-- O contrato externo.
-- A arquitetura modular.
-- O comportamento concorrente.
-- A recuperação após falhas.
-- A relação entre confirmação de escrita e durabilidade.
-
-A implementação atual não possui persistência em disco nem metas mensuráveis de latência e throughput.
-
-Referência: `memorydb-roadmap.md`.
-
-## Validação técnica
-
-Na validação registrada em 15/11/2026, foram executados os testes automatizados com detector de condições de corrida e a análise estática nos módulos do workspace:
-
-| Módulo | `go test -race -count=1 ./...` | `go vet ./...` |
+| Módulo | Testes com `-race` | `go vet` |
 |---|---|---|
 | `protocol/generated/go` | Aprovado — sem testes próprios | Aprovado |
 | `transport/tcp/go` | Aprovado | Aprovado |
@@ -182,9 +164,7 @@ Na validação registrada em 15/11/2026, foram executados os testes automatizado
 | `server` | Aprovado | Aprovado |
 | `api` | Aprovado — sem testes próprios | Aprovado |
 
-Após essa validação, o driver Go recebeu testes adicionais relacionados a resultados indeterminados, cancelamento durante I/O e falhas de comunicação.
-
-Na validação posterior do driver, foram executados com sucesso:
+Em validação posterior do driver Go, foram executados com sucesso:
 
 ```bash
 go test -v -count=1 ./drivers/go
@@ -193,65 +173,41 @@ go test -race -count=20 ./drivers/go
 go vet ./drivers/go
 ```
 
-Os testes automatizados abrangem, entre outros aspectos:
+Também foi registrada uma validação manual ponta a ponta envolvendo conexão TCP, PING, SET, GET e DELETE.
 
-- Operações do engine e do storage.
-- Concorrência no armazenamento.
-- Codificação e decodificação Protobuf.
-- Framing TCP, fragmentação, limites e escritas parciais.
-- Atendimento de múltiplas conexões.
-- Compartilhamento de armazenamento entre clientes.
-- Operações e concorrência no driver Go.
-- Cancelamento, deadlines e falhas de comunicação.
-- Resultados indeterminados após falhas de comunicação.
-- Encerramento do servidor.
+**Atenção:** os resultados acima representam execuções registradas nas respectivas datas. A validação completa de 15/11 não substitui uma nova execução integral de todos os módulos após alterações posteriores. Consulte os testes e o histórico de validação antes de afirmar que uma revisão específica está integralmente validada.
 
-Todos os comandos mencionados terminaram sem falhas nas respectivas execuções registradas.
+## 7. Documentação e manutenção
 
-**Observação:** a validação completa de 15/11 comprova o estado dos módulos naquela execução. A validação posterior comprova os cenários adicionais do driver Go, mas não substitui uma nova execução completa de todos os módulos após as alterações. Alterações futuras no código também exigem nova execução para manter essas evidências atualizadas.
+A documentação deve acompanhar o comportamento efetivamente implementado.
 
-## Validação ponta a ponta
+Ao alterar o projeto:
 
-Em 15/11/2026, foi executado um teste manual de integração utilizando o servidor real e a aplicação cliente de demonstração.
+1. Atualize a arquitetura quando houver mudança de camadas, dependências, fluxos ou contratos.
+2. Atualize o catálogo de componentes quando responsabilidades, interfaces ou arquivos forem alterados.
+3. Atualize os requisitos quando houver mudança de comportamento ou de critérios de aceite.
+4. Atualize o manual quando houver mudança de instalação, configuração, utilização ou tratamento de erros.
+5. Atualize o roadmap quando prioridades, etapas ou objetivos planejados forem modificados.
+6. Registre evidências de testes com os comandos efetivamente executados e seus resultados.
 
-Fluxo validado:
+Distinga sempre:
 
-1. Estabelecimento da conexão TCP.
-2. Execução de PING.
-3. Armazenamento de uma chave por SET.
-4. Recuperação do valor por GET.
-5. Remoção da chave por DELETE.
-6. Nova consulta por GET, confirmando que a chave não existe mais.
+- **Implementado:** comportamento presente no código e verificável.
+- **Validado:** comportamento coberto por uma execução de teste ou verificação identificável.
+- **Planejado:** evolução prevista, ainda não implementada.
+- **Lacuna:** capacidade ausente ou comportamento ainda não definido.
 
-Resultado observado:
+Não apresente uma funcionalidade planejada como disponível nem uma execução antiga como evidência de validação do estado atual do código.
 
-```text
-MemoryDB conectado com sucesso!
-SET: chave "user:1" armazenada
-GET: memorydb
-DELETE: chave removida = true
-GET após DELETE: chave encontrada = false
-```
+## 8. Referências do projeto
 
-Essa execução valida a integração entre o servidor, o transporte TCP, o protocolo Protobuf e o driver Go.
+- [Repositório MemoryDB](https://github.com/pescador95/memorydb)
+- [Documentação oficial do Go](https://go.dev/doc/)
+- [Gerenciamento de módulos Go](https://go.dev/doc/modules/managing-dependencies)
+- [Protocol Buffers](https://protobuf.dev/)
 
-Trata-se de uma verificação manual complementar aos testes automatizados, não de uma substituição deles.
+---
 
-## Estado geral do projeto
+**MemoryDB**
 
-A implementação atual contempla o núcleo funcional do MemoryDB:
-
-- Servidor TCP com conexões persistentes.
-- Protocolo Protobuf com contrato definido.
-- Framing independente da serialização.
-- Engine com PING, SET, GET e DELETE.
-- Storage em memória com proteção concorrente.
-- Driver Go com suporte a contextos.
-- Identificação de resultados indeterminados no driver.
-- Atendimento concorrente de múltiplos clientes.
-- Shutdown gracioso com contexto.
-- Testes automatizados e validação ponta a ponta.
-
-As lacunas descritas neste documento representam evoluções futuras e limitações conhecidas. Elas não devem ser confundidas com funcionalidades já implementadas.
-
-O roadmap registra o planejamento de desenvolvimento; esta documentação apresenta a arquitetura, o comportamento e o estado verificável da implementação atual.
+Servidor chave-valor em memória com comunicação TCP e protocolo Protocol Buffers.

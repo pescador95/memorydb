@@ -1,129 +1,179 @@
 # Manual do MemoryDB
 
-## O que o sistema faz
+## 1. Visão geral
 
-MemoryDB é um servidor chave-valor que mantém valores em memória durante a execução. Clientes enviam comandos PING, SET, GET e DELETE por TCP, utilizando mensagens Protocol Buffers.
+MemoryDB é um servidor chave-valor em memória que permite armazenar, consultar, substituir e remover valores por meio de comandos enviados por TCP.
 
-Os dados são compartilhados pelos clientes conectados à mesma instância do servidor, mas não são preservados quando o processo é encerrado ou reiniciado.
+A comunicação utiliza mensagens Protocol Buffers (Protobuf), encapsuladas em frames com prefixo de tamanho.
 
 A implementação atual oferece:
 
-- Armazenamento de chaves do tipo `string`.
-- Armazenamento de valores do tipo `[]byte`.
-- Consulta, inserção, substituição e remoção de valores.
-- Compartilhamento dos dados entre conexões da mesma instância.
-- Comunicação TCP com mensagens Protobuf.
+- Comandos PING, SET, GET e DELETE.
+- Chaves do tipo `string`.
+- Valores do tipo `[]byte`.
+- Armazenamento compartilhado entre conexões da mesma instância.
+- Atendimento concorrente de múltiplas conexões.
 - Driver cliente para aplicações Go.
-- Suporte a operações com `context.Context` no driver Go.
-- Atendimento concorrente de múltiplos clientes.
-- Encerramento gracioso do servidor, com prazo configurado.
+- Operações do driver com suporte a `context.Context`.
+- Tratamento de erros de aplicação e de resultados indeterminados.
 
-Evidências:
+O armazenamento é exclusivamente em memória. Os dados são perdidos quando o processo do servidor termina ou é reiniciado.
 
-- `server/internal/engine/engine.go`
-- `server/internal/storage/storage.go`
-- `protocol/proto/memorydb/v1/memorydb.proto`
-- `drivers/go/client.go`
+## 2. Pré-requisitos
 
-## Pré-requisitos
-
-Para executar o projeto localmente, são necessários:
+Para executar o projeto localmente:
 
 - Go 1.27.0.
 - Repositório MemoryDB clonado.
-- Workspace Go configurado pelo arquivo `go.work` da raiz.
+- Workspace Go disponível no arquivo `go.work` da raiz.
 - Porta TCP disponível para o servidor, por padrão `6380`.
 
-O projeto possui vários módulos Go independentes. Por isso, os comandos de execução e validação devem ser realizados dentro do módulo correspondente.
+O projeto é organizado em módulos Go independentes. Os comandos de execução devem ser realizados no módulo correspondente.
 
-## Iniciar e usar a demonstração
+## 3. Executar o servidor
 
-### 1. Iniciar o servidor
+### 3.1. Iniciar
 
-Abra um terminal na raiz do repositório e entre no módulo `server`:
+Na raiz do repositório, entre no módulo `server`:
 
-```powershell
+```bash
 cd server
 go run ./cmd/memorydb
 ```
 
-Por padrão, o servidor escuta na porta TCP `6380`, em todas as interfaces de rede.
+Por padrão, o servidor escuta em `:6380`, ou seja, na porta 6380 em todas as interfaces de rede disponíveis.
 
-Para escolher outro endereço, defina a variável `MEMORYDB_ADDR` antes de iniciar o servidor.
+O endereço pode ser alterado pela variável de ambiente `MEMORYDB_ADDR`.
 
-Exemplo no PowerShell:
+PowerShell:
 
 ```powershell
 $env:MEMORYDB_ADDR = "127.0.0.1:6380"
 go run ./cmd/memorydb
 ```
 
-Para voltar ao endereço padrão na sessão atual do PowerShell:
+Linux:
+
+```bash
+MEMORYDB_ADDR=127.0.0.1:6380 go run ./cmd/memorydb
+```
+
+Para remover a variável na sessão atual do PowerShell:
 
 ```powershell
 Remove-Item Env:MEMORYDB_ADDR
 ```
 
-O endereço padrão e a variável de ambiente são definidos em:
+O endereço padrão e a variável de ambiente são definidos em `server/cmd/memorydb/main.go`.
 
-`server/cmd/memorydb/main.go`
+**Segurança:** o servidor não possui autenticação, autorização ou TLS. Escutar em todas as interfaces pode permitir que outros equipamentos alcancem o serviço, dependendo da configuração da rede e do firewall. Não exponha o MemoryDB a redes não confiáveis.
 
-**Atenção:** escutar em todas as interfaces de rede não significa que o serviço esteja protegido para exposição externa. A implementação atual não possui autenticação, autorização ou TLS.
+### 3.2. Confirmar a inicialização
 
-### 2. Executar o cliente de demonstração
+Quando o servidor inicia corretamente, registra uma mensagem semelhante a:
 
-Com o servidor ativo, abra outro terminal na raiz do repositório e entre no módulo `api`:
+```text
+MemoryDB listening on [endereço]
+```
 
-```powershell
+Se a porta estiver ocupada ou o endereço for inválido, o processo retorna um erro de inicialização.
+
+### 3.3. Encerrar
+
+No terminal em que o servidor está em execução, pressione `Ctrl+C`.
+
+O executável trata SIGINT e SIGTERM e solicita o encerramento do servidor com timeout de 10 segundos.
+
+O shutdown fecha o listener e aguarda as conexões ativas terminarem. Se o prazo expirar, o servidor retorna erro; a implementação não força diretamente o fechamento das conexões ativas. O executável trata esse erro como falha e encerra pelo caminho de erro.
+
+Os dados em memória são perdidos quando o processo termina.
+
+## 4. Executar o cliente de demonstração
+
+Com o servidor ativo, abra outro terminal na raiz do repositório:
+
+```bash
 cd api
 go run ./client
 ```
 
-O cliente de demonstração utiliza o driver Go e conecta ao endereço `127.0.0.1:6380`.
+O cliente demonstra:
 
-Ele demonstra operações de PING, SET, GET e DELETE.
+1. Conexão com o servidor.
+2. PING.
+3. SET de uma chave.
+4. GET do valor armazenado.
+5. DELETE da chave.
+6. GET após a exclusão para confirmar que ela não existe.
 
-**Importante:** o cliente de demonstração utiliza endereço fixo. Alterar `MEMORYDB_ADDR` no servidor não altera automaticamente o endereço utilizado pelo cliente.
+O cliente utiliza o endereço fixo `127.0.0.1:6380`, definido em `api/client/main.go`.
 
-Arquivos envolvidos:
+**Importante:** alterar `MEMORYDB_ADDR` no servidor não altera automaticamente o endereço utilizado pelo cliente de demonstração. Se o servidor estiver em outro endereço, o exemplo deverá ser ajustado.
 
-- `api/client/main.go`
-- `drivers/go/client.go`
+## 5. Utilizar o driver Go em outra aplicação
 
-### 3. Encerrar o servidor
+O módulo `drivers/go` disponibiliza uma biblioteca cliente para aplicações Go. Ele abstrai a conexão TCP, o framing e a serialização Protobuf.
 
-O servidor trata os sinais de encerramento SIGINT e SIGTERM e solicita um shutdown gracioso.
+O driver não mantém o armazenamento localmente: as operações são encaminhadas ao servidor MemoryDB.
 
-No terminal em que o servidor está executando, pressione `Ctrl+C`.
+### 5.1. Instalação
 
-O servidor fecha o listener e aguarda as conexões ativas terminarem, respeitando o timeout de shutdown de 10 segundos configurado no executável.
+O caminho de importação é:
 
-Se o contexto de shutdown expirar, `Shutdown` retorna o erro de contexto. A implementação atual não força o fechamento das conexões ativas nesse caso.
+```go
+github.com/pescador95/memorydb/drivers/go
+```
 
-Portanto, conexões que permaneçam bloqueadas podem impedir que o encerramento seja concluído imediatamente. O comportamento final do processo também depende do tratamento desse erro pelo executável e das goroutines ainda em execução.
+Crie uma aplicação Go:
 
-Os dados armazenados em memória são perdidos quando o processo termina.
+```bash
+mkdir minha-api
+cd minha-api
+go mod init minha-api
+```
 
-## Utilizar o driver Go em outra aplicação
+Após a publicação e disponibilização das versões do driver e de suas dependências, instale o módulo:
 
-O módulo `drivers/go` oferece uma API cliente para aplicações Go. Ele abstrai a comunicação TCP, o framing e a serialização Protobuf, permitindo que a aplicação utilize as operações do MemoryDB sem implementar diretamente o protocolo.
+```bash
+go get github.com/pescador95/memorydb/drivers/go@v0.1.0
+go mod tidy
+```
 
-### Operações disponíveis
+Substitua `v0.1.0` pela versão efetivamente publicada que deseja utilizar.
 
-| Método | Descrição |
-|---|---|
-| `Dial(address)` | Estabelece conexão com o servidor. |
-| `DialContext(ctx, address)` | Estabelece conexão utilizando um contexto. |
-| `New(conn)` | Cria um cliente a partir de uma conexão `net.Conn`, assumindo sua propriedade. |
-| `Ping()` / `PingContext(ctx)` | Verifica a comunicação com o servidor. |
-| `Set(key, value)` / `SetContext(ctx, key, value)` | Armazena ou substitui um valor. |
-| `Get(key)` / `GetContext(ctx, key)` | Consulta uma chave. |
-| `Delete(key)` / `DeleteContext(ctx, key)` | Remove uma chave. |
-| `Close()` | Encerra a conexão do cliente. |
+O driver depende também dos módulos de transporte TCP e protocolo Protobuf. Para que a instalação independente funcione, esses módulos precisam estar disponíveis nas versões declaradas nas dependências.
+
+Durante o desenvolvimento dentro do repositório MemoryDB, o arquivo `go.work` resolve os módulos locais. Ele não é necessário na aplicação consumidora.
+
+**Nota sobre distribuição:** a instalação acima pressupõe que as versões indicadas já estejam publicadas e acessíveis no mecanismo de resolução de módulos Go. A existência de uma versão declarada em um `go.mod`, isoladamente, não comprova que ela esteja publicada.
+
+### 5.2. Importar
+
+```go
+import (
+    memorydb "github.com/pescador95/memorydb/drivers/go"
+)
+```
+
+O alias `memorydb` facilita a identificação dos tipos e funções da biblioteca.
+
+### 5.3. Métodos disponíveis
+
+| Operação | Método convencional | Método com contexto |
+|---|---|---|
+| Conectar | `Dial(address)` | `DialContext(ctx, address)` |
+| Criar client a partir de conexão | `New(conn)` | — |
+| Verificar comunicação | `Ping()` | `PingContext(ctx)` |
+| Armazenar | `Set(key, value)` | `SetContext(ctx, key, value)` |
+| Consultar | `Get(key)` | `GetContext(ctx, key)` |
+| Excluir | `Delete(key)` | `DeleteContext(ctx, key)` |
+| Encerrar | `Close()` | — |
 
 Os métodos sem contexto utilizam `context.Background()` internamente.
 
-### Exemplo de utilização
+`New(conn)` recebe uma conexão `net.Conn` existente e transfere sua propriedade ao client. Quando `Close()` for chamado, a conexão será encerrada.
+
+### 5.4. Exemplo de utilização
 
 ```go
 package main
@@ -170,11 +220,9 @@ func main() {
 }
 ```
 
-### Utilização com context.Context
+### 5.5. Utilização com contexto
 
-As variantes com contexto permitem controlar o tempo de espera e o cancelamento das operações.
-
-O exemplo abaixo estabelece um prazo de três segundos para a conexão e as operações demonstradas:
+As variantes com `context.Context` permitem definir deadlines e cancelar operações.
 
 ```go
 package main
@@ -222,71 +270,55 @@ func main() {
 }
 ```
 
-**Comportamento dos contextos:**
+`DialContext` utiliza o contexto somente durante o estabelecimento da conexão. O contexto não fica associado ao client para controlar as operações posteriores.
 
-- `DialContext` utiliza o contexto somente para estabelecer a conexão. O contexto não fica associado ao cliente nem controla automaticamente as operações posteriores.
-- Os métodos com contexto permitem cancelar a espera para iniciar uma operação.
-- Se o contexto for cancelado enquanto o cliente aguarda sua vez de utilizar a conexão, a operação é cancelada sem invalidar a conexão.
-- Se o contexto for cancelado durante uma operação de I/O, o driver interrompe a comunicação, encerra a conexão e passa ao estado `failed`.
-- Essa invalidação é necessária porque o servidor pode ter executado o comando mesmo que o cliente não tenha recebido a resposta. Nesse cenário, o resultado da operação pode ser desconhecido.
+Para controlar cada operação, utilize os métodos específicos que recebem contexto.
 
-**Atenção:** depois de uma falha de comunicação ou de um cancelamento durante I/O, não reutilize o cliente. Crie uma nova conexão para continuar a comunicação.
+## 6. Semântica dos comandos
 
-O driver não realiza reconexão automática nem repetição transparente de comandos. Antes de repetir uma operação cujo resultado seja desconhecido, considere se ela pode ter sido executada no servidor.
+### 6.1. PING
 
-### Concorrência e ciclo de vida do cliente
+Verifica se o servidor responde à solicitação.
 
-O driver Go serializa as operações de requisição e resposta em cada conexão. Isso significa que uma operação precisa terminar antes que outra comece a utilizar a mesma conexão.
+Uma resposta válida contém o mesmo `request_id` da solicitação e o resultado `PongResult`.
 
-Não há multiplexação de múltiplas requisições simultâneas na mesma conexão.
+O PING não comprova a disponibilidade de funcionalidades adicionais, persistência ou capacidade de processamento.
 
-O cliente gerencia três estados internos:
+### 6.2. SET
 
-| Estado | Comportamento |
-|---|---|
-| `open` | Cliente disponível para executar operações. |
-| `closed` | Cliente encerrado por `Close`. |
-| `failed` | Cliente invalidado por falha de comunicação ou cancelamento durante I/O. |
+Armazena um valor associado a uma chave.
 
-Clientes nos estados `closed` e `failed` não devem ser reutilizados.
+Se a chave já existir, o valor anterior será substituído.
 
-### Utilização em outro projeto
+Chaves são strings e valores são bytes. O armazenamento realiza uma cópia dos bytes recebidos.
 
-Para utilizar o driver em outro projeto, o módulo `github.com/pescador95/memorydb/drivers/go` deverá estar publicado ou disponível por outro mecanismo de resolução de dependências Go.
+O campo `ttl_ms` existe no contrato Protobuf, mas a implementação atual não oferece expiração por TTL:
 
-Durante o desenvolvimento dentro deste repositório, o `go.work` resolve os módulos locais.
+- `ttl_ms = 0`: armazenamento sem expiração.
+- `ttl_ms > 0`: retorna `UNSUPPORTED_FEATURE`.
 
-A instalação independente também depende da publicação e disponibilidade dos módulos utilizados pelo driver, incluindo transporte TCP e protocolo Protobuf, nas versões declaradas nas dependências.
+### 6.3. GET
 
-## Funcionalidades disponíveis
+Consulta o valor associado a uma chave.
 
-O MemoryDB não oferece interface web, endpoints HTTP ou comandos de texto diretamente pelo TCP.
+O resultado contém:
 
-A comunicação utiliza:
+- `found`: indica se a chave existe.
+- `value`: bytes armazenados quando a chave existe.
 
-1. Conexão TCP.
-2. Frame com prefixo de tamanho.
-3. Payload serializado em Protocol Buffers.
-4. Solicitação e resposta correlacionadas por `request_id`.
+Uma chave existente com valor vazio retorna `found=true`. Uma chave inexistente retorna `found=false`.
 
-O contrato externo está definido em:
+Não utilize somente o tamanho do valor para determinar se uma chave existe.
 
-`protocol/proto/memorydb/v1/memorydb.proto`
+### 6.4. DELETE
 
-| Comando | Quando usar | Entrada do contrato | Resultado esperado |
-|---|---|---|---|
-| PING | Verificar se o servidor responde. | `Request { request_id, ping: {} }` | `success=true`, resultado `pong` |
-| SET | Armazenar ou substituir um valor. | `Request { request_id, set: { key, value, ttl_ms: 0 } }` | `success=true`, resultado `set` |
-| GET | Consultar um valor. | `Request { request_id, get: { key } }` | `success=true`; `get.found` informa se a chave existe |
-| DELETE | Remover uma chave. | `Request { request_id, delete: { key } }` | `success=true`; `delete.deleted` informa se houve remoção |
+Remove uma chave do armazenamento.
 
-Os exemplos representam os campos do schema Protobuf, não um formato JSON aceito pelo servidor.
+O resultado `deleted` informa se uma chave foi efetivamente removida.
 
-Chaves são strings e valores são bytes. O `request_id` enviado pelo cliente deve ser preservado na resposta correspondente.
+Excluir uma chave inexistente não é erro de aplicação: a operação retorna sucesso com `deleted=false`.
 
-**Importante:** `request_id` é um identificador de correlação da solicitação e da resposta. Ele não funciona como chave de idempotência e não oferece deduplicação de comandos no servidor.
-
-### Exemplo lógico de utilização
+### 6.5. Sequência lógica
 
 ```text
 PING
@@ -306,99 +338,136 @@ GET key="user:1"
     found=false
 ```
 
-Essa sequência representa o fluxo de operações disponibilizado pelo engine e pelo driver Go.
+Essa representação ilustra a sequência lógica dos comandos. Não é um formato de texto ou JSON aceito diretamente pelo servidor.
 
-## Semântica dos comandos
+## 7. Protocolo de comunicação
 
-### PING
+O servidor não oferece API HTTP, REST ou comandos de texto diretamente pelo TCP.
 
-Verifica se o servidor está respondendo.
+A comunicação utiliza:
 
-Uma resposta válida contém o mesmo `request_id` da solicitação e o resultado `PongResult`.
+1. Conexão TCP.
+2. Frame com prefixo de tamanho.
+3. Payload serializado em Protocol Buffers.
+4. Solicitação e resposta correlacionadas por `request_id`.
 
-### SET
+O contrato externo está definido em:
 
-Armazena um valor associado a uma chave.
+`protocol/proto/memorydb/v1/memorydb.proto`
 
-Se a chave já existir, o valor anterior será substituído.
-
-O valor é recebido como bytes. O armazenamento realiza uma cópia dos bytes para evitar que alterações no slice original modifiquem diretamente o conteúdo armazenado.
-
-O campo `ttl_ms` deve ser zero na implementação atual.
-
-### GET
-
-Consulta o valor associado a uma chave.
-
-O resultado possui dois campos importantes:
-
-- `found`: indica se a chave existe.
-- `value`: contém os bytes armazenados quando a chave existe.
-
-Uma chave existente com valor vazio retorna `found=true`. Uma chave inexistente retorna `found=false`.
-
-Portanto, não utilize apenas o tamanho do valor para determinar se uma chave existe.
-
-### DELETE
-
-Remove uma chave do armazenamento.
-
-O resultado `deleted` indica se uma chave foi efetivamente removida.
-
-Excluir uma chave inexistente não é considerado erro de aplicação: a operação retorna sucesso com `deleted=false`.
-
-## Protocolo de transporte
-
-O transporte TCP utiliza framing para delimitar as mensagens.
-
-Cada frame possui:
+### 7.1. Estrutura do frame
 
 | Campo | Tamanho | Descrição |
 |---|---:|---|
-| Prefixo | 4 bytes | Tamanho do payload, como `uint32` Big Endian |
+| Prefixo | 4 bytes | Tamanho do payload como `uint32` Big Endian |
 | Payload | 1 byte a 1 MiB | Mensagem Protobuf serializada |
 
-O prefixo informa somente o tamanho do payload, sem incluir os próprios quatro bytes do prefixo.
+O prefixo informa somente o tamanho do payload, sem incluir os quatro bytes do próprio prefixo.
 
-O leitor utiliza leitura completa para lidar com fragmentação TCP. Isso é necessário porque TCP fornece um fluxo de bytes, não uma sequência de mensagens com fronteiras preservadas.
+O payload máximo permitido é de 1 MiB.
 
-A escrita trata escritas parciais para garantir a transmissão completa do frame ou retornar um erro.
-
-O módulo reutilizável de transporte está em:
-
-- `transport/tcp/go/framing.go`
-- `transport/tcp/go/connection.go`
+Como TCP é um fluxo de bytes, uma mensagem pode ser recebida em partes. O transporte implementa leitura completa do frame e trata escritas parciais.
 
 O framing é independente de Protobuf. A serialização é responsabilidade do codec utilizado pelo servidor e pelo driver.
 
-## Tratamento de erros e resultados indeterminados
+### 7.2. Envelope Protobuf
 
-O driver diferencia erros retornados pelo servidor de falhas de comunicação.
+Uma solicitação possui:
 
-### ServerError
+- `request_id`: identificador da solicitação.
+- `command`: um dos comandos suportados.
+
+Uma resposta possui:
+
+- `request_id`: identificador correspondente à solicitação.
+- `success`: indica sucesso ou rejeição.
+- `result`: resultado do comando ou erro estruturado.
+
+O `request_id` é utilizado para correlação entre solicitação e resposta. Ele não funciona como chave de idempotência e não oferece deduplicação no servidor.
+
+### 7.3. Clientes em outras linguagens
+
+O protocolo e o schema Protobuf são independentes da linguagem.
+
+Um cliente em outra linguagem pode implementar o mesmo contrato, desde que respeite:
+
+- O framing TCP.
+- O prefixo de tamanho em Big Endian.
+- O limite máximo do payload.
+- A serialização Protobuf.
+- Os tipos de solicitação e resposta.
+- A correlação por `request_id`.
+
+A existência do contrato não significa que já exista um driver implementado e validado para todas as linguagens.
+
+## 8. Concorrência e ciclo de vida do client
+
+O driver Go permite que uma instância de `Client` seja compartilhada entre goroutines.
+
+Entretanto, as operações são serializadas por conexão. Uma operação precisa terminar antes que outra utilize a mesma conexão.
+
+Características:
+
+- O servidor atende múltiplas conexões simultaneamente.
+- O driver permite chamadas concorrentes sobre o mesmo client.
+- As operações em uma mesma conexão são executadas sequencialmente.
+- Não há multiplexação de múltiplas solicitações simultâneas na mesma conexão.
+- O driver não oferece pool de conexões integrado.
+
+O client possui três estados internos:
+
+| Estado | Comportamento |
+|---|---|
+| `open` | Disponível para executar operações. |
+| `closed` | Encerrado por `Close()`. |
+| `failed` | Invalidado após falha de comunicação ou protocolo. |
+
+Clientes nos estados `closed` e `failed` não devem ser reutilizados.
+
+Após uma falha que invalide o client, crie uma nova conexão com `Dial` ou `DialContext`.
+
+## 9. Tratamento de erros
+
+O driver diferencia erros estruturados retornados pelo servidor de falhas de comunicação.
+
+### 9.1. ServerError
 
 `ServerError` representa um erro estruturado recebido do servidor.
 
-Quando o servidor retorna uma resposta de erro de aplicação válida, o driver disponibiliza esse erro à aplicação sem invalidar automaticamente o cliente.
+O tipo disponibiliza:
 
-Esse comportamento pressupõe o contrato atual do servidor: um erro estruturado de aplicação representa uma operação rejeitada, e não uma operação executada cuja resposta foi perdida.
+- `Code`: código do erro.
+- `Message`: descrição do erro.
 
-### OperationOutcomeUnknownError
+Exemplos de códigos utilizados pela implementação:
 
-`OperationOutcomeUnknownError` representa uma situação em que o cliente não consegue determinar se o servidor executou a operação.
+| Código | Significado |
+|---|---|
+| `INVALID_REQUEST` | Solicitação inválida ou comando ausente/não suportado. |
+| `INVALID_ARGUMENT` | Argumento inválido, como chave vazia. |
+| `UNSUPPORTED_FEATURE` | Funcionalidade não suportada, como TTL positivo. |
 
-Isso pode acontecer, por exemplo, quando:
+Quando o servidor retorna uma resposta estruturada de erro, o driver disponibiliza `ServerError` e não invalida automaticamente a conexão.
+
+### 9.2. OperationOutcomeUnknownError
+
+`OperationOutcomeUnknownError` representa uma situação em que o client não consegue determinar se o servidor executou a operação.
+
+Pode ocorrer quando:
 
 - O cliente envia um comando e a conexão é interrompida antes de receber a resposta.
-- O contexto é cancelado durante a comunicação de rede.
+- O contexto é cancelado durante uma operação de I/O.
 - O servidor executa o comando, mas a resposta não chega ao cliente.
-- O cliente recebe uma resposta inválida ou incompatível com a solicitação e não consegue confirmar o resultado.
+- A resposta recebida não pode ser validada ou correlacionada com a solicitação.
 
-Nessas situações, o driver não deve afirmar que a operação falhou no servidor. Ele informa que o resultado é desconhecido.
+O erro disponibiliza:
 
-O erro disponibiliza o `RequestID` da operação e a causa da interrupção. A causa original pode ser consultada por meio de `errors.Is` e `errors.As`, utilizando o encadeamento de erros.
+- `RequestID`: identificador da solicitação.
+- `Cause`: causa da interrupção ou falha.
 
-Exemplo de identificação:
+O tipo implementa `Unwrap()`, permitindo utilizar `errors.Is` e `errors.As`.
+
+Exemplo:
 
 ```go
 var outcomeErr *memorydb.OperationOutcomeUnknownError
@@ -412,101 +481,104 @@ if errors.As(err, &outcomeErr) {
 }
 ```
 
-Para esse exemplo, inclua `errors` nos imports.
+Para esse exemplo, inclua os pacotes `errors` e `log` nos imports.
 
-**Atenção:** não repita automaticamente uma operação com resultado desconhecido. O servidor pode já ter executado o comando.
+**Atenção:** um resultado indeterminado não significa que o servidor deixou de executar o comando. O comando pode ter sido executado, mesmo que o cliente não tenha recebido a confirmação.
 
-O `request_id` não permite consultar o resultado anterior nem impede a execução duplicada. A implementação atual não oferece deduplicação server-side ou recuperação de resultados por identificador de operação.
+O `request_id` não permite consultar o resultado anterior nem impede a execução duplicada de comandos.
 
-### Resumo dos cenários
+A implementação atual não oferece:
+
+- Deduplicação server-side.
+- Recuperação posterior do resultado por identificador.
+- Retry automático.
+- Reconexão automática.
+
+Não repita automaticamente uma operação cujo resultado seja desconhecido sem avaliar os possíveis efeitos de uma execução duplicada.
+
+### 9.3. Cancelamento e falhas de comunicação
+
+O comportamento do driver depende do momento da interrupção:
 
 | Situação | Comportamento |
 |---|---|
 | Falha ao estabelecer conexão | Retorna erro na inicialização. |
-| Erro estruturado do servidor | Retorna `ServerError`; cliente permanece utilizável. |
+| Erro estruturado do servidor | Retorna `ServerError`; client não é invalidado automaticamente. |
 | Cancelamento enquanto aguarda acesso à conexão | Operação cancelada; conexão preservada. |
-| Falha de comunicação durante I/O | Cliente passa para `failed`; resultado pode ser desconhecido. |
-| Cancelamento durante I/O | Conexão encerrada; cliente passa para `failed`. |
-| Resposta inválida ou incompatível | Cliente não consegue confirmar o resultado; conexão é invalidada. |
+| Falha de comunicação durante I/O | Client passa para `failed`; resultado pode ser desconhecido. |
+| Cancelamento durante I/O | Conexão encerrada; client passa para `failed`. |
+| Resposta inválida ou incompatível | Client é invalidado; resultado pode ser desconhecido. |
 | Uso após `Close()` | Operação rejeitada. |
 | Uso após falha de comunicação | Operação rejeitada. |
 
-A aplicação deve tratar os erros conforme o contexto da operação, evitando expor detalhes internos do MemoryDB diretamente aos consumidores da API.
+Depois de uma falha de comunicação ou cancelamento durante I/O, não reutilize o client.
 
-## Erros comuns
+## 10. Erros comuns e diagnóstico
 
-| Situação | O que acontece | Como resolver |
+| Situação | Causa provável | Ação recomendada |
 |---|---|---|
-| Servidor não está ativo | O cliente não consegue estabelecer conexão. | Inicie `server/cmd/memorydb` e confirme endereço e porta. |
-| Endereço ou porta incorretos | A conexão falha ou não alcança a instância esperada. | Confira o endereço configurado no cliente e em `MEMORYDB_ADDR`. |
-| SET, GET ou DELETE com chave vazia | Retorno `INVALID_ARGUMENT`, com mensagem `key cannot be empty`. | Envie uma chave não vazia. |
-| SET com `ttl_ms` maior que zero | Retorno `UNSUPPORTED_FEATURE`, com mensagem `TTL is not supported yet`. | Utilize `ttl_ms: 0`. |
-| Frame com tamanho zero | A operação de framing falha. | Envie um payload válido. |
-| Frame maior que 1 MiB | A operação de framing falha. | Reduza o tamanho da mensagem. |
-| Frame incompleto | A leitura não consegue completar o frame e retorna erro. | Confira o tamanho declarado e envie todos os bytes. |
-| Payload Protobuf inválido | A decodificação falha e o handler encerra o processamento da conexão. | Confira o schema e a serialização do cliente. |
-| Comando ou resultado ausente | A validação ou decodificação rejeita a mensagem. | Envie um comando suportado e um envelope válido. |
-| Chave inexistente em GET | Retorno bem-sucedido com `found=false`. | Verifique o campo `found`; isso não representa erro. |
-| DELETE de chave inexistente | Retorno bem-sucedido com `deleted=false`. | Grave a chave antes, caso precise removê-la. |
-| Contexto cancelado antes da operação | A operação retorna o erro de cancelamento ou deadline. | Verifique o prazo e o estado do contexto. |
-| Contexto cancelado durante I/O | A conexão é encerrada e o cliente passa ao estado `failed`. | Crie uma nova conexão e avalie se é seguro repetir o comando. |
-| Resultado da operação desconhecido | O servidor pode ter executado o comando sem que o cliente tenha recebido confirmação. | Não repita indiscriminadamente; avalie a semântica da operação. |
-| Cliente fechado ou com falha | Novas operações são rejeitadas. | Crie um novo cliente com `Dial` ou `DialContext`. |
+| Servidor não está ativo | Processo não iniciado ou encerrado. | Inicie o servidor e verifique o endereço. |
+| Conexão recusada | Endereço ou porta incorretos, ou serviço indisponível. | Confira `MEMORYDB_ADDR` e o endereço utilizado pelo client. |
+| Porta ocupada | Outro processo está utilizando a porta. | Escolha outra porta ou encerre o processo conflitante. |
+| Chave vazia | SET, GET ou DELETE recebeu uma chave vazia. | Envie uma chave não vazia. |
+| TTL positivo | A funcionalidade ainda não está implementada. | Utilize `ttl_ms = 0`. |
+| Frame com tamanho zero | Payload inválido. | Envie um payload Protobuf válido. |
+| Frame maior que 1 MiB | Payload excede o limite do transporte. | Reduza o tamanho da mensagem. |
+| Frame incompleto | A mensagem não foi transmitida integralmente. | Confira o tamanho declarado e o envio dos bytes. |
+| Payload Protobuf inválido | Serialização incompatível ou mensagem malformada. | Confira o schema e a serialização. |
+| Chave inexistente em GET | Chave não está armazenada. | Verifique `found`; isso não representa erro. |
+| DELETE de chave inexistente | Chave não estava armazenada. | Verifique `deleted`; isso não representa erro. |
+| Contexto cancelado antes da operação | Cancelamento ou deadline antes do início do I/O. | Verifique o prazo e o estado do contexto. |
+| Contexto cancelado durante I/O | Comunicação interrompida. | Crie outro client e avalie se é seguro repetir a operação. |
+| OperationOutcomeUnknownError | Não foi possível confirmar o resultado. | Não repita indiscriminadamente o comando. |
+| Client fechado ou com falha | Ciclo de vida encerrado ou conexão invalidada. | Crie um novo client. |
 
-Erros de framing e de decodificação não são necessariamente convertidos em `ErrorResult`. Em geral, eles encerram o processamento da conexão.
+Erros de framing e decodificação não são necessariamente convertidos em `ErrorResult`. Em geral, eles encerram o processamento da conexão.
 
-Erros de conexão, como conexão recusada ou conexão encerrada, podem apresentar mensagens específicas do sistema operacional.
+Erros de conexão podem apresentar mensagens específicas do sistema operacional.
 
-Erros de aplicação retornados pelo servidor são diferentes de falhas de transporte. Um erro estruturado de aplicação não invalida automaticamente o cliente.
+## 11. Limitações conhecidas
 
-## Limitações conhecidas
+A implementação atual possui as seguintes limitações:
 
-- **Sem persistência:** os valores são perdidos quando o processo é encerrado ou reiniciado.
-- **TTL indisponível:** `ttl_ms` existe no contrato, mas valores positivos retornam `UNSUPPORTED_FEATURE`.
-- **Sem autenticação:** qualquer cliente que consiga estabelecer conexão pode tentar executar comandos.
+- **Sem persistência:** os valores são perdidos quando o processo termina ou reinicia.
+- **Sem TTL:** valores positivos de `ttl_ms` são rejeitados.
+- **Sem autenticação:** clientes que alcançam o servidor podem tentar executar comandos.
 - **Sem autorização:** não há controle de permissões por cliente ou operação.
-- **Sem isolamento por tenant:** todos os clientes da mesma instância compartilham o armazenamento.
 - **Sem TLS:** a comunicação não é criptografada.
-- **Limite de frame:** o payload máximo é de 1 MiB.
-- **Timeouts no servidor:** não há política configurável de timeout de leitura e escrita por operação.
-- **Limite de conexões:** não há cota configurável de conexões concorrentes.
-- **Proteção contra clientes lentos:** não há política específica de timeout de inatividade ou proteção contra envio lento de dados.
+- **Sem isolamento por tenant:** clientes da mesma instância compartilham o armazenamento.
+- **Limite de frame:** payload máximo de 1 MiB.
+- **Sem timeout configurável por operação no servidor:** não há política configurável de timeout de leitura e escrita.
+- **Sem cota de conexões:** não há limite configurável de conexões concorrentes.
+- **Sem proteção específica contra clientes lentos:** não há política específica de timeout de inatividade ou envio lento de dados.
 - **Shutdown sem fechamento forçado:** conexões ativas não são fechadas diretamente quando o contexto de shutdown expira.
-- **Sem multiplexação:** o driver Go processa uma operação por vez em cada conexão.
-- **Sem reconexão automática:** o driver não restabelece automaticamente conexões interrompidas.
-- **Sem repetição automática:** o driver não repete comandos após falhas de comunicação.
-- **Sem deduplicação de operações:** `request_id` não é uma chave de idempotência e não existe mecanismo server-side para evitar a execução duplicada de comandos.
-- **Cancelamento no driver:** o suporte a `context.Context` existe, mas o cancelamento durante I/O invalida a conexão.
-- **Resultado indeterminado:** quando a comunicação é interrompida após o envio de uma operação, o cliente pode não conseguir determinar se o servidor a executou.
+- **Sem multiplexação:** o driver Go executa uma operação por vez em cada conexão.
+- **Sem pool de conexões integrado:** o driver não gerencia um conjunto de conexões.
+- **Sem reconexão automática:** conexões interrompidas não são restabelecidas automaticamente.
+- **Sem retry automático:** comandos não são repetidos após falhas de comunicação.
+- **Sem idempotência server-side:** `request_id` não impede execução duplicada.
+- **Resultado indeterminado:** uma interrupção durante a comunicação pode impedir que o cliente saiba se o comando foi executado.
 - **Cliente de demonstração com endereço fixo:** utiliza `127.0.0.1:6380`.
 - **Sem interface HTTP ou REST:** o protocolo disponível é TCP com framing e Protobuf.
 - **Sem driver Java implementado e validado nesta etapa:** a integração Java não faz parte do escopo funcional atual.
 
-Não exponha o serviço a redes não confiáveis enquanto autenticação, autorização e TLS não estiverem implementados.
+Não utilize o MemoryDB como armazenamento durável nem exponha o serviço a redes não confiáveis enquanto os mecanismos de segurança necessários não estiverem implementados.
 
-## Perguntas frequentes
-
-### O que significa GET retornar `found=false`?
-
-Significa que a chave não existe no armazenamento.
-
-Isso é diferente de uma chave existente com valor de zero bytes, que retorna `found=true`.
+## 12. Perguntas frequentes
 
 ### Os dados ficam disponíveis para mais de um cliente?
 
-Sim. Enquanto os clientes estiverem conectados à mesma instância do servidor, todos utilizam o mesmo armazenamento em memória.
+Sim. Clientes conectados à mesma instância utilizam o mesmo armazenamento em memória.
 
-Cada processo do servidor possui seu próprio storage. Duas instâncias independentes não compartilham automaticamente os dados.
+Cada processo do servidor possui seu próprio storage. Instâncias independentes não compartilham automaticamente os dados.
 
 ### Os dados continuam disponíveis após reiniciar?
 
-Não. O armazenamento atual é exclusivamente em memória e não existe persistência implementada.
+Não. O armazenamento atual é exclusivamente em memória.
 
 ### Posso utilizar TTL?
 
-Ainda não. O campo `ttl_ms` está presente no contrato Protobuf, mas qualquer valor positivo é rejeitado.
-
-Utilize zero para armazenar valores sem expiração.
+Ainda não. O campo `ttl_ms` está presente no contrato Protobuf, mas valores positivos são rejeitados. Utilize zero.
 
 ### O servidor oferece API REST?
 
@@ -518,57 +590,53 @@ Não. O servidor espera frames contendo mensagens serializadas conforme o contra
 
 ### Posso utilizar outro cliente além do Go?
 
-Sim, desde que o cliente implemente o framing TCP e o contrato Protobuf corretamente.
+Sim, desde que o cliente implemente corretamente o framing TCP e o contrato Protobuf.
 
-O transporte e o schema são independentes da linguagem. Um driver em outra linguagem pode implementar o mesmo contrato.
+Isso não significa que já exista um driver pronto para todas as linguagens.
 
 ### Posso cancelar uma operação?
 
-Sim. O driver Go oferece métodos com `context.Context`, incluindo suporte a cancelamento e deadline.
+Sim. O driver Go disponibiliza métodos com `context.Context`.
 
-Se o cancelamento ocorrer enquanto o cliente aguarda para iniciar uma operação, a conexão permanece disponível.
+Se o cancelamento ocorrer enquanto o client aguarda para iniciar uma operação, a conexão permanece disponível.
 
-Se ocorrer durante a comunicação de rede, a conexão é encerrada porque não é possível garantir se o servidor executou o comando.
+Se ocorrer durante a comunicação de rede, a conexão é encerrada porque o resultado da operação pode ser desconhecido.
 
 ### O contexto de DialContext controla as operações posteriores?
 
-Não. `DialContext` utiliza o contexto somente para estabelecer a conexão. Para controlar operações posteriores, utilize os métodos específicos com contexto, como `PingContext`, `SetContext`, `GetContext` e `DeleteContext`.
+Não. Ele controla somente o estabelecimento da conexão. Para controlar operações posteriores, utilize `PingContext`, `SetContext`, `GetContext` ou `DeleteContext`.
 
 ### O driver reconecta automaticamente?
 
-Não. Após falha de comunicação ou cancelamento durante I/O, é necessário criar um novo cliente.
+Não. Após falha de comunicação ou cancelamento durante I/O, é necessário criar um novo client.
 
-O driver não realiza reconexão automática nem repetição transparente de comandos.
+### Posso executar várias operações simultaneamente no mesmo client?
 
-### Posso executar várias operações simultaneamente no mesmo cliente?
+As chamadas podem partir de goroutines diferentes, mas o driver serializa as operações na mesma conexão.
 
-As chamadas podem partir de goroutines diferentes, mas o driver serializa as operações na mesma conexão. Uma operação aguarda a anterior terminar.
+O servidor atende múltiplas conexões simultaneamente.
 
-Para obter concorrência de comunicação, utilize conexões distintas. O servidor atende múltiplas conexões simultaneamente.
+### O que significa OperationOutcomeUnknownError?
 
-### O que acontece se uma operação retornar OperationOutcomeUnknownError?
+Significa que o client não conseguiu confirmar se o servidor executou a operação.
 
-Significa que o cliente não conseguiu confirmar se o servidor executou a operação.
-
-O comando pode ter sido executado, mesmo que a resposta não tenha chegado ao cliente.
-
-Não repita automaticamente a operação sem avaliar os possíveis efeitos de uma execução duplicada. A implementação atual não oferece deduplicação ou consulta posterior do resultado por `request_id`.
+O comando pode ter sido executado, mesmo que a resposta não tenha chegado. Não repita automaticamente a operação sem avaliar os efeitos de uma execução duplicada.
 
 ### O que acontece quando o servidor é encerrado?
 
-O servidor fecha o listener e aguarda as conexões ativas terminarem, respeitando o timeout configurado no executável.
+O servidor fecha o listener e aguarda as conexões ativas, respeitando o timeout de 10 segundos.
 
-Se o contexto expirar, `Shutdown` retorna o erro correspondente, mas não força o fechamento das conexões ativas. O encerramento completo do processo depende do tratamento desse erro e das goroutines restantes.
+Se o contexto expirar, o executável trata o erro e encerra pelo caminho de falha. O shutdown não força diretamente o fechamento das conexões ativas.
 
 Os dados em memória são perdidos quando o processo termina.
 
-## Referências técnicas
+## 13. Referências técnicas
 
 | Assunto | Arquivo |
 |---|---|
 | Arquitetura geral | `docs/tecnica/ARQUITETURA.md` |
-| Catálogo de componentes | `docs/tecnica/COMPONENTES.md` |
-| Requisitos e critérios de aceite | `docs/requisitos/REQUISITOS.md` |
+| Componentes | `docs/tecnica/COMPONENTES.md` |
+| Requisitos | `docs/requisitos/REQUISITOS.md` |
 | Contrato Protobuf | `protocol/proto/memorydb/v1/memorydb.proto` |
 | Engine | `server/internal/engine/engine.go` |
 | Storage | `server/internal/storage/storage.go` |
@@ -584,7 +652,18 @@ Os dados em memória são perdidos quando o processo termina.
 | Cliente de demonstração | `api/client/main.go` |
 | Executável do servidor | `server/cmd/memorydb/main.go` |
 | Workspace Go | `go.work` |
+| Guia específico do driver Go | `drivers/go/README.md` |
 | Roadmap | `memorydb-roadmap.md` |
+
+## 14. Referências externas
+
+- Repositório: https://github.com/pescador95/memorydb
+- Documentação oficial do Go: https://go.dev/doc/
+- Download do Go: https://go.dev/dl/
+- Gerenciamento de módulos Go: https://go.dev/doc/modules/managing-dependencies
+- Pacote `context`: https://pkg.go.dev/context
+- Pacote `errors`: https://pkg.go.dev/errors
+- Pacote `net/http`: https://pkg.go.dev/net/http
 
 ---
 
