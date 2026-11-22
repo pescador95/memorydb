@@ -16,7 +16,7 @@ A implementação atual oferece:
 - Driver cliente para aplicações Go.
 - Suporte a operações com `context.Context` no driver Go.
 - Atendimento concorrente de múltiplos clientes.
-- Encerramento gracioso do servidor.
+- Encerramento gracioso do servidor, com prazo configurado.
 
 Evidências:
 
@@ -68,6 +68,8 @@ O endereço padrão e a variável de ambiente são definidos em:
 
 `server/cmd/memorydb/main.go`
 
+**Atenção:** escutar em todas as interfaces de rede não significa que o serviço esteja protegido para exposição externa. A implementação atual não possui autenticação, autorização ou TLS.
+
 ### 2. Executar o cliente de demonstração
 
 Com o servidor ativo, abra outro terminal na raiz do repositório e entre no módulo `api`:
@@ -96,9 +98,9 @@ No terminal em que o servidor está executando, pressione `Ctrl+C`.
 
 O servidor fecha o listener e aguarda as conexões ativas terminarem, respeitando o timeout de shutdown de 10 segundos configurado no executável.
 
-Se o contexto de shutdown expirar, `Shutdown` retorna o erro de contexto. O servidor não força o fechamento das conexões ativas nesse caso.
+Se o contexto de shutdown expirar, `Shutdown` retorna o erro de contexto. A implementação atual não força o fechamento das conexões ativas nesse caso.
 
-Portanto, conexões que permaneçam bloqueadas podem impedir que o encerramento seja concluído imediatamente. O comportamento final do processo depende também do tratamento desse erro pelo executável e das goroutines ainda em execução.
+Portanto, conexões que permaneçam bloqueadas podem impedir que o encerramento seja concluído imediatamente. O comportamento final do processo também depende do tratamento desse erro pelo executável e das goroutines ainda em execução.
 
 Os dados armazenados em memória são perdidos quando o processo termina.
 
@@ -225,7 +227,7 @@ func main() {
 - `DialContext` utiliza o contexto somente para estabelecer a conexão. O contexto não fica associado ao cliente nem controla automaticamente as operações posteriores.
 - Os métodos com contexto permitem cancelar a espera para iniciar uma operação.
 - Se o contexto for cancelado enquanto o cliente aguarda sua vez de utilizar a conexão, a operação é cancelada sem invalidar a conexão.
-- Se o contexto for cancelado durante uma operação de rede, o driver interrompe a comunicação, encerra a conexão e passa ao estado `failed`.
+- Se o contexto for cancelado durante uma operação de I/O, o driver interrompe a comunicação, encerra a conexão e passa ao estado `failed`.
 - Essa invalidação é necessária porque o servidor pode ter executado o comando mesmo que o cliente não tenha recebido a resposta. Nesse cenário, o resultado da operação pode ser desconhecido.
 
 **Atenção:** depois de uma falha de comunicação ou de um cancelamento durante I/O, não reutilize o cliente. Crie uma nova conexão para continuar a comunicação.
@@ -254,6 +256,8 @@ Para utilizar o driver em outro projeto, o módulo `github.com/pescador95/memory
 
 Durante o desenvolvimento dentro deste repositório, o `go.work` resolve os módulos locais.
 
+A instalação independente também depende da publicação e disponibilidade dos módulos utilizados pelo driver, incluindo transporte TCP e protocolo Protobuf, nas versões declaradas nas dependências.
+
 ## Funcionalidades disponíveis
 
 O MemoryDB não oferece interface web, endpoints HTTP ou comandos de texto diretamente pelo TCP.
@@ -279,6 +283,8 @@ O contrato externo está definido em:
 Os exemplos representam os campos do schema Protobuf, não um formato JSON aceito pelo servidor.
 
 Chaves são strings e valores são bytes. O `request_id` enviado pelo cliente deve ser preservado na resposta correspondente.
+
+**Importante:** `request_id` é um identificador de correlação da solicitação e da resposta. Ele não funciona como chave de idempotência e não oferece deduplicação de comandos no servidor.
 
 ### Exemplo lógico de utilização
 
@@ -365,6 +371,68 @@ O módulo reutilizável de transporte está em:
 
 O framing é independente de Protobuf. A serialização é responsabilidade do codec utilizado pelo servidor e pelo driver.
 
+## Tratamento de erros e resultados indeterminados
+
+O driver diferencia erros retornados pelo servidor de falhas de comunicação.
+
+### ServerError
+
+`ServerError` representa um erro estruturado recebido do servidor.
+
+Quando o servidor retorna uma resposta de erro de aplicação válida, o driver disponibiliza esse erro à aplicação sem invalidar automaticamente o cliente.
+
+Esse comportamento pressupõe o contrato atual do servidor: um erro estruturado de aplicação representa uma operação rejeitada, e não uma operação executada cuja resposta foi perdida.
+
+### OperationOutcomeUnknownError
+
+`OperationOutcomeUnknownError` representa uma situação em que o cliente não consegue determinar se o servidor executou a operação.
+
+Isso pode acontecer, por exemplo, quando:
+
+- O cliente envia um comando e a conexão é interrompida antes de receber a resposta.
+- O contexto é cancelado durante a comunicação de rede.
+- O servidor executa o comando, mas a resposta não chega ao cliente.
+- O cliente recebe uma resposta inválida ou incompatível com a solicitação e não consegue confirmar o resultado.
+
+Nessas situações, o driver não deve afirmar que a operação falhou no servidor. Ele informa que o resultado é desconhecido.
+
+O erro disponibiliza o `RequestID` da operação e a causa da interrupção. A causa original pode ser consultada por meio de `errors.Is` e `errors.As`, utilizando o encadeamento de erros.
+
+Exemplo de identificação:
+
+```go
+var outcomeErr *memorydb.OperationOutcomeUnknownError
+
+if errors.As(err, &outcomeErr) {
+    log.Printf(
+        "Resultado desconhecido para request %d: %v",
+        outcomeErr.RequestID,
+        outcomeErr.Cause,
+    )
+}
+```
+
+Para esse exemplo, inclua `errors` nos imports.
+
+**Atenção:** não repita automaticamente uma operação com resultado desconhecido. O servidor pode já ter executado o comando.
+
+O `request_id` não permite consultar o resultado anterior nem impede a execução duplicada. A implementação atual não oferece deduplicação server-side ou recuperação de resultados por identificador de operação.
+
+### Resumo dos cenários
+
+| Situação | Comportamento |
+|---|---|
+| Falha ao estabelecer conexão | Retorna erro na inicialização. |
+| Erro estruturado do servidor | Retorna `ServerError`; cliente permanece utilizável. |
+| Cancelamento enquanto aguarda acesso à conexão | Operação cancelada; conexão preservada. |
+| Falha de comunicação durante I/O | Cliente passa para `failed`; resultado pode ser desconhecido. |
+| Cancelamento durante I/O | Conexão encerrada; cliente passa para `failed`. |
+| Resposta inválida ou incompatível | Cliente não consegue confirmar o resultado; conexão é invalidada. |
+| Uso após `Close()` | Operação rejeitada. |
+| Uso após falha de comunicação | Operação rejeitada. |
+
+A aplicação deve tratar os erros conforme o contexto da operação, evitando expor detalhes internos do MemoryDB diretamente aos consumidores da API.
+
 ## Erros comuns
 
 | Situação | O que acontece | Como resolver |
@@ -382,13 +450,14 @@ O framing é independente de Protobuf. A serialização é responsabilidade do c
 | DELETE de chave inexistente | Retorno bem-sucedido com `deleted=false`. | Grave a chave antes, caso precise removê-la. |
 | Contexto cancelado antes da operação | A operação retorna o erro de cancelamento ou deadline. | Verifique o prazo e o estado do contexto. |
 | Contexto cancelado durante I/O | A conexão é encerrada e o cliente passa ao estado `failed`. | Crie uma nova conexão e avalie se é seguro repetir o comando. |
+| Resultado da operação desconhecido | O servidor pode ter executado o comando sem que o cliente tenha recebido confirmação. | Não repita indiscriminadamente; avalie a semântica da operação. |
 | Cliente fechado ou com falha | Novas operações são rejeitadas. | Crie um novo cliente com `Dial` ou `DialContext`. |
 
 Erros de framing e de decodificação não são necessariamente convertidos em `ErrorResult`. Em geral, eles encerram o processamento da conexão.
 
 Erros de conexão, como conexão recusada ou conexão encerrada, podem apresentar mensagens específicas do sistema operacional.
 
-Erros de aplicação retornados pelo servidor são diferentes de falhas de transporte. Um erro de aplicação não invalida automaticamente o cliente.
+Erros de aplicação retornados pelo servidor são diferentes de falhas de transporte. Um erro estruturado de aplicação não invalida automaticamente o cliente.
 
 ## Limitações conhecidas
 
@@ -406,7 +475,9 @@ Erros de aplicação retornados pelo servidor são diferentes de falhas de trans
 - **Sem multiplexação:** o driver Go processa uma operação por vez em cada conexão.
 - **Sem reconexão automática:** o driver não restabelece automaticamente conexões interrompidas.
 - **Sem repetição automática:** o driver não repete comandos após falhas de comunicação.
+- **Sem deduplicação de operações:** `request_id` não é uma chave de idempotência e não existe mecanismo server-side para evitar a execução duplicada de comandos.
 - **Cancelamento no driver:** o suporte a `context.Context` existe, mas o cancelamento durante I/O invalida a conexão.
+- **Resultado indeterminado:** quando a comunicação é interrompida após o envio de uma operação, o cliente pode não conseguir determinar se o servidor a executou.
 - **Cliente de demonstração com endereço fixo:** utiliza `127.0.0.1:6380`.
 - **Sem interface HTTP ou REST:** o protocolo disponível é TCP com framing e Protobuf.
 - **Sem driver Java implementado e validado nesta etapa:** a integração Java não faz parte do escopo funcional atual.
@@ -475,6 +546,14 @@ As chamadas podem partir de goroutines diferentes, mas o driver serializa as ope
 
 Para obter concorrência de comunicação, utilize conexões distintas. O servidor atende múltiplas conexões simultaneamente.
 
+### O que acontece se uma operação retornar OperationOutcomeUnknownError?
+
+Significa que o cliente não conseguiu confirmar se o servidor executou a operação.
+
+O comando pode ter sido executado, mesmo que a resposta não tenha chegado ao cliente.
+
+Não repita automaticamente a operação sem avaliar os possíveis efeitos de uma execução duplicada. A implementação atual não oferece deduplicação ou consulta posterior do resultado por `request_id`.
+
 ### O que acontece quando o servidor é encerrado?
 
 O servidor fecha o listener e aguarda as conexões ativas terminarem, respeitando o timeout configurado no executável.
@@ -506,3 +585,9 @@ Os dados em memória são perdidos quando o processo termina.
 | Executável do servidor | `server/cmd/memorydb/main.go` |
 | Workspace Go | `go.work` |
 | Roadmap | `memorydb-roadmap.md` |
+
+---
+
+**MemoryDB**
+
+Servidor chave-valor em memória com comunicação TCP e protocolo Protocol Buffers.

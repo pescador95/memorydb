@@ -12,9 +12,11 @@ O armazenamento compartilha dados entre as conexões da mesma instância e prote
 
 A arquitetura separa armazenamento, execução de comandos, protocolo interno, codec, transporte TCP, servidor e drivers. O projeto possui um driver Go com operações básicas, suporte a `context.Context`, serialização de operações concorrentes e tratamento de falhas de comunicação e protocolo.
 
+O driver também identifica situações em que uma operação pode ter sido executada pelo servidor, mas sua resposta não foi confirmada pelo cliente. Nesses casos, retorna `OperationOutcomeUnknownError`, preservando o identificador da solicitação e a causa da falha.
+
 O servidor atende múltiplos clientes simultaneamente. Entretanto, o driver Go executa uma operação por vez em cada conexão, sem multiplexação de requisições simultâneas.
 
-Não há persistência, autenticação, autorização ou TLS implementados. O serviço não deve ser exposto a redes não confiáveis sem mecanismos adicionais de proteção.
+Não há persistência, autenticação, autorização, isolamento por tenant ou TLS implementados. O serviço não deve ser exposto a redes não confiáveis sem mecanismos adicionais de proteção.
 
 ## Documentos
 
@@ -41,7 +43,7 @@ Cada módulo possui seu próprio `go.mod`. O workspace permite desenvolver e tes
 
 # Lacunas e próximos passos
 
-As prioridades abaixo representam evoluções possíveis da implementação atual. Não indicam funcionalidades já disponíveis.
+As prioridades abaixo representam evoluções possíveis da implementação atual. Não indicam funcionalidades já disponíveis nem estabelecem, por si só, uma ordem definitiva de implementação.
 
 ## P1 — Robustez operacional
 
@@ -50,17 +52,22 @@ As prioridades abaixo representam evoluções possíveis da implementação atua
 O servidor ainda descarta erros retornados por `Handler.Handle`. É necessário definir uma estratégia de registro e observabilidade desses erros.
 
 A evolução deve considerar:
+
 - Registro estruturado de falhas de leitura, escrita e processamento.
 - Diferenciação entre encerramentos esperados e falhas de conexão.
 - Informações suficientes para diagnóstico sem expor dados sensíveis.
+- Métricas de erros e encerramentos de conexão.
 
 ### Timeouts e conexões
 
 Implementar políticas configuráveis de timeout de leitura e escrita no servidor, além de avaliar:
+
 - Limites de conexões simultâneas.
 - Tempo máximo de inatividade.
 - Proteção contra clientes lentos.
 - Comportamento diante de conexões que não concluem o envio de um frame.
+
+O driver Go já oferece operações baseadas em `context.Context`, permitindo controlar o cancelamento e o prazo das operações no lado cliente. Isso não substitui políticas operacionais de timeout e proteção no servidor.
 
 ### Encerramento gracioso
 
@@ -80,6 +87,7 @@ Referências:
 Definir condições seguras de uso antes de disponibilizar o servidor em redes não confiáveis.
 
 Ainda não existem mecanismos de:
+
 - TLS para proteção da comunicação.
 - Autenticação para identificação de clientes.
 - Autorização para controle das operações permitidas.
@@ -118,7 +126,7 @@ Referências:
 - `server/internal/storage/storage.go`
 - `memorydb-roadmap.md`
 
-## P2 — Evoluir os drivers
+## P2 — Evoluir os drivers e a confiabilidade das operações
 
 O driver Go possui operações básicas, suporte a `context.Context`, serialização de operações concorrentes e tratamento de falhas de comunicação e protocolo.
 
@@ -129,14 +137,19 @@ Próximos passos incluem avaliar:
 - Implementação e validação de drivers em outras linguagens.
 - Compatibilidade entre diferentes implementações de clientes.
 - Estratégias para lidar com resultados desconhecidos após interrupções de comunicação.
+- Mecanismos de idempotência e deduplicação no servidor.
 
-O cancelamento de operações durante comunicação pode invalidar a conexão, pois o resultado da operação no servidor pode ser desconhecido. O cliente deve estabelecer uma nova conexão para continuar operando.
+O cancelamento de operações durante a comunicação pode invalidar a conexão, pois o resultado da operação no servidor pode ser desconhecido. O driver sinaliza essa condição por meio de `OperationOutcomeUnknownError`.
 
-A reconexão automática e a repetição transparente de comandos não fazem parte da implementação atual.
+O `request_id` atual permite correlacionar solicitações e respostas, mas não funciona como identificador de idempotência. O servidor ainda não possui deduplicação, registro de operações executadas ou recuperação de resultados.
+
+A reconexão automática e a repetição transparente de comandos não fazem parte da implementação atual. Uma futura estratégia de retry deverá considerar a semântica de idempotência para evitar execuções duplicadas.
 
 Referências:
 
 - `drivers/go/`
+- `protocol/proto/memorydb/v1/memorydb.proto`
+- `server/internal/engine/`
 - `memorydb-roadmap.md`
 
 ## P3 — Persistência e desempenho
@@ -151,6 +164,7 @@ Essas evoluções precisam considerar os impactos sobre:
 - A arquitetura modular.
 - O comportamento concorrente.
 - A recuperação após falhas.
+- A relação entre confirmação de escrita e durabilidade.
 
 A implementação atual não possui persistência em disco nem metas mensuráveis de latência e throughput.
 
@@ -168,6 +182,17 @@ Na validação registrada em 15/11/2026, foram executados os testes automatizado
 | `server` | Aprovado | Aprovado |
 | `api` | Aprovado — sem testes próprios | Aprovado |
 
+Após essa validação, o driver Go recebeu testes adicionais relacionados a resultados indeterminados, cancelamento durante I/O e falhas de comunicação.
+
+Na validação posterior do driver, foram executados com sucesso:
+
+```bash
+go test -v -count=1 ./drivers/go
+go test -race -count=1 ./drivers/go
+go test -race -count=20 ./drivers/go
+go vet ./drivers/go
+```
+
 Os testes automatizados abrangem, entre outros aspectos:
 
 - Operações do engine e do storage.
@@ -178,11 +203,12 @@ Os testes automatizados abrangem, entre outros aspectos:
 - Compartilhamento de armazenamento entre clientes.
 - Operações e concorrência no driver Go.
 - Cancelamento, deadlines e falhas de comunicação.
+- Resultados indeterminados após falhas de comunicação.
 - Encerramento do servidor.
 
-Todos os comandos terminaram sem falhas na execução registrada.
+Todos os comandos mencionados terminaram sem falhas nas respectivas execuções registradas.
 
-**Observação:** essa validação comprova o estado dos testes na data da execução. Alterações futuras no código exigem nova execução para manter essa evidência atualizada.
+**Observação:** a validação completa de 15/11 comprova o estado dos módulos naquela execução. A validação posterior comprova os cenários adicionais do driver Go, mas não substitui uma nova execução completa de todos os módulos após as alterações. Alterações futuras no código também exigem nova execução para manter essas evidências atualizadas.
 
 ## Validação ponta a ponta
 
@@ -221,6 +247,7 @@ A implementação atual contempla o núcleo funcional do MemoryDB:
 - Engine com PING, SET, GET e DELETE.
 - Storage em memória com proteção concorrente.
 - Driver Go com suporte a contextos.
+- Identificação de resultados indeterminados no driver.
 - Atendimento concorrente de múltiplos clientes.
 - Shutdown gracioso com contexto.
 - Testes automatizados e validação ponta a ponta.

@@ -196,7 +196,16 @@ O protocolo de framing utiliza:
 - Leitura completa com tratamento de fragmentação.
 - Escrita com tratamento de escritas parciais.
 
-A abstração `Connection` permite leitura e escrita simultâneas, mas serializa operações concorrentes do mesmo tipo por meio de mutexes independentes. O fechamento da conexão interrompe operações de I/O bloqueadas.
+A abstração `Connection` encapsula `net.Conn` e oferece operações de leitura, escrita e fechamento.
+
+Características de concorrência e ciclo de vida:
+
+- Leituras e escritas podem ocorrer simultaneamente.
+- Operações concorrentes do mesmo tipo são serializadas por mutexes independentes.
+- `Close` fecha diretamente a conexão subjacente, permitindo interromper operações de I/O bloqueadas.
+- Os métodos públicos validam o receiver nulo.
+- A criação da conexão também rejeita interfaces nulas e conexões tipadas como nil.
+- A escrita completa trata escritas parciais e valida contagens inválidas retornadas pelo writer.
 
 Arquivos principais:
 
@@ -250,14 +259,24 @@ Responsabilidades:
 - Expor operações PING, SET, GET e DELETE.
 - Converter respostas de erro do servidor em erros Go.
 - Serializar operações concorrentes do cliente no modelo sequencial de requisição/resposta.
-- Permitir controle de estabelecimento de conexão e de operações por meio de `context.Context`.
+- Permitir controle do estabelecimento da conexão e das operações por meio de `context.Context`.
 - Gerenciar o ciclo de vida da conexão e impedir a reutilização de clientes encerrados ou que sofreram falhas de comunicação.
+- Diferenciar erros de aplicação de situações em que o resultado de uma operação não pode ser confirmado.
 
 A API oferece os métodos convencionais `Dial`, `Ping`, `Set`, `Get` e `Delete`, além de suas variantes com contexto: `DialContext`, `PingContext`, `SetContext`, `GetContext` e `DeleteContext`.
 
+#### Conexão e contexto
+
 `DialContext` utiliza o contexto para controlar o estabelecimento da conexão. O contexto utilizado nessa etapa não fica associado às operações posteriores do cliente.
 
-Nas operações, o contexto permite cancelar a espera para iniciar uma operação ou interromper uma operação de rede em andamento. Quando o cancelamento ocorre durante a comunicação, a conexão é encerrada e o cliente passa para o estado `failed`. Essa decisão evita reutilizar uma conexão cujo estado de execução da solicitação no servidor pode ser desconhecido.
+Nas operações, o contexto pode atuar em dois momentos distintos:
+
+1. **Antes do início da operação:** o cliente pode estar aguardando acesso à conexão por meio do mecanismo de serialização. Se o contexto for cancelado durante essa espera, a operação não começa, o erro de contexto é retornado diretamente e o cliente permanece disponível.
+2. **Durante a comunicação:** se o contexto for cancelado enquanto a operação está em andamento, o cliente interrompe o I/O fechando a conexão. Como a solicitação pode já ter sido enviada e executada pelo servidor, não é possível garantir se o comando foi aplicado.
+
+O segundo cenário invalida a conexão e leva o cliente ao estado `failed`.
+
+#### Estados internos do cliente
 
 O cliente possui três estados internos:
 
@@ -265,13 +284,60 @@ O cliente possui três estados internos:
 - `closed`: cliente encerrado explicitamente por `Close`.
 - `failed`: conexão invalidada após falha de comunicação ou protocolo.
 
-As operações são serializadas por um mecanismo de exclusão mútua baseado em canal, permitindo que apenas uma solicitação utilize a conexão por vez. Isso evita que respostas de operações concorrentes sejam associadas incorretamente às requisições.
+A transição para `failed` impede que operações futuras utilizem uma conexão cujo estado de comunicação não é mais confiável.
 
-Erros de aplicação retornados pelo servidor não invalidam automaticamente a conexão. Falhas de transporte ou de protocolo, por outro lado, tornam o cliente indisponível.
+#### Serialização das operações
 
-O cliente não oferece multiplexação de requisições, reconexão automática ou recuperação transparente de operações interrompidas.
+As operações são serializadas por um mecanismo de exclusão mútua baseado em canal (`operationGate`), permitindo que apenas uma solicitação utilize a conexão por vez.
 
-Arquivos principais:
+Esse comportamento corresponde ao protocolo atual, que não implementa multiplexação de solicitações e respostas na mesma conexão.
+
+A serialização evita que respostas de operações concorrentes sejam associadas incorretamente às requisições.
+
+O `request_id` identifica e correlaciona uma solicitação com sua resposta. No estado atual, ele é sequencial e local à conexão. Não constitui uma chave de idempotência nem oferece deduplicação de comandos.
+
+#### Tratamento de erros e resultado indeterminado
+
+O driver diferencia erros de aplicação retornados pelo servidor de falhas de transporte ou protocolo.
+
+Erros estruturados de aplicação são representados por `ServerError`. Eles indicam que o servidor retornou uma resposta de erro reconhecível e não invalidam automaticamente a conexão.
+
+Falhas de comunicação podem impedir que o cliente saiba se uma operação foi executada. Exemplos:
+
+- Escrita parcial ou falha de escrita depois que parte da solicitação foi transmitida.
+- Cancelamento ou deadline durante a comunicação.
+- Conexão interrompida depois do envio da solicitação e antes da confirmação.
+- Resposta perdida ou incompleta.
+- Resposta Protobuf inválida.
+- Divergência entre o `request_id` enviado e o recebido.
+- Tipo de resposta incompatível com a operação solicitada.
+
+Para esses casos, o driver disponibiliza `OperationOutcomeUnknownError`.
+
+Esse erro contém:
+
+- `RequestID`: identificador da solicitação cujo resultado não pôde ser confirmado.
+- `Cause`: causa subjacente da falha de comunicação ou interrupção.
+
+O tipo implementa `Unwrap()`, preservando a possibilidade de inspeção da causa por meio de `errors.Is` e `errors.As`.
+
+A semântica de `OperationOutcomeUnknownError` é importante: **o cliente não está afirmando que a operação falhou, mas que não possui confirmação suficiente para determinar se ela foi executada**.
+
+Por exemplo, uma operação SET pode ter sido aplicada pelo servidor antes de a resposta se perder. Nesse cenário, retornar apenas um erro de transporte poderia induzir a aplicação cliente a interpretar incorretamente que a operação não ocorreu.
+
+O driver não realiza retry automático. A aplicação cliente não deve repetir cegamente uma operação com resultado indeterminado sem considerar sua semântica e os efeitos de uma possível execução anterior.
+
+A implementação atual ainda não oferece:
+
+- Identificador de operação estável entre tentativas.
+- Deduplicação de operações no servidor.
+- Armazenamento de resultados anteriores para recuperação de respostas.
+- Garantia de execução idempotente baseada em contrato distribuído.
+- Reconexão automática ou recuperação transparente de operações interrompidas.
+
+Essas capacidades fazem parte de uma evolução arquitetural futura.
+
+#### Arquivos principais
 
 - `drivers/go/client.go`
 - `drivers/go/client_test.go`
@@ -383,6 +449,32 @@ sequenceDiagram
     H-->>C: Frame com resposta de erro
 ```
 
+### Resultado indeterminado no driver
+
+O fluxo abaixo representa uma situação em que o servidor executa a operação, mas a resposta não chega ao cliente.
+
+```mermaid
+sequenceDiagram
+    participant C as Driver Go
+    participant T as Transporte TCP
+    participant H as Handler
+    participant E as Engine
+    participant St as Storage
+
+    C->>T: Envia solicitação SET
+    T->>H: Solicitação recebida
+    H->>E: Execute(SET)
+    E->>St: Set(key, value)
+    St-->>E: Operação aplicada
+    E-->>H: Response SET
+    H--xC: Resposta perdida ou conexão interrompida
+    Note over C: Cliente não consegue confirmar o resultado
+    C->>C: Retorna OperationOutcomeUnknownError
+    C->>C: Transição para estado failed
+```
+
+Nesse cenário, o erro representa incerteza sobre o resultado da operação, e não uma confirmação de que o servidor deixou de executá-la.
+
 ## Contrato de comunicação
 
 O MemoryDB não expõe uma API HTTP na implementação atual. Os comandos são transmitidos por TCP utilizando frames com prefixo de tamanho e payload Protobuf.
@@ -401,6 +493,8 @@ O envelope de resposta contém `request_id`, `success` e um resultado selecionad
 Quando há erro de aplicação, o resultado contém `ErrorResult`, com código e mensagem.
 
 Erros de framing ou de decodificação Protobuf encerram o processamento da conexão. Não há garantia de resposta estruturada de aplicação nesses casos.
+
+O `request_id` é utilizado para correlação entre solicitação e resposta. Ele não representa uma chave de idempotência e não permite deduplicar solicitações repetidas.
 
 ## Modelo de dados
 
@@ -463,6 +557,9 @@ Não há persistência, identificação de tenant, timestamp ou expiração de e
 4. **Módulos independentes:** cada componente possui seu próprio `go.mod`; o workspace facilita o desenvolvimento conjunto.
 5. **Execução sequencial por conexão:** o driver serializa as operações e o handler processa uma solicitação por vez em cada conexão.
 6. **Armazenamento compartilhado:** todas as conexões atendidas pela mesma instância do servidor utilizam o mesmo storage.
+7. **Falha conservadora do cliente:** quando a comunicação deixa de oferecer condições para confirmar o resultado de uma operação, o driver invalida a conexão em vez de reutilizá-la em estado incerto.
+8. **Separação entre erro de aplicação e incerteza de execução:** respostas estruturadas de erro são diferentes de falhas de comunicação que impedem confirmar o resultado da operação.
+9. **Ausência de retry automático:** o driver não repete operações automaticamente quando o resultado é indeterminado, evitando introduzir duplicidade de execução sem um contrato de idempotência.
 
 ## Lacunas arquiteturais identificadas
 
@@ -474,6 +571,9 @@ Não há persistência, identificação de tenant, timestamp ou expiração de e
 6. **Multiplexação ausente:** o protocolo possui `request_id`, mas o driver atual trabalha com uma solicitação por vez em cada conexão. O identificador permite correlacionar requisições e respostas, mas não implementa processamento concorrente de solicitações na mesma conexão.
 7. **Persistência ausente:** os dados são perdidos quando o processo termina.
 8. **TTL não implementado:** o campo existe no contrato, mas valores positivos são rejeitados.
+9. **Contrato de idempotência ausente:** não há identificador de operação estável entre tentativas, deduplicação no servidor ou recuperação de resultados anteriores. O `request_id` atual não oferece essas garantias.
+10. **Recuperação de resultado indeterminado ausente:** depois de uma falha de comunicação, o cliente não consegue consultar o resultado de uma operação anterior por meio de um identificador estável.
+11. **Política de retenção de deduplicação inexistente:** como ainda não há deduplicação, não existe política de expiração ou retenção de registros de operações processadas.
 
 ## Testes e validação
 
@@ -487,17 +587,58 @@ O projeto possui testes para:
 - Driver Go e tratamento de erros.
 - Integração entre cliente e servidor.
 
-Na validação consolidada mais recente, foram executados `go test -race -count=1 ./...` e `go vet ./...` separadamente nos módulos:
+### Validação do transporte TCP
 
-- `protocol/generated/go`
-- `transport/tcp/go`
-- `drivers/go`
-- `server`
-- `api`
+A camada TCP possui testes para:
 
-Todos os testes e verificações de `go vet` passaram nessa execução.
+- Serialização e desserialização de frames.
+- Ordem Big Endian do prefixo de tamanho.
+- Leitura de payloads fragmentados.
+- Cabeçalhos e payloads incompletos.
+- Tamanho zero e payload acima do limite.
+- Escritas parciais e writer sem progresso.
+- Validação de reader e writer nulos.
+- Conexões nulas e receivers nulos.
+- Interrupção de leitura e escrita bloqueadas por `Close`.
+- Escritas e leituras concorrentes.
+- Operações simultâneas de leitura e escrita.
 
-Além dos testes automatizados, foi executada uma validação manual ponta a ponta em 15/11/2026, utilizando o servidor real e a aplicação `api/client`.
+Os testes com `net.Pipe()` permitem verificar cenários determinísticos de comunicação, mas não substituem testes adicionais utilizando sockets TCP reais.
+
+### Validação do driver Go
+
+A cobertura do driver inclui:
+
+- Operações convencionais e operações com contexto.
+- Validação de conexão e contexto nulos.
+- Serialização de operações concorrentes.
+- Correlação de requisições e respostas por `request_id`.
+- Respostas Protobuf inválidas e incompatíveis.
+- Erros estruturados retornados pelo servidor.
+- Fechamento do cliente e falhas de comunicação.
+- Cancelamento antes do início da operação.
+- Cancelamento durante a espera pelo acesso à conexão.
+- Interrupção de I/O por cancelamento ou deadline.
+- Escrita parcial com resultado indeterminado.
+- Operação SET executada pelo servidor cuja resposta não chega ao cliente.
+- Cancelamento durante a leitura da resposta final.
+
+Foram executados e aprovados:
+
+```bash
+go test -v -count=1 ./drivers/go
+go test -race -count=1 ./drivers/go
+go test -race -count=20 ./drivers/go
+go vet ./drivers/go
+```
+
+A execução repetida com o detector de condições de corrida passou nos testes do driver. O `go vet` também terminou sem apontamentos.
+
+Esses resultados documentam a validação recente do módulo `drivers/go`; não representam uma nova execução consolidada de todos os módulos do workspace.
+
+### Validação ponta a ponta
+
+Foi executada uma validação manual em 15/11/2026, utilizando o servidor real e a aplicação `api/client`.
 
 O fluxo validado foi:
 
@@ -509,4 +650,16 @@ O fluxo validado foi:
 
 Resultado: ciclo completo executado com sucesso.
 
-Os testes do driver também cobrem operações com contexto, cancelamento antes da execução, cancelamento durante espera pelo acesso à conexão, interrupção de I/O por cancelamento ou deadline, fechamento concorrente e falhas de comunicação.
+### Limites da validação
+
+Os testes atuais demonstram o comportamento dos componentes nos cenários exercitados, mas não representam garantias de disponibilidade, durabilidade ou recuperação distribuída.
+
+Ainda são necessárias validações específicas para:
+
+- Falhas de processo e reinicialização do servidor.
+- Limites de conexões e comportamento sob carga.
+- Timeouts operacionais no lado servidor.
+- Testes de rede com sockets TCP reais e falhas controladas.
+- Contrato de idempotência e deduplicação.
+- Recuperação de operações após perda de resposta.
+- Persistência e recuperação de dados, quando implementadas.

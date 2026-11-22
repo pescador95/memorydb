@@ -17,6 +17,8 @@ A implementação atual contempla:
 - Conexões TCP persistentes.
 - Atendimento concorrente de múltiplos clientes.
 - Driver cliente em Go.
+- Operações context-aware no driver Go, com suporte a cancelamento e deadlines.
+- Sinalização de resultados indeterminados por meio de `OperationOutcomeUnknownError`.
 - Encerramento gracioso do servidor.
 - Workspace Go com módulos independentes.
 
@@ -27,6 +29,8 @@ A implementação atual contempla:
 - Não há autenticação, autorização ou isolamento por tenant.
 - Não há TLS.
 - Não há multiplexação de requisições na mesma conexão.
+- Não há idempotência ou deduplicação de operações no servidor.
+- Não há retry automático nem recuperação de resultados de operações cujo desfecho seja indeterminado.
 - Não há driver Java implementado e validado nesta etapa.
 
 ## 2. Requisitos funcionais
@@ -213,6 +217,8 @@ Cenário: Rejeitar chave vazia
 
 **Descrição:** O engine copia o `request_id` da solicitação para a resposta. O contrato externo também define esse campo nos envelopes de requisição e resposta.
 
+O identificador permite correlacionar uma resposta com sua solicitação correspondente. Não representa, por si só, uma chave de idempotência e não impede que uma operação seja executada mais de uma vez.
+
 **Componentes:** `Engine`, protocolo interno e codec Protobuf.
 
 **Evidência:**
@@ -355,6 +361,56 @@ Cenário: Encerrar após sinal do sistema operacional
 
 **Limitação:** O servidor não força o fechamento das conexões ativas quando o contexto de shutdown expira. Nesse caso, `Shutdown` retorna o erro de contexto, mas as conexões permanecem sob responsabilidade de seus respectivos handlers.
 
+### FR-011 — Controlar operações do driver por contexto
+
+**Descrição:** O driver Go oferece métodos baseados em `context.Context` para controlar o prazo e o cancelamento de operações. Também oferece `DialContext` para controlar o estabelecimento inicial da conexão.
+
+O comportamento do cancelamento depende da fase em que a operação se encontra:
+
+- Se o contexto for cancelado enquanto a operação aguarda acesso ao mecanismo de serialização, a operação não iniciou o I/O. O driver retorna o erro do contexto e mantém a conexão utilizável.
+- Se o contexto for cancelado durante o I/O, o driver interrompe a operação fechando a conexão. Como não é possível determinar com segurança se o servidor executou o comando antes da interrupção, o driver retorna `OperationOutcomeUnknownError`.
+- Quando uma operação termina normalmente, o resultado recebido é retornado conforme o contrato do comando.
+- O erro `OperationOutcomeUnknownError` preserva o identificador da solicitação e a causa original, permitindo inspeção com `errors.As` e `errors.Is`.
+
+O estado do cliente é atualizado de acordo com o resultado da operação. Após uma interrupção durante I/O, a conexão não é reutilizada.
+
+**Componente:** Driver Go.
+
+**Evidência:**
+- [Driver Go](../../drivers/go/client.go).
+- [TestClientPartialWriteReturnsUnknownOutcome](../../drivers/go/client_test.go).
+- [TestClientSetReturnsUnknownOutcomeAfterServerExecution](../../drivers/go/client_test.go).
+- [TestClientCancellationDuringFinalResponseRead](../../drivers/go/client_test.go).
+
+**Critério de aceite**
+
+```gherkin
+Cenário: Cancelar operação antes do início do I/O
+  Dado que uma operação aguarda acesso à conexão
+  E que seu contexto é cancelado antes do início do I/O
+  Quando a operação tentar prosseguir
+  Então deve retornar o erro de contexto
+  E o cliente deve permanecer utilizável
+
+Cenário: Cancelar operação durante o I/O
+  Dado que uma operação já iniciou a comunicação com o servidor
+  Quando seu contexto for cancelado
+  Então o driver deve interromper a conexão
+  E deve retornar OperationOutcomeUnknownError
+  E deve preservar o RequestID e a causa do cancelamento
+  E o cliente não deve reutilizar a conexão interrompida
+
+Cenário: Preservar a causa original do erro
+  Dado que uma operação retorna OperationOutcomeUnknownError
+  Quando a aplicação inspecionar o erro
+  Então deve conseguir identificar seu tipo com errors.As
+  E deve conseguir verificar sua causa com errors.Is
+```
+
+**Estado:** Implementado e testado no driver Go.
+
+**Limitação:** O controle por contexto não oferece garantia de que uma operação cancelada durante I/O não tenha sido executada no servidor. Também não existe mecanismo server-side para consultar ou recuperar o resultado dessa operação. O driver não realiza retry automático.
+
 ## 3. Requisitos não funcionais
 
 | ID | Requisito / observação verificável | Estado | Evidência |
@@ -365,14 +421,18 @@ Cenário: Encerrar após sinal do sistema operacional
 | NFR-004 | O servidor pode fechar o listener e aguardar conexões ativas. O executável limita o shutdown a 10 segundos. | Parcial | [server.go](../../server/internal/transport/tcp/server.go), [main.go](../../server/cmd/memorydb/main.go) |
 | NFR-005 | Dados sobrevivem à reinicialização do processo. | Não implementado | O armazenamento é exclusivamente em memória. [storage.go](../../server/internal/storage/storage.go) |
 | NFR-006 | Comunicação autenticada e criptografada por TLS. | Não implementado | O servidor utiliza listener TCP sem TLS. [main.go](../../server/cmd/memorydb/main.go) |
-| NFR-007 | Timeout de leitura/escrita, limite de conexões concorrentes e proteção contra clientes lentos. | Não implementado | Não há políticas operacionais específicas identificadas em [connection.go](../../transport/tcp/go/connection.go) e [server.go](../../server/internal/transport/tcp/server.go). |
+| NFR-007 | Timeout de leitura/escrita no servidor, limite de conexões concorrentes e proteção contra clientes lentos. | Não implementado | Não há políticas operacionais específicas identificadas em [connection.go](../../transport/tcp/go/connection.go) e [server.go](../../server/internal/transport/tcp/server.go). |
 | NFR-008 | Meta mensurável de latência e throughput para operações. | Não implementado | Não há metas ou benchmarks de performance identificados. |
 | NFR-009 | Erros de processamento de conexão devem ser observáveis em log. | Não implementado | O erro retornado por `Handler.Handle` é descartado pela goroutine do servidor. [server.go](../../server/internal/transport/tcp/server.go) |
 | NFR-010 | Separação entre armazenamento, execução de comandos, protocolo interno, serialização e transporte. | Implementado | [Engine](../../server/internal/engine), [Storage](../../server/internal/storage), [Protocol](../../server/internal/protocol), [Codec](../../server/internal/codec), [Transporte TCP](../../server/internal/transport/tcp) |
 | NFR-011 | O transporte TCP deve ser reutilizável sem dependência direta do Protobuf. | Implementado | [Módulo TCP](../../transport/tcp/go), [Driver Go](../../drivers/go), [Handler](../../server/internal/transport/tcp/handler.go) |
 | NFR-012 | O driver Go deve permitir que aplicações utilizem o MemoryDB sem implementar manualmente o protocolo de comunicação. | Implementado | [Driver Go](../../drivers/go/client.go), [Testes do driver](../../drivers/go/client_test.go) |
 | NFR-013 | Os módulos Go devem permitir desenvolvimento e testes independentes dentro do workspace. | Implementado | [go.work](../../go.work), arquivos `go.mod` dos módulos |
-| NFR-014 | O código deve passar pelos testes com detector de condições de corrida e pela análise estática `go vet`. | Validado na execução atual | Testes `go test -race -count=1 ./...` e `go vet ./...` executados em todos os módulos |
+| NFR-014 | O código deve passar pelos testes com detector de condições de corrida e pela análise estática `go vet`. | Validado nas execuções registradas | Validação dos módulos em 15/11/2026 e validações posteriores do driver Go, incluindo `go test -race -count=20 ./drivers/go` e `go vet ./drivers/go`. |
+
+**Observações sobre NFR-007:** O suporte a `context.Context` no driver permite controlar operações do lado cliente, mas não equivale à implementação de políticas server-side de timeout de leitura, timeout de escrita, inatividade ou proteção contra clientes lentos.
+
+**Observações sobre NFR-014:** A validação é uma evidência vinculada à versão do código e à data de execução. Não representa garantia permanente de que alterações futuras continuarão passando pelos mesmos testes e verificações.
 
 ## 4. Casos de borda implementados
 
@@ -396,6 +456,11 @@ Cenário: Encerrar após sinal do sistema operacional
 | Concorrência no storage | Operações são sincronizadas por lock de leitura/escrita. | [storage.go](../../server/internal/storage/storage.go), [TestConcurrentAccess](../../server/internal/storage/storage_test.go) |
 | Múltiplos clientes | Conexões distintas podem utilizar a mesma instância do servidor e compartilhar o armazenamento. | [server_test.go](../../server/internal/transport/tcp/server_test.go), [server_test.go — integração](../../server/internal/integration/server_test.go) |
 | Desconexão durante operação | Falhas de leitura e escrita são propagadas pelo driver. | [client_test.go](../../drivers/go/client_test.go) |
+| Cancelamento antes do início do I/O | A operação retorna o erro de contexto sem invalidar a conexão. | [client_test.go](../../drivers/go/client_test.go) |
+| Cancelamento durante o I/O | A conexão é interrompida e o driver sinaliza resultado indeterminado. | [client.go](../../drivers/go/client.go), [client_test.go](../../drivers/go/client_test.go) |
+| Escrita parcial seguida de falha | O driver não presume que a operação deixou de ser executada; retorna resultado indeterminado. | [client_test.go](../../drivers/go/client_test.go) |
+| Servidor executa SET, mas a resposta não chega ao cliente | O cliente não consegue determinar se o comando foi aplicado e retorna resultado indeterminado quando detecta a falha. | [TestClientSetReturnsUnknownOutcomeAfterServerExecution](../../drivers/go/client_test.go) |
+| Identificador da operação | `RequestID` identifica a solicitação e permite correlacionar a resposta; não realiza deduplicação. | [client.go](../../drivers/go/client.go), [memorydb.proto](../../protocol/proto/memorydb/v1/memorydb.proto) |
 
 ## 5. Rastreabilidade requisito–componente–teste
 
@@ -411,6 +476,7 @@ Cenário: Encerrar após sinal do sistema operacional
 | FR-008 | Framing TCP | Testes de endian, fragmentação, limites, truncamento e escrita parcial | Coberto |
 | FR-009 | Handler / Server / Driver | `TestHandlerProcessesMultipleRequests`, `TestServerAcceptsMultipleClients`, `TestServerMultipleClientsShareStorage`, `TestServerConcurrentClients` | Coberto para conexões distintas e requisições sequenciais |
 | FR-010 | Server / Executável | `TestServerShutdownWaitsForActiveConnections` | Parcial: fluxo de sinais do executável sem teste específico |
+| FR-011 | Driver Go | `TestClientPartialWriteReturnsUnknownOutcome`, `TestClientSetReturnsUnknownOutcomeAfterServerExecution`, `TestClientCancellationDuringFinalResponseRead` | Coberto para os cenários identificados |
 
 ## 6. Lacunas de especificação e comportamento
 
@@ -455,14 +521,16 @@ O armazenamento atual é compartilhado entre todos os clientes conectados à mes
 O tamanho dos frames é limitado a 1 MiB, mas não foram identificados limites específicos para:
 
 - Quantidade de conexões simultâneas.
-- Tempo máximo de leitura.
-- Tempo máximo de escrita.
+- Tempo máximo de leitura no servidor.
+- Tempo máximo de escrita no servidor.
 - Tempo máximo de inatividade de uma conexão.
 - Proteção contra clientes que enviam dados lentamente.
 
 **Impacto:** conexões lentas ou excessivas podem consumir recursos do servidor.
 
 **Referências:** [connection.go](../../transport/tcp/go/connection.go), [server.go](../../server/internal/transport/tcp/server.go), [framing.go](../../transport/tcp/go/framing.go).
+
+**Observação:** os métodos context-aware do driver permitem ao cliente controlar o prazo de suas operações, mas não substituem limites e timeouts operacionais aplicados pelo servidor.
 
 ### GAP-007 — Observabilidade de erros de conexão incompleta
 
@@ -474,17 +542,29 @@ O servidor executa `Handler.Handle` em goroutines, mas o erro retornado pelo han
 
 ### GAP-008 — Multiplexação de requisições não implementada
 
-O driver Go utiliza mutex para garantir que uma solicitação seja enviada e sua resposta recebida antes de iniciar a próxima operação na mesma conexão.
+O driver Go utiliza sincronização para garantir que uma solicitação seja enviada e sua resposta recebida antes de iniciar a próxima operação na mesma conexão.
 
 **Impacto:** uma conexão não permite múltiplas requisições simultâneas em trânsito, embora o servidor atenda várias conexões simultaneamente.
 
 **Referência:** [client.go](../../drivers/go/client.go).
 
-### GAP-009 — Timeout e cancelamento no driver não implementados
+### GAP-009 — Resultado indeterminado não possui recuperação server-side
 
-O driver ainda não oferece uma API baseada em `context.Context` nem métodos específicos para configurar timeout por operação ou conexão.
+O driver Go implementa operações baseadas em `context.Context` e identifica situações nas quais o resultado de uma operação não pode ser confirmado pelo cliente.
 
-**Impacto:** o consumidor não possui uma interface de alto nível para controlar o prazo de execução de cada operação.
+Quando o cancelamento acontece antes do início do I/O, o driver retorna o erro de contexto sem invalidar a conexão.
+
+Quando o cancelamento ou uma falha de comunicação acontece durante o I/O, o servidor pode já ter executado o comando, mesmo que o cliente não tenha recebido a resposta. Nesse cenário, o driver interrompe a conexão e retorna `OperationOutcomeUnknownError`, preservando o `RequestID` e a causa original.
+
+Entretanto, o servidor ainda não oferece:
+
+- Identificador de operação estável para deduplicação.
+- Registro de operações executadas e seus resultados.
+- Consulta posterior do resultado de uma operação.
+- Reenvio seguro de uma operação com garantia de não duplicação.
+- Recuperação de resultados após desconexão.
+
+**Impacto:** aplicações precisam tratar explicitamente resultados indeterminados. Repetir automaticamente uma operação após esse erro pode executar o comando novamente. O driver não realiza retry automático.
 
 **Referência:** [client.go](../../drivers/go/client.go).
 
@@ -493,6 +573,25 @@ O driver ainda não oferece uma API baseada em `context.Context` nem métodos es
 A arquitetura prevê drivers independentes do servidor, mas a implementação e a validação do driver Java não fazem parte do estado funcional documentado aqui.
 
 **Impacto:** a integração por Java ainda não deve ser considerada um requisito implementado.
+
+### GAP-011 — Idempotência e deduplicação não implementadas
+
+O protocolo possui `request_id`, utilizado para correlacionar requisições e respostas. Entretanto, esse identificador não constitui uma chave de idempotência.
+
+O servidor não mantém um registro de operações já executadas, não identifica reenvios de uma mesma operação lógica e não reproduz resultados anteriores.
+
+**Impacto:** em caso de perda de resposta ou resultado indeterminado, o cliente não consegue reenviar uma operação com garantia de que ela será executada no máximo uma vez.
+
+A implementação futura deverá definir, entre outros aspectos:
+
+- Identificador estável da operação, independente do identificador de transporte.
+- Escopo e período de retenção dos identificadores.
+- Armazenamento do resultado associado à operação.
+- Comportamento para identificadores repetidos com conteúdo divergente.
+- Política de concorrência para requisições com o mesmo identificador.
+- Relação entre deduplicação, persistência e recuperação após reinicialização.
+
+**Referência:** [memorydb.proto](../../protocol/proto/memorydb/v1/memorydb.proto), [client.go](../../drivers/go/client.go).
 
 ## 7. Validação técnica da implementação
 
@@ -506,15 +605,25 @@ Na validação registrada em 15/11/2026, foram executados os testes e a análise
 | `server` | Aprovado | Aprovado |
 | `api` | Aprovado — sem testes próprios | Aprovado |
 
-Também foram executadas validações específicas do servidor:
+Após essa validação, o driver Go recebeu testes adicionais relacionados a resultados indeterminados, cancelamento durante I/O e falhas de comunicação.
 
-- Testes do pacote `server/internal/transport/tcp`.
-- Testes do pacote `server/internal/integration`.
-- `go vet ./...` no módulo `server`.
+Na validação posterior do driver, foram executados com sucesso:
 
-Todos os comandos terminaram sem falhas.
+```bash
+go test -v -count=1 ./drivers/go
+go test -race -count=1 ./drivers/go
+go test -race -count=20 ./drivers/go
+go vet ./drivers/go
+```
 
-**Observação:** essa validação comprova o estado dos testes na data da execução. Alterações futuras no código exigem nova execução para manter essa evidência atualizada.
+Os testes adicionais contemplaram, entre outros cenários:
+
+- Falha durante escrita parcial.
+- Servidor executando SET antes de a resposta ser perdida.
+- Cancelamento durante a leitura da resposta final.
+- Preservação do identificador e da causa do resultado indeterminado.
+
+**Observação:** a validação de 15/11 comprova o estado dos módulos naquela execução. A validação posterior comprova os cenários adicionais do driver Go, mas não substitui uma nova execução completa de todos os módulos após as alterações. Alterações futuras no código também exigem nova execução para manter essas evidências atualizadas.
 
 ## 8. Critério geral de conclusão do escopo atual
 
@@ -527,8 +636,9 @@ O escopo funcional inicial do MemoryDB é considerado implementado quando:
 5. O transporte TCP delimita mensagens corretamente.
 6. O servidor atende múltiplos clientes e conexões persistentes.
 7. O driver Go permite consumir as operações sem implementar manualmente o protocolo.
-8. O servidor oferece encerramento gracioso.
-9. Os testes automatizados e a análise estática passam em todos os módulos.
+8. O driver Go oferece operações context-aware e sinaliza resultados indeterminados quando não é possível confirmar o desfecho de uma operação.
+9. O servidor oferece encerramento gracioso.
+10. Os testes automatizados e a análise estática passam em todos os módulos.
 
 Os GAPs documentados neste arquivo não impedem a conclusão do escopo inicial, pois representam evoluções planejadas e limitações conhecidas da implementação atual.
 

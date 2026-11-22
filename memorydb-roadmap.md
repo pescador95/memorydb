@@ -15,6 +15,9 @@ O projeto tem como objetivo principal aprender e implementar os fundamentos de u
 - Priorizar simplicidade, previsibilidade e testes antes de adicionar complexidade.
 - Implementar os fundamentos antes de avançar para funcionalidades distribuídas.
 - Manter documentação técnica, requisitos e decisões arquiteturais atualizados.
+- Tratar falhas de comunicação e resultados indeterminados como situações explícitas do contrato dos clientes.
+- Não implementar retries automáticos sem definir previamente garantias de idempotência.
+- Diferenciar confirmação de execução em memória de confirmação de persistência durável.
 
 ## 3. Escopo do MVP
 
@@ -40,6 +43,8 @@ O projeto tem como objetivo principal aprender e implementar os fundamentos de u
 - Sem implementação de TTL, embora o campo já exista no contrato Protobuf.
 - Sem multiplexação de requisições em uma mesma conexão.
 - Uma requisição por vez por conexão, com resposta correspondente.
+- Sem deduplicação de operações no servidor.
+- Sem garantia de recuperação do resultado de uma operação cuja resposta tenha sido perdida.
 
 O servidor pode atender múltiplas conexões simultaneamente. Dentro de cada conexão, entretanto, o processamento das requisições é sequencial.
 
@@ -205,7 +210,7 @@ O projeto utiliza Go Workspace para desenvolvimento local com múltiplos módulo
 
 O arquivo `go.work` reúne os módulos para facilitar o desenvolvimento dentro do repositório.
 
-Os módulos continuam independentes e poderão ser publicados e consumidos separadamente no futuro.
+Os módulos continuam independentes e poderão ser publicados e consumidos separadamente no futuro. Consumidores externos não precisam utilizar o `go.work` do repositório para importar os módulos publicados.
 
 ## 7. Contrato de comunicação
 
@@ -246,6 +251,8 @@ O contrato contempla:
 - `ErrorResult`
 
 O campo `request_id` permite correlacionar requisições e respostas.
+
+O `request_id` não representa uma chave de idempotência. Atualmente, não existe deduplicação de operações no servidor nem garantia de que uma requisição repetida será reconhecida como a mesma operação.
 
 O campo `ttl_ms` já está definido em `SetCommand`, mas sua funcionalidade ainda não foi implementada.
 
@@ -358,7 +365,11 @@ O encerramento gracioso não representa o fechamento forçado de todas as conex�
 - [x] Definição de estados internos do cliente (`open`, `closed` e `failed`).
 - [x] Diferenciação entre erros de aplicação e falhas de transporte ou protocolo.
 - [x] Tratamento de cancelamento e deadlines durante operações.
-- [x] Testes unitários, concorrentes e de falhas de comunicação.
+- [x] Representação explícita de resultados indeterminados por `OperationOutcomeUnknownError`.
+- [x] Preservação da causa original do erro por meio de `Unwrap`.
+- [x] Disponibilização do `RequestID` associado à operação de resultado desconhecido.
+- [x] Testes de escrita parcial, perda de resposta, cancelamento e concorrência.
+- [x] Testes de corrida e análise estática do módulo.
 
 O driver Go utiliza o módulo TCP compartilhado, evitando duplicar a implementação de framing.
 
@@ -366,7 +377,17 @@ As operações concorrentes na mesma instância do cliente são serializadas. O 
 
 O `DialContext` utiliza o contexto para estabelecer a conexão inicial. As operações posteriores recebem seus próprios contextos.
 
-Quando uma operação é cancelada enquanto aguarda a execução, a conexão permanece disponível. Quando o cancelamento ocorre durante o I/O, a conexão é encerrada e o cliente passa para o estado `failed`, pois não é possível garantir se o servidor chegou a executar a operação antes da interrupção da resposta.
+O comportamento de cancelamento é diferenciado conforme a fase da operação:
+
+- **Antes da execução:** se o contexto for cancelado enquanto a operação aguarda acesso à conexão, a operação não começa e a conexão permanece disponível.
+- **Durante o I/O:** se o cancelamento ocorrer enquanto a requisição ou resposta estiver sendo transmitida, a conexão é encerrada e o cliente passa para o estado `failed`.
+- **Resultado indeterminado:** quando não é possível confirmar se o servidor executou a operação, o driver retorna `OperationOutcomeUnknownError`, contendo o `RequestID` e a causa original.
+
+O resultado indeterminado é importante porque o servidor pode executar uma operação, mas a resposta pode ser perdida antes de chegar ao cliente.
+
+O `request_id` permite identificar e correlacionar a operação, mas não permite recuperá-la nem impedir sua execução duplicada.
+
+O driver não implementa retries automáticos. Repetir uma operação após um resultado indeterminado pode executar o comando novamente.
 
 ### Fase 8 — API cliente e validação integrada
 
@@ -381,11 +402,11 @@ Quando uma operação é cancelada enquanto aguarda a execução, a conexão per
 - [x] Testes do encerramento do servidor com conexões ativas.
 - [x] Validação manual do fluxo completo de operações.
 
-### Validação técnica atual
+### Validação técnica
 
-**Status: aprovada**
+**Validação integrada anterior — 15/11/2026**
 
-Todos os módulos foram submetidos a testes com o detector de condições de corrida e à análise estática.
+Foi realizada uma validação dos módulos do workspace utilizando testes com detector de condições de corrida e análise estática.
 
 Comandos executados:
 
@@ -407,29 +428,41 @@ go test -race -count=1 ./internal/integration
 go vet ./...
 ```
 
-Todos os comandos concluíram sem falhas.
+Todos os comandos reportados nessa validação concluíram sem falhas.
 
 Foi realizada também uma validação manual ponta a ponta, iniciando o servidor e utilizando a aplicação cliente para executar `PING`, `SET`, `GET`, `DELETE` e uma leitura posterior à remoção.
 
-A validação integrada foi realizada em 15/11/2026.
+**Validação posterior do driver Go — 22/11/2026**
+
+Após a evolução do tratamento de cancelamento e resultados indeterminados, foram executados:
+
+```bash
+go test -v -count=1 ./drivers/go
+go test -race -count=1 ./drivers/go
+go test -race -count=20 ./drivers/go
+go vet ./drivers/go
+```
+
+Os testes e a análise estática do módulo `drivers/go` concluíram sem falhas.
+
+Essa validação posterior está restrita ao driver Go. Ela não representa uma nova execução integral dos testes de todos os módulos.
 
 ## 9. Próximas fases
 
 ### Fase 9 — Consolidação da arquitetura e documentação
 
-**Status: concluída**
+**Status: em andamento**
 
 - [x] Revisar a documentação de arquitetura em relação à implementação atual.
 - [x] Revisar a documentação dos componentes.
 - [x] Atualizar os requisitos funcionais e não funcionais.
-- [x] Atualizar o manual de utilização.
 - [x] Documentar o contrato de framing TCP.
 - [x] Documentar o fluxo de comunicação entre driver e servidor.
 - [x] Documentar a utilização do Go Workspace.
 - [x] Documentar como executar testes nos módulos.
 - [x] Revisar as decisões arquiteturais e registrar as justificativas relevantes.
 
-A documentação foi alinhada ao comportamento implementado, incluindo as limitações atuais do servidor, do transporte e do driver Go.
+A documentação deve refletir o comportamento efetivamente implementado, incluindo as limitações atuais do servidor, do transporte e dos drivers.
 
 Novas decisões arquiteturais e mudanças de contrato deverão continuar sendo documentadas conforme o projeto evoluir.
 
@@ -446,11 +479,14 @@ Novas decisões arquiteturais e mudanças de contrato deverão continuar sendo d
 - [ ] Implementar tratamento de erros.
 - [ ] Definir o gerenciamento de conexões e operações concorrentes.
 - [ ] Avaliar suporte a cancelamento e deadlines.
+- [ ] Definir como representar resultados indeterminados.
 - [ ] Criar testes unitários.
 - [ ] Criar testes de integração com o servidor Go.
 - [ ] Validar interoperabilidade entre os drivers Go e Java.
 
 O driver Java deverá implementar o mesmo contrato de comunicação, sem depender de detalhes internos da implementação Go.
+
+O tratamento de resultados indeterminados deverá preservar a mesma semântica do driver Go: quando não for possível confirmar a execução de uma operação, o consumidor deverá receber uma indicação explícita, sem retry automático implícito.
 
 ### Fase 11 — TTL (Time To Live)
 
@@ -468,25 +504,73 @@ O driver Java deverá implementar o mesmo contrato de comunicação, sem depende
 
 A implementação deverá considerar precisão, custo de limpeza e impacto sobre a concorrência do Storage.
 
-### Fase 12 — Robustez e experiência de utilização
+### Fase 12 — Robustez, confiabilidade e experiência de utilização
 
 **Status: planejada**
 
+#### 12.1. Robustez operacional
+
 - [ ] Definir e documentar configurações operacionais adicionais.
-- [ ] Padronizar logs.
+- [ ] Padronizar logs estruturados.
 - [ ] Melhorar observabilidade de erros de processamento no servidor.
 - [ ] Revisar e evoluir mensagens e códigos de erro.
 - [ ] Avaliar timeouts de conexão e operações no lado do servidor.
 - [ ] Avaliar limites de conexões simultâneas.
 - [ ] Avaliar limites de tamanho de chave e valor.
 - [ ] Definir política para encerramento forçado de conexões durante shutdown.
+- [ ] Avaliar proteção contra clientes que mantêm conexões abertas sem enviar requisições completas.
+- [ ] Avaliar limites de recursos por conexão.
+- [ ] Criar testes de falhas de rede e encerramento inesperado.
+
+#### 12.2. Confiabilidade e idempotência
+
+- [ ] Definir a semântica de idempotência para cada operação.
+- [ ] Diferenciar identificador de correlação (`request_id`) de identificador de operação (`operation_id`).
+- [ ] Avaliar a inclusão de um identificador estável de operação no contrato.
+- [ ] Definir estratégia de deduplicação no servidor.
+- [ ] Definir armazenamento e retenção dos resultados das operações processadas.
+- [ ] Definir comportamento para operações repetidas com o mesmo identificador.
+- [ ] Definir comportamento para identificadores reutilizados com payloads diferentes.
+- [ ] Avaliar concorrência entre requisições duplicadas.
+- [ ] Definir limites e política de expiração do registro de deduplicação.
+- [ ] Avaliar recuperação de resultados após perda de resposta.
+- [ ] Criar testes para falhas antes, durante e depois da execução de comandos.
+- [ ] Documentar quais operações podem ser repetidas com segurança.
+
+A implementação deverá distinguir três situações:
+
+1. **Operação não iniciada:** o cliente sabe que a operação não foi enviada ao servidor.
+2. **Operação rejeitada:** o servidor retornou um erro estruturado que representa rejeição da operação.
+3. **Resultado indeterminado:** o cliente não consegue confirmar se o servidor executou a operação.
+
+O `OperationOutcomeUnknownError` já representa a terceira situação no driver Go. A recuperação desse resultado depende de evolução do protocolo e de mecanismos server-side de deduplicação.
+
+A implementação de idempotência deverá considerar a durabilidade do registro de operações. Uma tabela de deduplicação exclusivamente em memória não oferece garantia de recuperação após reinicialização do servidor.
+
+Não implementar retries automáticos antes de definir essas garantias.
+
+#### 12.3. Observabilidade
+
+- [ ] Definir métricas de conexões ativas.
+- [ ] Medir quantidade de operações por comando.
+- [ ] Medir latência das operações.
+- [ ] Medir erros por categoria.
+- [ ] Monitorar uso de memória.
+- [ ] Avaliar integração com Prometheus.
+- [ ] Avaliar instrumentação com OpenTelemetry.
+- [ ] Criar dashboards e alertas operacionais.
+
+A observabilidade deverá permitir identificar gargalos, falhas de comunicação, saturação de recursos e comportamento anormal do servidor.
+
+#### 12.4. Experiência de utilização
+
 - [ ] Melhorar a API pública dos drivers conforme novos requisitos.
 - [ ] Avaliar estratégia de reconexão do cliente.
 - [ ] Criar exemplos de utilização.
 - [ ] Criar ferramenta CLI para interação com o servidor.
-- [ ] Avaliar métricas e instrumentação para monitoramento.
+- [ ] Documentar configurações e cenários operacionais.
 
-A fase deverá priorizar robustez operacional e previsibilidade. O suporte a contextos, deadlines, serialização de operações concorrentes e gerenciamento de estados já faz parte do driver Go atual e não constitui uma pendência desta fase.
+A fase deverá priorizar robustez operacional e previsibilidade. O suporte a contextos, deadlines, serialização de operações concorrentes, gerenciamento de estados e identificação de resultados indeterminados já faz parte do driver Go atual e não constitui uma pendência de implementação básica.
 
 ### Fase 13 — Segurança
 
@@ -497,6 +581,7 @@ A fase deverá priorizar robustez operacional e previsibilidade. O suporte a con
 - [ ] Definir autorização de operações.
 - [ ] Avaliar isolamento por usuário ou tenant.
 - [ ] Definir política de rotação de credenciais.
+- [ ] Avaliar proteção contra abuso de conexões e requisições.
 - [ ] Documentar configurações e requisitos de segurança.
 
 TLS deverá ser a camada responsável pela proteção criptográfica da comunicação. SSH poderá ser considerado futuramente para administração ou criação de túneis, mas não será tratado como substituto do TLS.
@@ -524,7 +609,14 @@ Um adaptador RESP deverá converter os comandos Redis para operações da Engine
 - [ ] Avaliar log de operações (WAL).
 - [ ] Definir recuperação após falhas.
 - [ ] Definir consistência entre memória e disco.
+- [ ] Definir política de confirmação de escrita.
+- [ ] Diferenciar confirmação de escrita em memória e confirmação durável.
+- [ ] Avaliar integridade dos registros e recuperação de operações incompletas.
 - [ ] Criar testes de recuperação.
+
+A persistência deverá ser projetada considerando a relação entre execução de comandos, armazenamento em memória, gravação em disco e confirmação enviada ao cliente.
+
+A semântica de confirmação deverá deixar explícito se uma operação foi apenas aplicada em memória ou se também foi registrada de forma durável.
 
 ### Fase 16 — Distribuição e escalabilidade
 
@@ -556,6 +648,10 @@ Essa fase depende de decisões específicas de consistência, disponibilidade e 
 - Registrar limitações conhecidas em vez de implementar comportamentos implícitos.
 - Separar funcionalidades implementadas de evoluções planejadas.
 - Validar alterações nos módulos afetados e, quando necessário, executar a suíte completa do workspace.
+- Não introduzir retries automáticos sem garantias de idempotência documentadas.
+- Não tratar `request_id` como identificador de deduplicação.
+- Diferenciar erros de aplicação, falhas de transporte, falhas de protocolo e resultados indeterminados.
+- Preservar a rastreabilidade entre requisitos, implementação, testes e documentação.
 
 ## 11. Critérios de conclusão do MVP
 
@@ -573,7 +669,11 @@ O MVP será considerado concluído quando:
 - [x] Os módulos passarem pelo `go test -race`.
 - [x] Os módulos passarem pelo `go vet`.
 
-**Situação atual:** os critérios técnicos do MVP estão atendidos pela implementação e pelas validações executadas. A consolidação documental também foi concluída. O projeto pode avançar para as próximas evoluções sem depender de novas funcionalidades para considerar o MVP atual concluído.
+**Situação atual:** os critérios técnicos do MVP estão atendidos pela implementação e pelas validações realizadas. A validação integrada dos módulos foi registrada em 15/11/2026, e a evolução posterior do driver Go foi validada separadamente em 22/11/2026.
+
+A consolidação documental permanece em andamento até a conclusão da revisão do manual e das instruções de desenvolvimento.
+
+O projeto pode avançar para as próximas evoluções sem depender de novas funcionalidades para considerar o MVP atual concluído.
 
 ## 12. Visão geral do progresso
 
@@ -587,10 +687,10 @@ O MVP será considerado concluído quando:
 | 6 | Servidor TCP | Concluída |
 | 7 | Driver Go | Concluída |
 | 8 | API e integração | Concluída |
-| 9 | Consolidação e documentação | Concluída |
+| 9 | Consolidação e documentação | Em andamento |
 | 10 | Driver Java | Planejada |
 | 11 | TTL | Planejada |
-| 12 | Robustez e utilização | Planejada |
+| 12 | Robustez, confiabilidade e utilização | Planejada |
 | 13 | Segurança | Planejada |
 | 14 | Protocolos alternativos | Planejada |
 | 15 | Persistência | Futura |

@@ -16,8 +16,11 @@ O driver disponibiliza:
 - Operações com suporte a `context.Context`.
 - Serialização de operações concorrentes por conexão.
 - Tratamento de erros de comunicação e erros retornados pelo servidor.
+- Identificação de operações cujo resultado não pôde ser confirmado.
 
 **Importante:** o driver é uma biblioteca cliente. A aplicação consumidora precisa ter acesso a uma instância do servidor MemoryDB em execução.
+
+O driver não implementa o armazenamento dos dados. As operações são encaminhadas ao servidor, que mantém os valores em memória.
 
 ## 2. Pré-requisitos
 
@@ -114,7 +117,7 @@ Após a publicação de uma versão do driver e de suas dependências, execute:
 go get github.com/pescador95/memorydb/drivers/go@v0.1.0
 ```
 
-Substitua `vX.Y.Z` pela versão publicada que deseja utilizar.
+Substitua `v0.1.0` pela versão publicada que deseja utilizar.
 
 Em seguida, organize as dependências:
 
@@ -124,7 +127,7 @@ go mod tidy
 
 **Atenção:** o MemoryDB utiliza módulos Go independentes. Para que a instalação funcione fora do repositório original, as dependências do driver, incluindo os módulos de transporte TCP e Protobuf, também precisam estar publicadas e acessíveis nas versões declaradas pelo driver.
 
-O arquivo `go.work` utilizado no desenvolvimento do monorepo não é necessário na aplicação consumidora.
+O arquivo `go.work` utilizado no desenvolvimento do monorepo não é necessário na aplicação consumidora. Ele é utilizado para facilitar o desenvolvimento conjunto dos módulos locais.
 
 ### 4.3. Importar a biblioteca
 
@@ -162,7 +165,8 @@ func main() {
 
     client, err := memorydb.DialContext(ctx, "127.0.0.1:6380")
     if err != nil {
-        log.Fatal(err)
+        log.Printf("Erro ao conectar ao MemoryDB: %v", err)
+        return
     }
     defer client.Close()
 
@@ -172,7 +176,9 @@ func main() {
 
 O endereço `127.0.0.1:6380` é um exemplo. Utilize o endereço e a porta da instância do MemoryDB à qual a aplicação terá acesso.
 
-O `DialContext` utiliza o contexto durante o estabelecimento da conexão. Ele não mantém esse contexto associado às operações posteriores.
+O `DialContext` utiliza o contexto durante o estabelecimento da conexão. Ele não mantém esse contexto associado às operações posteriores. Para controlar cada operação, utilize os métodos que recebem `context.Context`.
+
+O `Close` encerra a conexão TCP associada ao client.
 
 ## 6. Operações disponíveis
 
@@ -180,7 +186,7 @@ As operações podem ser executadas por métodos convencionais ou por métodos q
 
 | Operação | Método convencional | Método com contexto |
 |---|---|---|
-| Verificar conexão | `Ping()` | `PingContext(ctx)` |
+| Verificar comunicação | `Ping()` | `PingContext(ctx)` |
 | Armazenar | `Set(key, value)` | `SetContext(ctx, key, value)` |
 | Consultar | `Get(key)` | `GetContext(ctx, key)` |
 | Excluir | `Delete(key)` | `DeleteContext(ctx, key)` |
@@ -197,6 +203,8 @@ if err := client.PingContext(ctx); err != nil {
     return
 }
 ```
+
+O PING verifica se o servidor responde à solicitação. Ele não verifica a disponibilidade de funcionalidades adicionais, persistência ou capacidade de processamento.
 
 ### 6.2. SET — armazenar um valor
 
@@ -215,6 +223,8 @@ if err != nil {
 ```
 
 Os valores são enviados como `[]byte`.
+
+Quando uma chave já existe, um novo SET sobrescreve seu valor.
 
 ### 6.3. GET — consultar um valor
 
@@ -240,6 +250,8 @@ O método retorna:
 - `[]byte`: valor armazenado.
 - `bool`: indica se a chave foi encontrada.
 - `error`: erro durante a operação.
+
+O indicador `found` permite distinguir uma chave inexistente de uma chave existente cujo valor é vazio.
 
 ### 6.4. DELETE — excluir um valor
 
@@ -281,7 +293,7 @@ import (
     memorydb "github.com/pescador95/memorydb/drivers/go"
 )
 
-func main() {
+func run() error {
     ctx, cancel := context.WithTimeout(
         context.Background(),
         5*time.Second,
@@ -290,20 +302,20 @@ func main() {
 
     client, err := memorydb.DialContext(ctx, "127.0.0.1:6380")
     if err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("conectar ao MemoryDB: %w", err)
     }
     defer client.Close()
 
-    // Verificar conexão.
+    // Verificar comunicação.
     if err := client.PingContext(ctx); err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("executar PING: %w", err)
     }
 
     key := "usuario:123"
 
     // CREATE: armazenar um valor.
     if err := client.SetContext(ctx, key, []byte("João")); err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("armazenar valor: %w", err)
     }
 
     fmt.Println("Valor armazenado")
@@ -311,7 +323,7 @@ func main() {
     // READ: consultar o valor.
     value, found, err := client.GetContext(ctx, key)
     if err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("consultar valor: %w", err)
     }
 
     if found {
@@ -320,7 +332,7 @@ func main() {
 
     // UPDATE: sobrescrever o valor da chave.
     if err := client.SetContext(ctx, key, []byte("Maria")); err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("atualizar valor: %w", err)
     }
 
     fmt.Println("Valor atualizado")
@@ -328,7 +340,7 @@ func main() {
     // READ: consultar o valor atualizado.
     value, found, err = client.GetContext(ctx, key)
     if err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("consultar valor atualizado: %w", err)
     }
 
     if found {
@@ -338,7 +350,7 @@ func main() {
     // DELETE: remover a chave.
     deleted, err := client.DeleteContext(ctx, key)
     if err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("excluir chave: %w", err)
     }
 
     fmt.Printf("Chave removida: %t\n", deleted)
@@ -346,20 +358,30 @@ func main() {
     // READ: confirmar a remoção.
     _, found, err = client.GetContext(ctx, key)
     if err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("confirmar exclusão: %w", err)
     }
 
     fmt.Printf("Chave encontrada após exclusão: %t\n", found)
+
+    return nil
+}
+
+func main() {
+    if err := run(); err != nil {
+        log.Printf("Erro na execução: %v", err)
+    }
 }
 ```
 
 **Observação:** o MemoryDB disponibiliza operações chave-valor. Portanto, UPDATE é realizado por meio de um novo SET sobre a mesma chave.
 
+O exemplo utiliza uma única janela de timeout para a sequência completa. Em aplicações reais, o prazo deve ser definido de acordo com o tempo esperado para cada operação ou fluxo de negócio.
+
 ## 8. Integração com uma API HTTP
 
 Em aplicações HTTP, recomenda-se criar uma única instância do client durante a inicialização da aplicação e compartilhá-la entre os handlers.
 
-O driver serializa operações concorrentes na mesma conexão. Portanto, compartilhar o client é permitido, mas as operações dessa conexão são executadas uma por vez.
+O driver permite o compartilhamento do client entre goroutines. Entretanto, as operações são serializadas na conexão. Assim, chamadas concorrentes aguardam sua vez de execução.
 
 Exemplo:
 
@@ -368,6 +390,7 @@ package main
 
 import (
     "context"
+    "errors"
     "log"
     "net/http"
     "time"
@@ -385,7 +408,40 @@ func NewAPI(client *memorydb.Client) *API {
     }
 }
 
-func (api *API) Create(w http.ResponseWriter, r *http.Request) {
+func (api *API) handleMemoryDBError(
+    w http.ResponseWriter,
+    err error,
+) {
+    var outcomeErr *memorydb.OperationOutcomeUnknownError
+
+    if errors.As(err, &outcomeErr) {
+        log.Printf(
+            "Resultado indeterminado no MemoryDB: request_id=%d: %v",
+            outcomeErr.RequestID,
+            err,
+        )
+
+        http.Error(
+            w,
+            "Não foi possível confirmar o resultado da operação",
+            http.StatusServiceUnavailable,
+        )
+        return
+    }
+
+    log.Printf("Erro na operação MemoryDB: %v", err)
+
+    http.Error(
+        w,
+        "Erro ao processar operação de armazenamento",
+        http.StatusInternalServerError,
+    )
+}
+
+func (api *API) Create(
+    w http.ResponseWriter,
+    r *http.Request,
+) {
     key := r.PathValue("key")
 
     ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -393,19 +449,25 @@ func (api *API) Create(w http.ResponseWriter, r *http.Request) {
 
     err := api.client.SetContext(ctx, key, []byte("valor"))
     if err != nil {
-        http.Error(w, "Erro ao armazenar valor", http.StatusInternalServerError)
+        api.handleMemoryDBError(w, err)
         return
     }
 
     w.WriteHeader(http.StatusCreated)
 }
 
-func (api *API) Read(w http.ResponseWriter, r *http.Request) {
+func (api *API) Read(
+    w http.ResponseWriter,
+    r *http.Request,
+) {
     key := r.PathValue("key")
 
-    value, found, err := api.client.GetContext(r.Context(), key)
+    ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+    defer cancel()
+
+    value, found, err := api.client.GetContext(ctx, key)
     if err != nil {
-        http.Error(w, "Erro ao consultar valor", http.StatusInternalServerError)
+        api.handleMemoryDBError(w, err)
         return
     }
 
@@ -414,27 +476,41 @@ func (api *API) Read(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    w.Write(value)
+    if _, err := w.Write(value); err != nil {
+        log.Printf("Erro ao escrever resposta HTTP: %v", err)
+    }
 }
 
-func (api *API) Update(w http.ResponseWriter, r *http.Request) {
+func (api *API) Update(
+    w http.ResponseWriter,
+    r *http.Request,
+) {
     key := r.PathValue("key")
 
-    err := api.client.SetContext(r.Context(), key, []byte("novo valor"))
+    ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+    defer cancel()
+
+    err := api.client.SetContext(ctx, key, []byte("novo valor"))
     if err != nil {
-        http.Error(w, "Erro ao atualizar valor", http.StatusInternalServerError)
+        api.handleMemoryDBError(w, err)
         return
     }
 
     w.WriteHeader(http.StatusNoContent)
 }
 
-func (api *API) Delete(w http.ResponseWriter, r *http.Request) {
+func (api *API) Delete(
+    w http.ResponseWriter,
+    r *http.Request,
+) {
     key := r.PathValue("key")
 
-    deleted, err := api.client.DeleteContext(r.Context(), key)
+    ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+    defer cancel()
+
+    deleted, err := api.client.DeleteContext(ctx, key)
     if err != nil {
-        http.Error(w, "Erro ao excluir valor", http.StatusInternalServerError)
+        api.handleMemoryDBError(w, err)
         return
     }
 
@@ -447,12 +523,10 @@ func (api *API) Delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-
-    client, err := memorydb.DialContext(ctx, "127.0.0.1:6380")
+    client, err := memorydb.Dial("127.0.0.1:6380")
     if err != nil {
-        log.Fatal(err)
+        log.Printf("Erro ao conectar ao MemoryDB: %v", err)
+        return
     }
     defer client.Close()
 
@@ -464,16 +538,32 @@ func main() {
     mux.HandleFunc("PUT /memory/{key}", api.Update)
     mux.HandleFunc("DELETE /memory/{key}", api.Delete)
 
+    server := &http.Server{
+        Addr:              ":8080",
+        Handler:           mux,
+        ReadHeaderTimeout: 5 * time.Second,
+    }
+
     log.Println("API disponível em :8080")
-    if err := http.ListenAndServe(":8080", mux); err != nil {
-    log.Printf("Erro no servidor HTTP: %v", err)
-}
+
+    if err := server.ListenAndServe(); err != nil &&
+        !errors.Is(err, http.ErrServerClosed) {
+        log.Printf("Erro no servidor HTTP: %v", err)
+    }
 }
 ```
 
 O exemplo utiliza `net/http` da biblioteca padrão do Go e os métodos HTTP POST, GET, PUT e DELETE.
 
-Em uma aplicação real, os valores devem ser recebidos e validados conforme o contrato da API, em vez de serem fixados nos handlers.
+A demonstração mantém o foco na integração com o driver. Em uma aplicação real:
+
+- Os valores devem ser recebidos e validados conforme o contrato da API.
+- A aplicação deve definir políticas apropriadas de timeout.
+- O encerramento do servidor HTTP deve ser integrado ao mecanismo de shutdown da aplicação.
+- Os erros devem ser classificados antes de serem convertidos em respostas HTTP.
+- Uma operação com resultado indeterminado não deve ser apresentada como uma falha comprovada de execução.
+
+O exemplo utiliza `Dial` para simplificar a inicialização. Em aplicações que precisam limitar o tempo de conexão, utilize `DialContext`.
 
 ## 9. Contexto, timeout e cancelamento
 
@@ -493,13 +583,49 @@ value, found, err := client.GetContext(ctx, "usuario:123")
 
 Em handlers HTTP, prefira propagar `r.Context()` para o driver, garantindo que o cancelamento da requisição seja propagado à operação.
 
-**Comportamento do driver:**
+### 9.1. Comportamento do driver
 
-- Cancelamento enquanto aguarda a liberação da conexão: a operação é cancelada sem invalidar o client.
-- Cancelamento durante uma operação de I/O: a conexão é encerrada e o client passa para o estado `failed`.
-- Após uma falha durante I/O, não é possível garantir se o servidor executou o comando antes de a conexão ser interrompida.
+O comportamento depende do momento em que o cancelamento acontece:
 
-Por esse motivo, não implemente retries automáticos indiscriminados para operações cujo resultado ficou incerto.
+- **Enquanto aguarda a conexão:** a operação é cancelada sem invalidar o client, pois ainda não começou a utilizar a conexão para executar a solicitação.
+- **Durante uma operação de I/O:** se o cancelamento interromper a comunicação, a conexão é encerrada e o client passa para o estado `failed`.
+- **Após a interrupção da comunicação:** não é possível garantir se o servidor executou o comando antes de a conexão ser interrompida.
+
+Esse último cenário é chamado de resultado indeterminado.
+
+### 9.2. OperationOutcomeUnknownError
+
+O driver disponibiliza `OperationOutcomeUnknownError` para representar operações cujo resultado não pôde ser confirmado.
+
+Esse erro contém:
+
+- `RequestID`: identificador da solicitação associada à operação.
+- `Cause`: causa da interrupção ou falha.
+
+O tipo implementa `Unwrap()`, permitindo utilizar `errors.Is` e `errors.As` para examinar o erro original.
+
+Exemplo de identificação:
+
+```go
+var outcomeErr *memorydb.OperationOutcomeUnknownError
+
+if errors.As(err, &outcomeErr) {
+    log.Printf(
+        "Resultado indeterminado: request_id=%d",
+        outcomeErr.RequestID,
+    )
+
+    if errors.Is(err, context.Canceled) {
+        log.Println("A operação foi interrompida por cancelamento")
+    }
+}
+```
+
+**Importante:** `RequestID` é um identificador de correlação da solicitação. Ele não é uma chave de idempotência e não permite consultar ou recuperar o resultado de uma operação posteriormente.
+
+O driver não implementa retry automático, deduplicação de comandos ou recuperação server-side do resultado.
+
+Por isso, não implemente retries automáticos indiscriminados para operações cujo resultado ficou incerto. Repetir um comando sem garantias de idempotência pode produzir efeitos diferentes dos esperados pela aplicação.
 
 ## 10. Concorrência e compartilhamento do client
 
@@ -513,28 +639,53 @@ Características:
 - Leituras e escritas concorrentes na aplicação são coordenadas pelo driver.
 - O client deve possuir um ciclo de vida gerenciado pela aplicação.
 - Não é necessário criar uma conexão para cada requisição HTTP.
+- Uma operação que aguarda a conexão pode ser cancelada sem interromper uma operação que já esteja em andamento.
 
-O uso de múltiplas conexões pode ser considerado futuramente quando houver necessidade de maior paralelismo.
+O compartilhamento simplifica o gerenciamento de recursos e evita a criação desnecessária de conexões.
+
+O uso de múltiplas conexões pode ser considerado futuramente quando houver necessidade de maior paralelismo. Isso exige gerenciamento adequado de conexões, concorrência, falhas e ciclo de vida.
 
 ## 11. Tratamento de erros
 
-O driver diferencia erros de comunicação de erros retornados pelo servidor.
+O driver diferencia erros de comunicação de erros estruturados retornados pelo servidor.
 
 Os principais cenários são:
 
 | Situação | Comportamento |
 |---|---|
 | Falha ao estabelecer conexão | Retorna erro na inicialização |
-| Erro retornado pelo servidor | Retorna erro sem invalidar automaticamente o client |
-| Falha de comunicação | Client passa para `failed` |
+| Erro estruturado retornado pelo servidor | Retorna `ServerError` sem invalidar automaticamente o client |
+| Falha de comunicação durante uma operação | Client passa para `failed` |
 | Cancelamento durante espera pelo acesso à conexão | Operação cancelada, conexão preservada |
 | Cancelamento durante I/O | Conexão encerrada e client invalidado |
+| Falha que impede confirmar o resultado da operação | Retorna `OperationOutcomeUnknownError`, quando aplicável |
 | Uso após `Close()` | Operação rejeitada |
 | Uso após falha de comunicação | Operação rejeitada |
 
-O driver também disponibiliza `ServerError` para representar erros estruturados retornados pelo servidor.
+### 11.1. ServerError
 
-A aplicação deve tratar os erros conforme o contexto da operação, evitando expor detalhes internos do MemoryDB diretamente aos consumidores da API.
+O driver disponibiliza `ServerError` para representar erros estruturados retornados pelo servidor.
+
+Esse tipo permite diferenciar uma rejeição da operação pelo servidor de uma falha na comunicação TCP.
+
+No contrato atual, um erro estruturado representa uma operação rejeitada, e não uma operação executada cuja resposta foi perdida. A aplicação pode tratar esse erro sem invalidar automaticamente a conexão.
+
+### 11.2. Erros de transporte e resultado indeterminado
+
+Uma falha de transporte não significa necessariamente que o comando deixou de ser executado.
+
+Por exemplo:
+
+1. O client envia um SET.
+2. O servidor recebe e executa o comando.
+3. A conexão é interrompida antes de a resposta chegar ao client.
+4. O client não consegue confirmar o resultado.
+
+Nesse cenário, o servidor pode ter armazenado o valor, mesmo que o client tenha recebido um erro.
+
+A aplicação deve tratar esse cenário separadamente de uma rejeição explícita do servidor.
+
+**Recomendação:** não exponha detalhes internos do MemoryDB diretamente aos consumidores da API. Registre os detalhes técnicos nos logs e retorne mensagens apropriadas ao contrato da aplicação.
 
 ## 12. Encerramento da conexão
 
@@ -548,6 +699,8 @@ O fechamento encerra a conexão TCP associada ao client.
 
 Como o client representa uma conexão e não um pool de conexões, sua inicialização e seu encerramento devem ser gerenciados pelo ciclo de vida da aplicação.
 
+O encerramento também deve considerar operações em andamento. Fechar o client interrompe a conexão e pode fazer com que uma operação que esteja utilizando a conexão termine com erro.
+
 ## 13. Limitações atuais
 
 A implementação atual do driver possui as seguintes características:
@@ -558,10 +711,13 @@ A implementação atual do driver possui as seguintes características:
 - Sem reconexão automática.
 - Sem retry automático.
 - Sem pool de conexões integrado.
-- Cancelamento durante I/O invalida o client.
+- Cancelamento durante I/O pode invalidar o client.
 - O resultado de uma operação pode ser incerto quando a conexão é interrompida durante a comunicação.
+- Não existe mecanismo server-side de deduplicação ou recuperação de resultados por identificador de operação.
 
 As funcionalidades de persistência, TTL, autenticação e TLS dependem da implementação correspondente no servidor e não devem ser presumidas como disponíveis.
+
+O driver não oferece garantias de durabilidade dos dados. A disponibilidade e a retenção dos valores dependem do servidor MemoryDB.
 
 ## 14. Referências
 
@@ -569,6 +725,9 @@ As funcionalidades de persistência, TTL, autenticação e TLS dependem da imple
 - Documentação oficial do Go: https://go.dev/doc/
 - Download do Go: https://go.dev/dl/
 - Gerenciamento de módulos Go: https://go.dev/doc/modules/managing-dependencies
+- Pacote `context`: https://pkg.go.dev/context
+- Pacote `errors`: https://pkg.go.dev/errors
+- Pacote `net/http`: https://pkg.go.dev/net/http
 
 ---
 
