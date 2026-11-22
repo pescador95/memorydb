@@ -2,6 +2,7 @@ package memorydb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -17,6 +18,15 @@ const (
 	clientStateOpen clientState = iota
 	clientStateClosed
 	clientStateFailed
+)
+
+type operationPhase uint8
+
+const (
+	operationPhaseReady operationPhase = iota
+	operationPhaseInFlight
+	operationPhaseCompleted
+	operationPhaseInterrupted
 )
 
 // Client representa um cliente conectado ao MemoryDB.
@@ -52,6 +62,49 @@ type ServerError struct {
 // Error retorna a descrição do erro retornado pelo servidor.
 func (e *ServerError) Error() string {
 	return fmt.Sprintf("MemoryDB error [%s]: %s", e.Code, e.Message)
+}
+
+// OperationOutcomeUnknownError indica que uma operação pode ter sido
+// executada pelo servidor, mas seu resultado não pôde ser confirmado.
+type OperationOutcomeUnknownError struct {
+	RequestID uint64
+	Cause     error
+}
+
+// Error retorna a descrição do resultado indeterminado.
+func (e *OperationOutcomeUnknownError) Error() string {
+	return fmt.Sprintf(
+		"MemoryDB operation outcome unknown for request %d: %v",
+		e.RequestID,
+		e.Cause,
+	)
+}
+
+// Unwrap permite acessar a causa original do erro.
+func (e *OperationOutcomeUnknownError) Unwrap() error {
+	return e.Cause
+}
+
+type partialWriteFailureConn struct {
+	net.Conn
+
+	writeCalls int
+	writeErr   error
+}
+
+func (c *partialWriteFailureConn) Write(p []byte) (int, error) {
+	c.writeCalls++
+
+	if c.writeCalls == 1 {
+		n := len(p) / 2
+		if n == 0 {
+			n = 1
+		}
+
+		return c.Conn.Write(p[:n])
+	}
+
+	return 0, c.writeErr
 }
 
 // Dial estabelece uma conexão TCP com o MemoryDB.
@@ -278,6 +331,7 @@ func (c *Client) DeleteContext(
 }
 
 // execute envia uma solicitação e aguarda sua resposta correspondente.
+
 func (c *Client) execute(
 	ctx context.Context,
 	request *memorydbpb.Request,
@@ -300,7 +354,6 @@ func (c *Client) execute(
 		*memorydbpb.Request_Set,
 		*memorydbpb.Request_Get,
 		*memorydbpb.Request_Delete:
-
 	default:
 		return nil, fmt.Errorf("request command is missing or unsupported")
 	}
@@ -314,22 +367,69 @@ func (c *Client) execute(
 
 	payload, err := proto.Marshal(request)
 	if err != nil {
-		return nil, fmt.Errorf("encode request %d: %w", request.RequestId, err)
+		return nil, fmt.Errorf(
+			"encode request %d: %w",
+			request.RequestId,
+			err,
+		)
 	}
 
-	// Evita iniciar a comunicação se o contexto já foi cancelado.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+	var operationMu sync.Mutex
+	phase := operationPhaseReady
 
-	// Interrompe a conexão caso o contexto seja cancelado durante
-	// a escrita da requisição ou a leitura da resposta.
 	callbackDone := make(chan struct{})
 
 	stopCancellation := context.AfterFunc(ctx, func() {
-		c.fail()
+		operationMu.Lock()
+
+		shouldFail := phase == operationPhaseInFlight
+
+		if phase == operationPhaseReady ||
+			phase == operationPhaseInFlight {
+			phase = operationPhaseInterrupted
+		}
+
+		operationMu.Unlock()
+
+		if shouldFail {
+			c.fail()
+		}
+
 		close(callbackDone)
 	})
+
+	// Decide atomicamente se a operação pode iniciar a comunicação.
+	operationMu.Lock()
+
+	if err := ctx.Err(); err != nil {
+		phase = operationPhaseInterrupted
+		operationMu.Unlock()
+
+		if !stopCancellation() {
+			<-callbackDone
+		}
+
+		return nil, err
+	}
+
+	if phase != operationPhaseReady {
+		operationMu.Unlock()
+
+		if !stopCancellation() {
+			<-callbackDone
+		}
+
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		return nil, fmt.Errorf(
+			"operation interrupted before communication",
+		)
+	}
+
+	phase = operationPhaseInFlight
+	operationMu.Unlock()
 
 	// Executa a comunicação com o servidor.
 	responsePayload, communicationErr := func() ([]byte, error) {
@@ -353,47 +453,93 @@ func (c *Client) execute(
 		return response, nil
 	}()
 
-	// Aguarda o callback caso ele já tenha começado.
-	// Isso impede que ele feche a conexão depois que a operação
-	// liberar o acesso exclusivo ao cliente.
+	// Registra a conclusão ou interrupção da operação.
+	operationMu.Lock()
+
+	if phase == operationPhaseInFlight {
+		if communicationErr == nil {
+			phase = operationPhaseCompleted
+		} else {
+			phase = operationPhaseInterrupted
+		}
+	}
+
+	operationMu.Unlock()
+
+	// Impede que o callback continue executando após a liberação
+	// do operationGate.
 	if !stopCancellation() {
 		<-callbackDone
 	}
 
-	// Se o contexto foi cancelado, seu erro tem prioridade sobre
-	// eventuais erros de comunicação causados pelo fechamento.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+	operationMu.Lock()
+	completed := phase == operationPhaseCompleted
+	operationMu.Unlock()
 
-	if communicationErr != nil {
+	// A comunicação foi interrompida antes da confirmação da resposta.
+	if !completed {
 		c.fail()
-		return nil, communicationErr
+
+		cause := communicationErr
+
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if cause != nil {
+				cause = errors.Join(ctxErr, cause)
+			} else {
+				cause = ctxErr
+			}
+		}
+
+		if cause == nil {
+			cause = errors.New(
+				"operation interrupted before response confirmation",
+			)
+		}
+
+		return nil, &OperationOutcomeUnknownError{
+			RequestID: request.RequestId,
+			Cause:     cause,
+		}
 	}
 
+	// A partir daqui, o frame de resposta foi recebido integralmente.
 	response := &memorydbpb.Response{}
+
 	if err := proto.Unmarshal(responsePayload, response); err != nil {
 		c.fail()
-		return nil, fmt.Errorf("decode response %d: %w", request.RequestId, err)
+
+		return nil, &OperationOutcomeUnknownError{
+			RequestID: request.RequestId,
+			Cause: fmt.Errorf(
+				"decode response: %w",
+				err,
+			),
+		}
 	}
 
 	if response.GetRequestId() != request.GetRequestId() {
 		c.fail()
-		return nil, fmt.Errorf(
-			"request ID mismatch: got %d, want %d",
-			response.GetRequestId(),
-			request.GetRequestId(),
-		)
+
+		return nil, &OperationOutcomeUnknownError{
+			RequestID: request.RequestId,
+			Cause: fmt.Errorf(
+				"request ID mismatch: got %d, want %d",
+				response.GetRequestId(),
+				request.GetRequestId(),
+			),
+		}
 	}
 
 	if !response.GetSuccess() {
 		serverError := response.GetError()
+
 		if serverError == nil {
 			c.fail()
-			return nil, fmt.Errorf(
-				"request %d failed: missing error details",
-				request.GetRequestId(),
-			)
+
+			return nil, &OperationOutcomeUnknownError{
+				RequestID: request.RequestId,
+				Cause:     errors.New("missing error details"),
+			}
 		}
 
 		return nil, &ServerError{
@@ -421,10 +567,13 @@ func (c *Client) execute(
 
 	if !validResponse {
 		c.fail()
-		return nil, fmt.Errorf(
-			"unexpected response for request %d",
-			request.GetRequestId(),
-		)
+
+		return nil, &OperationOutcomeUnknownError{
+			RequestID: request.RequestId,
+			Cause: errors.New(
+				"unexpected response type",
+			),
+		}
 	}
 
 	return response, nil

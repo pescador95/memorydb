@@ -1060,3 +1060,295 @@ func TestClientContextCancellationInterruptsBlockedWrite(t *testing.T) {
 		t.Fatal("cliente não deveria aceitar operações após o cancelamento")
 	}
 }
+
+type cancelAfterReadConn struct {
+	net.Conn
+	remaining int
+	cancel    context.CancelFunc
+	once      sync.Once
+}
+
+func (c *cancelAfterReadConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+
+	if n > 0 {
+		c.remaining -= n
+
+		if c.remaining <= 0 {
+			c.once.Do(c.cancel)
+		}
+	}
+
+	return n, err
+}
+
+func TestClientCancellationDuringFinalResponseRead(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	response := &memorydbpb.Response{
+		RequestId: 1,
+		Success:   true,
+		Result: &memorydbpb.Response_Pong{
+			Pong: &memorydbpb.PongResult{},
+		},
+	}
+
+	responsePayload, err := proto.Marshal(response)
+	if err != nil {
+		t.Fatalf("codificar resposta: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wrappedConn := &cancelAfterReadConn{
+		Conn:      clientConn,
+		remaining: 4 + len(responsePayload),
+		cancel:    cancel,
+	}
+
+	client, err := New(wrappedConn)
+	if err != nil {
+		t.Fatalf("criar cliente: %v", err)
+	}
+	defer client.Close()
+
+	serverConnection, err := transporttcp.NewConnection(serverConn)
+	if err != nil {
+		t.Fatalf("criar conexão do servidor: %v", err)
+	}
+	defer serverConnection.Close()
+
+	go func() {
+		defer serverConnection.Close()
+
+		if _, err := serverConnection.ReadFrame(); err != nil {
+			return
+		}
+
+		if err := serverConnection.WriteFrame(responsePayload); err != nil {
+			t.Errorf("enviar resposta: %v", err)
+		}
+	}()
+	err = client.PingContext(ctx)
+
+	stateErr := client.checkState()
+
+	switch {
+	case err == nil:
+		// A conclusão da operação venceu a sincronização.
+		if stateErr != nil {
+			t.Fatalf(
+				"cliente deveria permanecer aberto após resposta válida: %v",
+				stateErr,
+			)
+		}
+
+	case errors.Is(err, context.Canceled):
+		// O cancelamento venceu a sincronização.
+		var outcomeErr *OperationOutcomeUnknownError
+
+		if !errors.As(err, &outcomeErr) {
+			t.Fatalf(
+				"esperava OperationOutcomeUnknownError, obtido: %T: %v",
+				err,
+				err,
+			)
+		}
+
+		if outcomeErr.RequestID != 1 {
+			t.Fatalf(
+				"request ID inesperado: obtido %d, esperado 1",
+				outcomeErr.RequestID,
+			)
+		}
+
+		if stateErr == nil ||
+			!strings.Contains(stateErr.Error(), "failed") {
+			t.Fatalf(
+				"cliente deveria estar em estado failed, obtido: %v",
+				stateErr,
+			)
+		}
+
+	default:
+		t.Fatalf(
+			"esperava sucesso ou OperationOutcomeUnknownError com context.Canceled, obtido: %v",
+			err,
+		)
+	}
+}
+
+func TestClientPartialWriteReturnsUnknownOutcome(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	writeErr := errors.New("simulated partial write failure")
+
+	wrappedConn := &partialWriteFailureConn{
+		Conn:     clientConn,
+		writeErr: writeErr,
+	}
+
+	client, err := New(wrappedConn)
+	if err != nil {
+		t.Fatalf("criar cliente: %v", err)
+	}
+	defer client.Close()
+
+	receivedPartialFrame := make(chan []byte, 1)
+
+	go func() {
+		header := make([]byte, 2)
+
+		if _, err := io.ReadFull(serverConn, header); err != nil {
+			return
+		}
+
+		receivedPartialFrame <- header
+	}()
+
+	err = client.Ping()
+	if err == nil {
+		t.Fatal("esperava erro durante escrita parcial")
+	}
+
+	var outcomeErr *OperationOutcomeUnknownError
+	if !errors.As(err, &outcomeErr) {
+		t.Fatalf(
+			"esperava OperationOutcomeUnknownError, obtido %T: %v",
+			err,
+			err,
+		)
+	}
+
+	if outcomeErr.RequestID != 1 {
+		t.Fatalf(
+			"request ID inesperado: obtido %d, esperado 1",
+			outcomeErr.RequestID,
+		)
+	}
+
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("erro original de escrita não foi preservado: %v", err)
+	}
+
+	select {
+	case header := <-receivedPartialFrame:
+		if len(header) != 2 {
+			t.Fatalf("esperava 2 bytes transmitidos, obtido %d", len(header))
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("servidor não recebeu os bytes parciais do frame")
+	}
+
+	if err := client.checkState(); err == nil ||
+		!strings.Contains(err.Error(), "failed") {
+		t.Fatalf("esperava cliente em estado failed, obtido: %v", err)
+	}
+
+	if err := client.Ping(); err == nil {
+		t.Fatal("cliente não deveria aceitar operações após escrita parcial")
+	}
+}
+
+func TestClientSetReturnsUnknownOutcomeAfterServerExecution(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	client, err := New(clientConn)
+	if err != nil {
+		serverConn.Close()
+		t.Fatalf("criar cliente: %v", err)
+	}
+	defer client.Close()
+
+	executedValue := make(chan []byte, 1)
+	serverErr := make(chan error, 1)
+
+	go func() {
+		connection, err := transporttcp.NewConnection(serverConn)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer connection.Close()
+
+		payload, err := connection.ReadFrame()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+
+		request := &memorydbpb.Request{}
+		if err := proto.Unmarshal(payload, request); err != nil {
+			serverErr <- err
+			return
+		}
+
+		command, ok := request.GetCommand().(*memorydbpb.Request_Set)
+		if !ok {
+			serverErr <- errors.New("expected SET command")
+			return
+		}
+
+		// Simula a execução bem-sucedida no servidor.
+		value := append([]byte(nil), command.Set.GetValue()...)
+		executedValue <- value
+
+		// A conexão é encerrada sem enviar a resposta.
+	}()
+
+	expectedValue := []byte("memorydb")
+
+	err = client.Set("user:1", expectedValue)
+	if err == nil {
+		t.Fatal("esperava resultado indeterminado após perda da resposta")
+	}
+
+	var outcomeErr *OperationOutcomeUnknownError
+	if !errors.As(err, &outcomeErr) {
+		t.Fatalf(
+			"esperava OperationOutcomeUnknownError, obtido %T: %v",
+			err,
+			err,
+		)
+	}
+
+	if outcomeErr.RequestID != 1 {
+		t.Fatalf(
+			"request ID inesperado: obtido %d, esperado 1",
+			outcomeErr.RequestID,
+		)
+	}
+
+	select {
+	case value := <-executedValue:
+		if !reflect.DeepEqual(value, expectedValue) {
+			t.Fatalf(
+				"valor executado inesperado: obtido %q, esperado %q",
+				value,
+				expectedValue,
+			)
+		}
+
+	case err := <-serverErr:
+		t.Fatalf("servidor simulado não conseguiu executar SET: %v", err)
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("servidor não executou SET dentro do prazo")
+	}
+
+	if err := client.checkState(); err == nil ||
+		!strings.Contains(err.Error(), "failed") {
+		t.Fatalf(
+			"esperava cliente em estado failed, obtido: %v",
+			err,
+		)
+	}
+
+	if err := client.Ping(); err == nil {
+		t.Fatal("cliente não deveria aceitar operações após perda da resposta")
+	}
+}
