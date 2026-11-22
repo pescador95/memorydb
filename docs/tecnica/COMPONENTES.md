@@ -331,6 +331,110 @@ A interface `Result` é implementada por:
 
 O modelo interno preserva a separação entre o contrato externo e a lógica de execução.
 
+### 8.5. Contrato aprovado de idempotência
+
+**Estado: especificado e aprovado em 22/11/2026; ainda não implementado.**
+
+O modelo interno deverá ser evoluído para representar um identificador de operação independente do `RequestID`.
+
+#### Identificadores
+
+| Campo | Responsabilidade |
+|---|---|
+| `RequestID` | Identificar a tentativa de requisição e correlacionar a resposta |
+| `OperationID` | Identificar a mesma operação lógica entre tentativas |
+
+O `OperationID` deverá possuir 128 bits. No contrato Protobuf, será representado por `bytes`, com validação de tamanho exato de 16 bytes.
+
+O identificador será obrigatório para os comandos `SET` e `DELETE`. Não será exigido para `PING` e `GET` no contrato inicial.
+
+#### Gerenciador de idempotência
+
+Está prevista a criação de um componente `IdempotencyManager`, responsável por controlar os registros de operações.
+
+Responsabilidades previstas:
+
+- reservar identificadores antes da execução;
+- garantir reserva atômica para identificadores concorrentes;
+- comparar fingerprints;
+- aguardar a conclusão de operações duplicadas em andamento;
+- armazenar resultados terminais reproduzíveis;
+- reproduzir resultados sem executar novamente a mutação;
+- controlar retenção e capacidade;
+- rejeitar novos identificadores quando a capacidade estiver esgotada;
+- preservar registros quando o resultado da execução for indeterminado e não houver comprovação de que a mutação não ocorreu.
+
+O componente deverá ser independente do Storage de dados de negócio. Os registros de idempotência não serão armazenados como pares chave-valor da aplicação.
+
+#### Contrato de execução
+
+O gerenciador deverá considerar:
+
+| Situação | Comportamento previsto |
+|---|---|
+| Primeiro uso do identificador | Reservar e permitir a execução |
+| Mesmo identificador e fingerprint igual, concluído | Reproduzir o resultado armazenado |
+| Mesmo identificador e fingerprint diferente | Retornar conflito |
+| Mesmo identificador e fingerprint igual, em andamento | Aguardar a execução original |
+| Capacidade esgotada | Rejeitar sem executar nem reservar |
+| Resultado terminal de aplicação | Armazenar a resposta reproduzível |
+| Falha comprovadamente anterior à mutação | Permitir liberação segura da reserva |
+| Resultado indeterminado | Não liberar a reserva de forma que permita execução duplicada |
+
+A resposta reproduzida deverá utilizar o `RequestID` da tentativa atual. O resultado de negócio deverá ser semanticamente equivalente ao resultado original.
+
+#### Capacidade e retenção
+
+| Propriedade | Valor aprovado |
+|---|---|
+| Capacidade padrão | 100.000 registros |
+| Configuração | Configurável na inicialização |
+| Escopo | Global por instância |
+| Retenção | 24 horas após conclusão |
+| Armazenamento | Memória |
+| Evicção antecipada | Não permitida para registros válidos |
+
+A capacidade contará operações em andamento e concluídas. Registros em andamento não expiram pela janela de retenção.
+
+A rejeição por capacidade não cria reserva. A operação poderá ser tentada novamente quando houver espaço disponível.
+
+#### Integração prevista
+
+O fluxo de execução deverá ser organizado de forma que a deduplicação aconteça antes da chamada ao Engine:
+
+```text
+Handler
+   |
+   v
+Codec / Modelo interno
+   |
+   v
+IdempotencyManager
+   |
+   |-- identificador existente --> replay ou conflito
+   |
+   |-- identificador inédito
+   v
+Engine
+   |
+   v
+Storage
+```
+
+O gerenciador deverá coordenar a execução original e o armazenamento do resultado, sem permitir que duas requisições concorrentes com o mesmo identificador executem a mesma mutação.
+
+A posição exata do componente, suas interfaces e seu mecanismo de sincronização deverão ser definidos durante a implementação e cobertos por testes de concorrência.
+
+#### Limites
+
+A garantia será de no máximo uma execução por identificador enquanto o registro estiver retido na mesma instância.
+
+Como o gerenciador será inicialmente volátil, a garantia não sobreviverá a reinicialização ou perda do processo.
+
+Não se trata de *exactly-once*. Essa garantia exigiria persistência atômica da mutação e do registro de deduplicação.
+
+O driver deverá permitir que a aplicação forneça e reutilize o `OperationID`. Não deverá gerar um novo identificador para uma tentativa de recuperação da mesma operação lógica, nem executar retries automáticos implícitos.
+
 ## 9. Engine
 
 **Localização:** `server/internal/engine`
@@ -388,6 +492,7 @@ Os códigos de erro estão definidos em `server/internal/engine/command.go`:
 - Não há TTL funcional.
 - Não há deduplicação de operações.
 - Não há identificação estável de operações entre tentativas.
+- Não há idempotency key; o driver ainda não expõe `OperationID` nem oferece recuperação idempotente. A evolução está especificada, mas não implementada.
 
 ## 10. Storage
 
@@ -669,6 +774,7 @@ A aplicação cliente não deve repetir cegamente a operação. O comando pode t
 - Não há deduplicação no servidor.
 - `request_id` é local à conexão e utilizado para correlação.
 - Não há recuperação de resultado após reconexão.
+- O driver ainda não expõe `OperationID` nem oferece recuperação idempotente; a evolução está especificada, mas não implementada.
 
 ## 13. Schema Protobuf e tipos gerados
 
@@ -687,6 +793,8 @@ O campo `ttl_ms` existe em `SetCommand`, mas sua funcionalidade não está imple
 Os arquivos gerados devem ser atualizados a partir do schema por meio do processo de geração adotado pelo projeto.
 
 **[LACUNA]** O processo oficial de geração, incluindo versão e instalação das ferramentas, deve ser documentado em um procedimento reproduzível se ainda não estiver definido em outro documento do repositório.
+
+O contrato aprovado prevê a inclusão de OperationID no envelope Request. A alteração do schema e a regeneração dos tipos ainda não foram realizadas.
 
 ## 14. API de demonstração
 
@@ -761,7 +869,7 @@ Também há registro de validações anteriores das demais áreas e de execuçã
 
 | Evolução | Componentes envolvidos | Resultado esperado |
 |---|---|---|
-| Idempotência | Schema, modelo interno, engine, armazenamento de operações e driver | Identificação estável das operações |
+| Idempotência | Schema, modelo interno, Handler, IdempotencyManager, Engine e driver | Identificação estável e deduplicação de operações |
 | Deduplicação | Handler, engine e armazenamento de resultados | Evitar execução duplicada e recuperar resposta anterior |
 | TTL | Schema, modelo interno, engine e storage | Expiração de entradas |
 | Persistência | Storage e recuperação | Preservação de dados após reinicialização |
@@ -770,24 +878,31 @@ Também há registro de validações anteriores das demais áreas e de execuçã
 | Timeouts | Server, Handler e configuração | Controle de operações de rede bloqueadas |
 | Multiplexação | Protocolo, handler e driver | Operações simultâneas na mesma conexão |
 
-### 17.1 Considerações para idempotência
+### 17.1. Considerações para idempotência
 
-A implementação de idempotência exige decisões anteriores à alteração do schema:
+O contrato inicial de idempotência foi aprovado em 22/11/2026 e está documentado na seção 8.5.
 
-- diferença entre `request_id` e `operation_id`;
-- escopo e geração do identificador de operação;
-- comandos que exigem deduplicação;
-- comportamento quando o mesmo identificador é recebido com payload diferente;
-- tratamento de operações concorrentes com o mesmo identificador;
-- retenção e expiração dos registros;
-- replay da resposta original;
-- comportamento após reinicialização.
+As decisões principais já estão definidas:
 
-Uma garantia inicial de execução no máximo uma vez por identificador só pode ser afirmada dentro do escopo e do período de retenção definidos pelo contrato.
+- `RequestID` e `OperationID` possuem responsabilidades distintas.
+- `OperationID` possui 128 bits e é representado por `bytes` no Protobuf.
+- A idempotência inicial abrange `SET` e `DELETE`.
+- O escopo é global por instância do servidor.
+- A retenção é de 24 horas após a conclusão.
+- A capacidade padrão é de 100.000 registros, configurável na inicialização.
+- Registros válidos não podem ser removidos antecipadamente.
+- Operações concorrentes com o mesmo identificador e fingerprint devem compartilhar a execução original.
+- Identificadores reutilizados com conteúdo diferente devem gerar conflito.
+- O resultado original deverá ser reproduzido com o `RequestID` da tentativa atual.
+- A garantia inicial não sobrevive à reinicialização do processo.
 
-Para sobreviver a crash ou reinicialização, a alteração do dado e o registro de deduplicação precisarão de persistência com atomicidade.
+A implementação ainda deverá definir e testar os detalhes internos de sincronização, tratamento de falhas e armazenamento de resultados.
 
-O projeto não deve anunciar *exactly once* sem uma garantia técnica e contratual que sustente essa afirmação.
+O projeto não deverá anunciar *exactly-once*. A garantia prevista é limitada à retenção do registro na mesma instância do servidor.
+
+Para sobreviver a crash ou reinicialização, a mutação e o registro de deduplicação precisarão de persistência com atomicidade.
+
+A aplicação consumidora deverá decidir explicitamente quando repetir uma operação, reutilizando o mesmo `OperationID`. O driver não deverá realizar retries automáticos implícitos.
 
 ## 18. Diretrizes de manutenção dos componentes
 

@@ -524,30 +524,81 @@ A implementação deverá considerar precisão, custo de limpeza e impacto sobre
 
 #### 12.2. Confiabilidade e idempotência
 
-- [ ] Definir a semântica de idempotência para cada operação.
-- [ ] Diferenciar identificador de correlação (`request_id`) de identificador de operação (`operation_id`).
-- [ ] Avaliar a inclusão de um identificador estável de operação no contrato.
-- [ ] Definir estratégia de deduplicação no servidor.
-- [ ] Definir armazenamento e retenção dos resultados das operações processadas.
-- [ ] Definir comportamento para operações repetidas com o mesmo identificador.
-- [ ] Definir comportamento para identificadores reutilizados com payloads diferentes.
-- [ ] Avaliar concorrência entre requisições duplicadas.
-- [ ] Definir limites e política de expiração do registro de deduplicação.
-- [ ] Avaliar recuperação de resultados após perda de resposta.
-- [ ] Criar testes para falhas antes, durante e depois da execução de comandos.
-- [ ] Documentar quais operações podem ser repetidas com segurança.
+**Especificação do contrato: aprovada em 22/11/2026.**
 
-A implementação deverá distinguir três situações:
+**Implementação: planejada.**
 
-1. **Operação não iniciada:** o cliente sabe que a operação não foi enviada ao servidor.
-2. **Operação rejeitada:** o servidor retornou um erro estruturado que representa rejeição da operação.
-3. **Resultado indeterminado:** o cliente não consegue confirmar se o servidor executou a operação.
+O contrato inicial de idempotência foi definido com as seguintes características:
 
-O `OperationOutcomeUnknownError` já representa a terceira situação no driver Go. A recuperação desse resultado depende de evolução do protocolo e de mecanismos server-side de deduplicação.
+| Decisão | Contrato aprovado |
+|---|---|
+| Identificador | `OperationID` de 128 bits |
+| Identificador de requisição | `RequestID` independente, utilizado para correlação |
+| Comandos protegidos | `SET` e `DELETE` |
+| Escopo | Global, dentro de uma instância do servidor |
+| Retenção | 24 horas após a conclusão da operação |
+| Capacidade padrão | 100.000 registros |
+| Configuração de capacidade | Configurável na inicialização |
+| Armazenamento | Exclusivamente em memória |
+| Evicção antecipada | Não permitida para registros ainda válidos |
+| Identificador ausente | Rejeitar `SET` e `DELETE` sem `OperationID` |
+| Persistência entre reinicializações | Não garantida |
 
-A implementação de idempotência deverá considerar a durabilidade do registro de operações. Uma tabela de deduplicação exclusivamente em memória não oferece garantia de recuperação após reinicialização do servidor.
+O `OperationID` deve permanecer igual entre tentativas da mesma operação lógica. O `RequestID` deve ser gerado para cada requisição e continuar sendo utilizado para correlacionar a resposta à tentativa correspondente.
 
-Não implementar retries automáticos antes de definir essas garantias.
+O contrato externo deverá representar o `OperationID` como `bytes`, exigindo exatamente 16 bytes. A validação deve rejeitar identificadores ausentes ou com tamanho diferente.
+
+O fingerprint deve considerar o comando e todos os parâmetros semanticamente relevantes. Para os comandos iniciais:
+
+- `SET`: comando, chave, valor e parâmetros semânticos adicionais, incluindo `ttl_ms`;
+- `DELETE`: comando, chave e parâmetros semânticos adicionais, caso existam.
+
+O comportamento para identificadores repetidos será:
+
+1. Mesmo `OperationID` e mesmo fingerprint: não executar novamente; reproduzir o resultado armazenado.
+2. Mesmo `OperationID` e fingerprint diferente: rejeitar a requisição por conflito.
+3. Mesmo `OperationID` recebido simultaneamente: as requisições concorrentes devem aguardar a execução original e receber resultado semanticamente equivalente.
+4. Respostas reproduzidas devem utilizar o `RequestID` da tentativa atual, preservando a correlação da requisição, enquanto o resultado da operação permanece equivalente ao resultado armazenado.
+
+A capacidade máxima contabiliza registros em andamento e concluídos. Quando a capacidade estiver esgotada, uma operação com `OperationID` inédito deve ser rejeitada com erro específico, sem executar a mutação e sem expulsar registros válidos. A tentativa rejeitada por capacidade não reserva o identificador; poderá ser repetida posteriormente.
+
+O período de retenção começa quando a operação alcança um resultado terminal. Registros em andamento não expiram por essa janela. Resultados estruturados e reproduzíveis, inclusive rejeições determinísticas de aplicação, devem ser armazenados para replay.
+
+Uma reserva só pode ser liberada após uma falha quando houver comprovação de que a mutação não foi executada. Se o resultado da execução for indeterminado, o registro não pode ser liberado de forma que permita executar novamente a mesma operação sem proteção.
+
+A garantia inicial será limitada a **no máximo uma execução por `OperationID` enquanto o respectivo registro permanecer retido na mesma instância do MemoryDB**. Como os registros são voláteis, a garantia não sobrevive a reinicialização, encerramento inesperado ou perda do processo.
+
+Essa implementação não deve ser denominada *exactly-once*. Para oferecer proteção após reinicialização, será necessário persistir atomicamente a mutação e o registro de deduplicação.
+
+#### 12.2.1. Etapas de implementação
+
+- [x] Definir a diferença entre `request_id` e `operation_id`.
+- [x] Definir os comandos inicialmente protegidos.
+- [x] Definir o escopo e a representação do identificador.
+- [x] Definir o comportamento para identificadores repetidos com o mesmo conteúdo.
+- [x] Definir o comportamento para identificadores repetidos com conteúdo diferente.
+- [x] Definir o tratamento de requisições concorrentes.
+- [x] Definir retenção, capacidade e política de não evicção antecipada.
+- [x] Definir o comportamento quando a capacidade estiver esgotada.
+- [x] Definir a limitação de durabilidade dos registros em memória.
+- [ ] Atualizar o schema Protobuf e os tipos gerados.
+- [ ] Atualizar o modelo interno de protocolo.
+- [ ] Implementar o gerenciador de idempotência.
+- [ ] Integrar o gerenciador ao fluxo de execução do servidor.
+- [ ] Implementar códigos de erro para identificador inválido, conflito e capacidade esgotada.
+- [ ] Implementar testes de replay de resultados.
+- [ ] Implementar testes de conflito de fingerprint.
+- [ ] Implementar testes de concorrência para identificadores iguais.
+- [ ] Implementar testes de expiração e capacidade.
+- [ ] Atualizar o driver Go para receber e reutilizar `OperationID`.
+- [ ] Testar a recuperação de uma operação após perda de resposta, reutilizando o mesmo `OperationID`.
+- [ ] Documentar a semântica pública e os limites da garantia.
+
+O driver não deverá gerar um novo `OperationID` automaticamente a cada tentativa de recuperação. A aplicação consumidora deverá poder fornecer e reutilizar o identificador associado à mesma operação lógica.
+
+O driver continuará sem retry automático implícito. A evolução permitirá que a aplicação decida repetir uma operação utilizando o mesmo `OperationID`.
+
+A implementação deverá preservar a distinção entre operação não iniciada, operação rejeitada e resultado indeterminado. Não liberar reservas quando não houver comprovação de que a mutação deixou de ocorrer.
 
 #### 12.3. Observabilidade
 

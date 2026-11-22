@@ -390,6 +390,127 @@ O encerramento gracioso, portanto, depende de as conexões terminarem por conta 
 | Observabilidade estruturada por conexão | Não implementada no fluxo atual |
 | Shutdown forçado de conexões | Não implementado |
 
+### 9.1. Contrato aprovado de idempotência
+
+**Estado: especificado e aprovado em 22/11/2026; ainda não implementado.**
+
+A evolução de idempotência introduzirá um identificador de operação (`OperationID`) independente do identificador de requisição (`RequestID`).
+
+A responsabilidade será evitar a execução repetida de uma mesma operação lógica quando o cliente precisar repetir uma tentativa após um resultado indeterminado.
+
+#### Identificadores
+
+| Identificador | Responsabilidade | Ciclo de vida |
+|---|---|---|
+| `RequestID` | Correlacionar uma requisição com sua resposta | Novo para cada tentativa |
+| `OperationID` | Identificar uma operação lógica entre tentativas | Reutilizado nas tentativas da mesma operação |
+
+O `OperationID` terá 128 bits e será representado no contrato Protobuf por um campo `bytes`, validado para exatamente 16 bytes.
+
+O identificador será obrigatório para `SET` e `DELETE`. `PING` e `GET` não estarão abrangidos pelo contrato inicial de idempotência.
+
+A obrigatoriedade do campo implica atualização coordenada dos drivers e do servidor. Clientes antigos que não enviarem o identificador não poderão executar as operações mutáveis após a ativação dessa validação.
+
+#### Escopo e retenção
+
+Os registros de idempotência terão:
+
+- escopo global dentro de uma instância do servidor;
+- retenção de 24 horas após o resultado terminal;
+- capacidade padrão de 100.000 registros;
+- capacidade configurável na inicialização;
+- armazenamento exclusivamente em memória.
+
+A capacidade contabilizará registros em andamento e concluídos. Registros válidos não poderão ser removidos antecipadamente para liberar espaço.
+
+Quando a capacidade estiver esgotada, uma operação inédita deverá ser rejeitada antes da execução, por meio de erro específico. A rejeição não deverá reservar o identificador nem alterar o estado do Storage.
+
+O prazo de retenção começará após a conclusão da operação. Operações em andamento não serão expiradas por essa janela.
+
+#### Fingerprint e deduplicação
+
+O servidor deverá calcular ou construir uma representação determinística dos parâmetros semanticamente relevantes da operação.
+
+O fingerprint deverá considerar:
+
+- comando;
+- chave;
+- valor, para `SET`;
+- TTL e demais parâmetros semânticos existentes.
+
+O mesmo `OperationID` será aceito como repetição somente quando o fingerprint for equivalente ao registrado.
+
+| Condição | Comportamento |
+|---|---|
+| Identificador inédito | Reservar e executar |
+| Identificador existente e fingerprint igual | Não executar novamente; reproduzir resultado |
+| Identificador existente e fingerprint diferente | Rejeitar por conflito |
+| Identificador em andamento e fingerprint igual | Aguardar execução original |
+| Identificador inédito com capacidade esgotada | Rejeitar sem executar |
+
+Ao reproduzir um resultado, o servidor deverá preservar o resultado semântico armazenado, mas preencher a resposta com o `RequestID` da tentativa atual. Isso mantém a correlação do protocolo sem alterar a identidade lógica da operação.
+
+Respostas estruturadas e reproduzíveis, inclusive erros determinísticos de aplicação, deverão ser armazenadas para replay.
+
+Uma reserva somente poderá ser liberada após uma falha quando houver comprovação de que a mutação não foi executada. Um resultado indeterminado não poderá ser interpretado como uma falha comprovadamente anterior à execução.
+
+#### Fluxo arquitetural previsto
+
+A deduplicação deverá ocorrer antes da execução da mutação. O fluxo lógico será:
+
+```mermaid
+flowchart TD
+    Client["Cliente / Driver"]
+    TCP["Transporte TCP"]
+    Handler["Handler"]
+    Codec["Codec"]
+    Model["Modelo interno"]
+    Manager["IdempotencyManager"]
+    Engine["Engine"]
+    Storage["Storage"]
+
+    Client --> TCP
+    TCP --> Handler
+    Handler --> Codec
+    Codec --> Model
+    Model --> Manager
+    Manager -->|"Operação inédita"| Engine
+    Engine --> Storage
+    Storage --> Engine
+    Engine --> Manager
+    Manager -->|"Resultado original ou reproduzido"| Handler
+```
+
+O `IdempotencyManager` será responsável por:
+
+- reservar identificadores de forma atômica;
+- comparar fingerprints;
+- coordenar requisições concorrentes;
+- armazenar estados e resultados;
+- controlar capacidade e retenção;
+- impedir a liberação insegura de reservas.
+
+O gerenciador deverá permanecer separado do Storage de dados de negócio. Os registros de deduplicação não deverão ser tratados como entradas chave-valor comuns.
+
+#### Garantias e limites
+
+A garantia inicial será de **no máximo uma execução por `OperationID` enquanto o registro permanecer retido na mesma instância do MemoryDB**.
+
+Como os registros serão mantidos somente em memória:
+
+- a garantia não sobreviverá à reinicialização do processo;
+- não haverá recuperação dos registros após crash;
+- o mesmo identificador poderá voltar a ser executado após perda dos registros;
+- a expiração após 24 horas encerra a garantia de deduplicação daquele registro.
+
+Não se deve denominar essa garantia *exactly-once*.
+
+Para oferecer proteção após reinicialização, será necessário persistir atomicamente a mutação de dados e o registro de deduplicação.
+
+O driver não deverá implementar retry automático implícito. A aplicação consumidora deverá poder fornecer e reutilizar o `OperationID` da operação original quando decidir tentar novamente.
+
+A implementação também deverá definir e testar o tratamento de falhas internas durante a execução, distinguindo falhas comprovadamente anteriores à mutação de situações em que o resultado não pode ser determinado.
+
 ## 10. Evoluções arquiteturais
 
 As evoluções abaixo exigem decisões de contrato e mudanças coordenadas entre componentes.

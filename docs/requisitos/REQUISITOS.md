@@ -463,6 +463,113 @@ Cenário: Preservar a causa original
 
 **Limitação:** O controle por contexto não garante que uma operação cancelada durante I/O deixou de ser executada no servidor. Não existe mecanismo server-side para consultar ou recuperar seu resultado. O driver não realiza retry automático.
 
+### FR-012 — Executar operações mutáveis com idempotência
+
+**Descrição:** O servidor deverá oferecer deduplicação para as operações `SET` e `DELETE`, utilizando um identificador estável de operação (`OperationID`) independente do identificador de requisição (`RequestID`).
+
+O contrato está especificado, mas a funcionalidade ainda não está implementada.
+
+**Contrato aprovado:**
+
+| Propriedade | Definição |
+|---|---|
+| Identificador | `OperationID` de 128 bits |
+| Representação externa | Campo Protobuf `bytes`, com exatamente 16 bytes |
+| Escopo | Global na instância do servidor |
+| Operações protegidas | `SET` e `DELETE` |
+| Retenção | 24 horas após o resultado terminal |
+| Capacidade padrão | 100.000 registros |
+| Capacidade configurável | Sim |
+| Armazenamento | Memória |
+| Evicção antecipada | Proibida para registros ainda válidos |
+
+`SET` e `DELETE` deverão rejeitar solicitações sem `OperationID` ou com identificador de tamanho inválido.
+
+O `RequestID` continuará identificando cada tentativa de requisição. O `OperationID` deverá ser reutilizado quando a aplicação repetir a mesma operação lógica.
+
+O fingerprint deverá considerar o comando e todos os parâmetros semanticamente relevantes, incluindo chave, valor e TTL quando aplicável.
+
+**Comportamentos exigidos:**
+
+| Situação | Resultado esperado |
+|---|---|
+| Primeiro uso de um `OperationID` válido | Reservar o identificador e executar a operação |
+| Mesmo identificador e mesmo fingerprint, após conclusão | Reproduzir o resultado armazenado sem executar novamente |
+| Mesmo identificador e fingerprint diferente | Rejeitar por conflito |
+| Requisições concorrentes com mesmo identificador e fingerprint | Aguardar a execução original e receber resultado semanticamente equivalente |
+| Capacidade esgotada para identificador inédito | Rejeitar antes da execução, com erro específico |
+| Identificador já expirado | Não há mais garantia de deduplicação para esse registro |
+
+A resposta reproduzida deverá conter o `RequestID` da tentativa atual, preservando a correlação entre a requisição recebida e a resposta enviada. O resultado semântico deverá corresponder ao resultado armazenado da operação original.
+
+A capacidade máxima deverá contar registros em andamento e concluídos. A rejeição por capacidade não deverá reservar o identificador nem executar a mutação. O identificador poderá ser tentado novamente quando houver capacidade disponível.
+
+O prazo de retenção começará após a conclusão da operação. Registros em andamento não expiram por essa janela. Respostas estruturadas e reproduzíveis, inclusive erros determinísticos de aplicação, deverão ser armazenadas.
+
+Uma reserva somente poderá ser liberada após falha quando houver comprovação de que a mutação não foi executada. Um resultado indeterminado não poderá ser tratado como uma falha comprovadamente anterior à execução.
+
+**Limites da garantia:**
+
+A garantia inicial será de no máximo uma execução por `OperationID` enquanto o registro estiver retido na mesma instância do servidor.
+
+Os registros são exclusivamente em memória. Portanto, a deduplicação não sobrevive à reinicialização ou perda do processo.
+
+Essa garantia não representa *exactly-once*. A durabilidade exigiria persistência atômica da mutação e do registro de deduplicação.
+
+**Componentes previstos:**
+- Schema Protobuf e tipos gerados.
+- Modelo interno de protocolo.
+- Handler e fluxo de processamento do servidor.
+- Gerenciador de idempotência.
+- Engine.
+- Driver Go.
+
+**Critérios de aceite**
+
+```gherkin
+Cenário: Executar uma operação pela primeira vez
+  Dado um SET com OperationID válido e inédito
+  Quando o servidor processar a solicitação
+  Então deverá reservar o identificador
+  E executar a operação
+  E armazenar o resultado
+
+Cenário: Repetir uma operação concluída
+  Dado um OperationID já concluído
+  E o mesmo fingerprint da operação original
+  Quando o cliente enviar uma nova tentativa
+  Então o servidor não deverá executar novamente a mutação
+  E deverá reproduzir o resultado armazenado
+  E deverá utilizar o RequestID da tentativa atual na resposta
+
+Cenário: Reutilizar identificador com conteúdo diferente
+  Dado um OperationID já registrado
+  Quando uma solicitação utilizar o mesmo identificador com fingerprint diferente
+  Então o servidor deverá rejeitar a solicitação por conflito
+
+Cenário: Receber operações concorrentes com o mesmo identificador
+  Dado que uma operação está em andamento
+  Quando outra requisição chegar com o mesmo OperationID e fingerprint
+  Então a segunda requisição deverá aguardar a execução original
+  E não deverá executar uma segunda mutação
+
+Cenário: Atingir a capacidade máxima
+  Dado que todos os registros permitidos estão ocupados
+  Quando chegar uma operação com OperationID inédito
+  Então o servidor deverá rejeitá-la com erro específico
+  E não deverá executar a mutação
+  E não deverá remover registros válidos antecipadamente
+
+Cenário: Rejeitar operação mutável sem identificador
+  Dado que uma solicitação SET ou DELETE não contém OperationID válido
+  Quando o servidor validar a solicitação
+  Então deverá rejeitá-la antes da execução
+```
+
+**Estado:** Especificado e aprovado em 22/11/2026; não implementado.
+
+**Observação de compatibilidade:** tornar `OperationID` obrigatório para `SET` e `DELETE` altera o comportamento esperado dos clientes existentes. Os drivers deverão ser atualizados de forma coordenada com o servidor.
+
 ## 4. Requisitos não funcionais e características verificáveis
 
 Esta seção registra características observáveis da implementação atual. Itens não implementados representam lacunas, não garantias oferecidas pelo sistema.
@@ -483,7 +590,7 @@ Esta seção registra características observáveis da implementação atual. It
 | NFR-012 | Aplicações Go devem consumir o serviço por meio de uma API cliente. | Implementado e testado | `drivers/go/client.go`, `drivers/go/client_test.go` |
 | NFR-013 | Os módulos Go devem permitir desenvolvimento e testes independentes no workspace. | Implementado | `go.work` e arquivos `go.mod` |
 | NFR-014 | O código deve passar pelos testes com detector de condições de corrida e análise estática. | Validação histórica | Registros de validação por módulo descritos na seção 8 |
-
+| NFR-015 | O registro de idempotência deve respeitar capacidade configurada, retenção de 24 horas e ausência de evicção antecipada de registros válidos. | Especificado, não implementado | Contrato FR-012; implementação futura no gerenciador de idempotência |
 ### 4.1 Observações sobre os requisitos não funcionais
 
 **NFR-004 — Shutdown**
