@@ -38,9 +38,10 @@ func (c *Codec) EncodeRequest(request *protocol.Request) ([]byte, error) {
 	case *protocol.SetCommand:
 		message.Command = &memorydbpb.Request_Set{
 			Set: &memorydbpb.SetCommand{
-				Key:   command.Key,
-				Value: command.Value,
-				TtlMs: command.TTLMillis,
+				Key:         command.Key,
+				Value:       command.Value,
+				TtlMs:       command.TTLMillis,
+				OperationId: command.OperationID,
 			},
 		}
 	case *protocol.GetCommand:
@@ -49,7 +50,10 @@ func (c *Codec) EncodeRequest(request *protocol.Request) ([]byte, error) {
 		}
 	case *protocol.DeleteCommand:
 		message.Command = &memorydbpb.Request_Delete{
-			Delete: &memorydbpb.DeleteCommand{Key: command.Key},
+			Delete: &memorydbpb.DeleteCommand{
+				Key:         command.Key,
+				OperationId: command.OperationID,
+			},
 		}
 	default:
 		return nil, fmt.Errorf("encode request: unsupported or missing command")
@@ -80,9 +84,10 @@ func (c *Codec) DecodeRequest(data []byte) (*protocol.Request, error) {
 		request.Command = &protocol.PingCommand{}
 	case *memorydbpb.Request_Set:
 		request.Command = &protocol.SetCommand{
-			Key:       command.Set.GetKey(),
-			Value:     command.Set.GetValue(),
-			TTLMillis: command.Set.GetTtlMs(),
+			OperationID: command.Set.GetOperationId(),
+			Key:         command.Set.GetKey(),
+			Value:       command.Set.GetValue(),
+			TTLMillis:   command.Set.GetTtlMs(),
 		}
 	case *memorydbpb.Request_Get:
 		request.Command = &protocol.GetCommand{
@@ -90,7 +95,8 @@ func (c *Codec) DecodeRequest(data []byte) (*protocol.Request, error) {
 		}
 	case *memorydbpb.Request_Delete:
 		request.Command = &protocol.DeleteCommand{
-			Key: command.Delete.GetKey(),
+			OperationID: command.Delete.GetOperationId(),
+			Key:         command.Delete.GetKey(),
 		}
 	default:
 		return nil, fmt.Errorf("decode request: unsupported or missing command")

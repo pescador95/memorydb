@@ -43,6 +43,7 @@ message SetCommand {
     string key = 1;
     bytes value = 2;
     uint64 ttl_ms = 3;
+    bytes operation_id = 4;
 }
 
 message SetResult {}
@@ -58,6 +59,7 @@ message GetResult {
 
 message DeleteCommand {
     string key = 1;
+    bytes operation_id = 2;
 }
 
 message DeleteResult {

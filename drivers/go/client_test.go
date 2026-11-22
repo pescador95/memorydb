@@ -156,7 +156,7 @@ func TestClientSetGetDelete(t *testing.T) {
 	key := "user:1"
 	value := []byte("memorydb")
 
-	if err := client.Set(key, value); err != nil {
+	if err := client.Set(newTestOperationID(t), key, value); err != nil {
 		t.Fatalf("SET retornou erro: %v", err)
 	}
 
@@ -173,7 +173,7 @@ func TestClientSetGetDelete(t *testing.T) {
 		t.Fatalf("valor inesperado: obtido %q, esperado %q", got, value)
 	}
 
-	deleted, err := client.Delete(key)
+	deleted, err := client.Delete(newTestOperationID(t), key)
 	if err != nil {
 		t.Fatalf("DELETE retornou erro: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestClientSetGetDelete(t *testing.T) {
 		t.Fatalf("valor deveria ser nil após chave ausente, obtido %v", got)
 	}
 
-	deleted, err = client.Delete(key)
+	deleted, err = client.Delete(newTestOperationID(t), key)
 	if err != nil {
 		t.Fatalf("segundo DELETE retornou erro: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestClientSetGetDelete(t *testing.T) {
 func TestClientEmptyValue(t *testing.T) {
 	client := newTestClient(t)
 
-	if err := client.Set("empty", []byte{}); err != nil {
+	if err := client.Set(newTestOperationID(t), "empty", []byte{}); err != nil {
 		t.Fatalf("SET retornou erro: %v", err)
 	}
 
@@ -260,6 +260,17 @@ func TestClientConcurrentRequests(t *testing.T) {
 	var wg sync.WaitGroup
 	errorsFound := make(chan error, total)
 
+	operationIDs := make([]OperationID, total)
+
+	for i := range operationIDs {
+		operationID, err := NewOperationID()
+		if err != nil {
+			t.Fatalf("gerar OperationID: %v", err)
+		}
+
+		operationIDs[i] = operationID
+	}
+
 	for i := 0; i < total; i++ {
 		wg.Add(1)
 
@@ -269,7 +280,7 @@ func TestClientConcurrentRequests(t *testing.T) {
 			key := string(rune('A' + i))
 			value := []byte(key)
 
-			if err := client.Set(key, value); err != nil {
+			if err := client.Set(operationIDs[i], key, value); err != nil {
 				errorsFound <- err
 				return
 			}
@@ -740,7 +751,7 @@ func TestClientContextMethods(t *testing.T) {
 		t.Fatalf("PING com contexto retornou erro: %v", err)
 	}
 
-	if err := client.SetContext(ctx, "user:context", []byte("memorydb")); err != nil {
+	if err := client.SetContext(ctx, newTestOperationID(t), "user:context", []byte("memorydb")); err != nil {
 		t.Fatalf("SET com contexto retornou erro: %v", err)
 	}
 
@@ -757,7 +768,7 @@ func TestClientContextMethods(t *testing.T) {
 		t.Fatalf("valor inesperado: %q", value)
 	}
 
-	deleted, err := client.DeleteContext(ctx, "user:context")
+	deleted, err := client.DeleteContext(ctx, newTestOperationID(t), "user:context")
 	if err != nil {
 		t.Fatalf("DELETE com contexto retornou erro: %v", err)
 	}
@@ -1264,7 +1275,13 @@ func TestClientSetReturnsUnknownOutcomeAfterServerExecution(t *testing.T) {
 	}
 	defer client.Close()
 
-	executedValue := make(chan []byte, 1)
+	type receivedSet struct {
+		key         string
+		value       []byte
+		operationID []byte
+	}
+
+	executedSet := make(chan receivedSet, 1)
 	serverErr := make(chan error, 1)
 
 	go func() {
@@ -1293,16 +1310,21 @@ func TestClientSetReturnsUnknownOutcomeAfterServerExecution(t *testing.T) {
 			return
 		}
 
-		// Simula a execução bem-sucedida no servidor.
-		value := append([]byte(nil), command.Set.GetValue()...)
-		executedValue <- value
+		// Simula a execução da mutação antes da perda da resposta.
+		executedSet <- receivedSet{
+			key:         command.Set.GetKey(),
+			value:       append([]byte(nil), command.Set.GetValue()...),
+			operationID: append([]byte(nil), command.Set.GetOperationId()...),
+		}
 
-		// A conexão é encerrada sem enviar a resposta.
+		// Encerra a conexão sem enviar a resposta.
 	}()
 
+	expectedKey := "user:1"
 	expectedValue := []byte("memorydb")
+	operationID := newTestOperationID(t)
 
-	err = client.Set("user:1", expectedValue)
+	err = client.Set(operationID, expectedKey, expectedValue)
 	if err == nil {
 		t.Fatal("esperava resultado indeterminado após perda da resposta")
 	}
@@ -1324,12 +1346,28 @@ func TestClientSetReturnsUnknownOutcomeAfterServerExecution(t *testing.T) {
 	}
 
 	select {
-	case value := <-executedValue:
-		if !reflect.DeepEqual(value, expectedValue) {
-			t.Fatalf(
-				"valor executado inesperado: obtido %q, esperado %q",
-				value,
+	case got := <-executedSet:
+		if got.key != expectedKey {
+			t.Errorf(
+				"chave inesperada: obtida %q, esperada %q",
+				got.key,
+				expectedKey,
+			)
+		}
+
+		if !reflect.DeepEqual(got.value, expectedValue) {
+			t.Errorf(
+				"valor inesperado: obtido %q, esperado %q",
+				got.value,
 				expectedValue,
+			)
+		}
+
+		if !reflect.DeepEqual(got.operationID, operationID[:]) {
+			t.Errorf(
+				"OperationID inesperado: obtido %x, esperado %x",
+				got.operationID,
+				operationID[:],
 			)
 		}
 
@@ -1350,5 +1388,36 @@ func TestClientSetReturnsUnknownOutcomeAfterServerExecution(t *testing.T) {
 
 	if err := client.Ping(); err == nil {
 		t.Fatal("cliente não deveria aceitar operações após perda da resposta")
+	}
+}
+
+func newTestOperationID(t *testing.T) OperationID {
+	t.Helper()
+
+	operationID, err := NewOperationID()
+	if err != nil {
+		t.Fatalf("gerar OperationID: %v", err)
+	}
+
+	return operationID
+}
+
+func TestNewOperationID(t *testing.T) {
+	first, err := NewOperationID()
+	if err != nil {
+		t.Fatalf("gerar primeiro OperationID: %v", err)
+	}
+
+	second, err := NewOperationID()
+	if err != nil {
+		t.Fatalf("gerar segundo OperationID: %v", err)
+	}
+
+	if first == (OperationID{}) {
+		t.Fatal("OperationID não deveria ser zero")
+	}
+
+	if first == second {
+		t.Fatal("identificadores gerados deveriam ser diferentes")
 	}
 }

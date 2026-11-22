@@ -10,6 +10,13 @@ import (
 func TestRequestRoundTrip(t *testing.T) {
 	codec := New()
 
+	operationID := []byte{
+		0x00, 0x01, 0x02, 0x03,
+		0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0A, 0x0B,
+		0x0C, 0x0D, 0x0E, 0x0F,
+	}
+
 	tests := []struct {
 		name    string
 		command protocol.Command
@@ -21,9 +28,10 @@ func TestRequestRoundTrip(t *testing.T) {
 		{
 			name: "SET",
 			command: &protocol.SetCommand{
-				Key:       "user:1",
-				Value:     []byte{0x00, 0x01, 0xFF, 0xFE},
-				TTLMillis: 5000,
+				OperationID: operationID,
+				Key:         "user:1",
+				Value:       []byte{0x00, 0x01, 0xFF, 0xFE},
+				TTLMillis:   5000,
 			},
 		},
 		{
@@ -35,7 +43,8 @@ func TestRequestRoundTrip(t *testing.T) {
 		{
 			name: "DELETE",
 			command: &protocol.DeleteCommand{
-				Key: "user:1",
+				OperationID: operationID,
+				Key:         "user:1",
 			},
 		},
 	}
@@ -76,6 +85,13 @@ func TestRequestRoundTrip(t *testing.T) {
 					!bytes.Equal(gotCommand.Value, want.Value) {
 					t.Errorf("SET command mismatch: got %+v, want %+v", gotCommand, want)
 				}
+				if !bytes.Equal(gotCommand.OperationID, want.OperationID) {
+					t.Errorf(
+						"SET OperationID = %v, want %v",
+						gotCommand.OperationID,
+						want.OperationID,
+					)
+				}
 			case *protocol.GetCommand:
 				gotCommand, ok := got.Command.(*protocol.GetCommand)
 				if !ok || gotCommand.Key != want.Key {
@@ -85,6 +101,13 @@ func TestRequestRoundTrip(t *testing.T) {
 				gotCommand, ok := got.Command.(*protocol.DeleteCommand)
 				if !ok || gotCommand.Key != want.Key {
 					t.Errorf("DELETE command mismatch: got %+v, want %+v", got.Command, want)
+				}
+				if !bytes.Equal(gotCommand.OperationID, want.OperationID) {
+					t.Errorf(
+						"DELETE OperationID = %v, want %v",
+						gotCommand.OperationID,
+						want.OperationID,
+					)
 				}
 			}
 		})

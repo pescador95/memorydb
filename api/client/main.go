@@ -29,7 +29,13 @@ func run() error {
 	key := "user:1"
 	value := []byte("memorydb")
 
-	if err := client.Set(key, value); err != nil {
+	operationID, err := memorydb.NewOperationID()
+
+	if err != nil {
+		return fmt.Errorf("gerar OperationID para SET: %w", err)
+	}
+
+	if err := client.Set(operationID, key, value); err != nil {
 		return fmt.Errorf("executar SET: %w", err)
 	}
 
@@ -46,7 +52,13 @@ func run() error {
 
 	fmt.Printf("GET: %s\n", string(result))
 
-	deleted, err := client.Delete(key)
+	operationID, err = memorydb.NewOperationID()
+
+	if err != nil {
+		return fmt.Errorf("gerar OperationID para DELETE: %w", err)
+	}
+
+	deleted, err := client.Delete(operationID, key)
 	if err != nil {
 		return fmt.Errorf("executar DELETE: %w", err)
 	}

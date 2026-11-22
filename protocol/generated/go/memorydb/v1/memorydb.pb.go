@@ -366,6 +366,7 @@ type SetCommand struct {
 	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
 	TtlMs         uint64                 `protobuf:"varint,3,opt,name=ttl_ms,json=ttlMs,proto3" json:"ttl_ms,omitempty"`
+	OperationId   []byte                 `protobuf:"bytes,4,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -419,6 +420,13 @@ func (x *SetCommand) GetTtlMs() uint64 {
 		return x.TtlMs
 	}
 	return 0
+}
+
+func (x *SetCommand) GetOperationId() []byte {
+	if x != nil {
+		return x.OperationId
+	}
+	return nil
 }
 
 type SetResult struct {
@@ -556,6 +564,7 @@ func (x *GetResult) GetValue() []byte {
 type DeleteCommand struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	OperationId   []byte                 `protobuf:"bytes,2,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -595,6 +604,13 @@ func (x *DeleteCommand) GetKey() string {
 		return x.Key
 	}
 	return ""
+}
+
+func (x *DeleteCommand) GetOperationId() []byte {
+	if x != nil {
+		return x.OperationId
+	}
+	return nil
 }
 
 type DeleteResult struct {
@@ -718,21 +734,23 @@ const file_memorydb_v1_memorydb_proto_rawDesc = "" +
 	"\x06result\"\r\n" +
 	"\vPingCommand\"\f\n" +
 	"\n" +
-	"PongResult\"K\n" +
+	"PongResult\"n\n" +
 	"\n" +
 	"SetCommand\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x15\n" +
-	"\x06ttl_ms\x18\x03 \x01(\x04R\x05ttlMs\"\v\n" +
+	"\x06ttl_ms\x18\x03 \x01(\x04R\x05ttlMs\x12!\n" +
+	"\foperation_id\x18\x04 \x01(\fR\voperationId\"\v\n" +
 	"\tSetResult\"\x1e\n" +
 	"\n" +
 	"GetCommand\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\"7\n" +
 	"\tGetResult\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\"!\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"D\n" +
 	"\rDeleteCommand\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\"(\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12!\n" +
+	"\foperation_id\x18\x02 \x01(\fR\voperationId\"(\n" +
 	"\fDeleteResult\x12\x18\n" +
 	"\adeleted\x18\x01 \x01(\bR\adeleted\";\n" +
 	"\vErrorResult\x12\x12\n" +

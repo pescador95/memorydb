@@ -12,6 +12,7 @@ import (
 
 	"github.com/pescador95/memorydb/server/internal/codec/protobuf"
 	"github.com/pescador95/memorydb/server/internal/engine"
+	"github.com/pescador95/memorydb/server/internal/idempotency"
 	"github.com/pescador95/memorydb/server/internal/transport/tcp"
 )
 
@@ -43,7 +44,12 @@ func run() error {
 	messageCodec := protobuf.New()
 	commandEngine := engine.New()
 
-	handler, err := tcp.NewHandler(commandEngine, messageCodec)
+	executor, err := idempotency.NewExecutor(&idempotency.Config{})
+	if err != nil {
+		return fmt.Errorf("create idempotency executor: %w", err)
+	}
+
+	handler, err := tcp.NewHandler(commandEngine, messageCodec, executor)
 	if err != nil {
 		return fmt.Errorf("create handler: %w", err)
 	}

@@ -256,22 +256,35 @@ func (c *Client) PingContext(ctx context.Context) error {
 	return err
 }
 
-// Set grava um valor associado a uma chave.
-func (c *Client) Set(key string, value []byte) error {
-	return c.SetContext(context.Background(), key, value)
+// Set grava um valor associado a uma chave usando o identificador
+// da operação lógica.
+func (c *Client) Set(
+	operationID OperationID,
+	key string,
+	value []byte,
+) error {
+	return c.SetContext(
+		context.Background(),
+		operationID,
+		key,
+		value,
+	)
 }
 
-// SetContext grava um valor associado a uma chave.
+// SetContext grava um valor associado a uma chave usando o identificador
+// da operação lógica.
 func (c *Client) SetContext(
 	ctx context.Context,
+	operationID OperationID,
 	key string,
 	value []byte,
 ) error {
 	_, err := c.execute(ctx, &memorydbpb.Request{
 		Command: &memorydbpb.Request_Set{
 			Set: &memorydbpb.SetCommand{
-				Key:   key,
-				Value: value,
+				OperationId: append([]byte(nil), operationID[:]...),
+				Key:         key,
+				Value:       value,
 			},
 		},
 	})
@@ -306,20 +319,31 @@ func (c *Client) GetContext(
 	return value, result.GetFound(), nil
 }
 
-// Delete remove uma chave do armazenamento.
-func (c *Client) Delete(key string) (bool, error) {
-	return c.DeleteContext(context.Background(), key)
+// Delete remove uma chave do armazenamento usando o identificador
+// da operação lógica.
+func (c *Client) Delete(
+	operationID OperationID,
+	key string,
+) (bool, error) {
+	return c.DeleteContext(
+		context.Background(),
+		operationID,
+		key,
+	)
 }
 
-// DeleteContext remove uma chave do armazenamento.
+// DeleteContext remove uma chave do armazenamento usando o identificador
+// da operação lógica.
 func (c *Client) DeleteContext(
 	ctx context.Context,
+	operationID OperationID,
 	key string,
 ) (bool, error) {
 	response, err := c.execute(ctx, &memorydbpb.Request{
 		Command: &memorydbpb.Request_Delete{
 			Delete: &memorydbpb.DeleteCommand{
-				Key: key,
+				OperationId: append([]byte(nil), operationID[:]...),
+				Key:         key,
 			},
 		},
 	})

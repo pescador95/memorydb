@@ -187,9 +187,9 @@ As operações podem ser executadas por métodos convencionais ou por métodos q
 | Operação | Método convencional | Método com contexto |
 |---|---|---|
 | Verificar comunicação | `Ping()` | `PingContext(ctx)` |
-| Armazenar | `Set(key, value)` | `SetContext(ctx, key, value)` |
+| Armazenar | `Set(operationID, key, value)` | `SetContext(ctx, operationID, key, value)` |
 | Consultar | `Get(key)` | `GetContext(ctx, key)` |
-| Excluir | `Delete(key)` | `DeleteContext(ctx, key)` |
+| Excluir | `Delete(operationID, key)` | `DeleteContext(ctx, operationID, key)` |
 
 Para aplicações HTTP e serviços, recomenda-se utilizar as variantes com contexto.
 
@@ -211,8 +211,15 @@ O PING verifica se o servidor responde à solicitação. Ele não verifica a dis
 Armazena um valor associado a uma chave:
 
 ```go
-err := client.SetContext(
+operationID, err := memorydb.NewOperationID()
+if err != nil {
+    log.Printf("Erro ao gerar OperationID: %v", err)
+    return
+}
+
+err = client.SetContext(
     ctx,
+    operationID,
     "usuario:123",
     []byte("João"),
 )
@@ -225,6 +232,10 @@ if err != nil {
 Os valores são enviados como `[]byte`.
 
 Quando uma chave já existe, um novo SET sobrescreve seu valor.
+
+Cada nova operação lógica de SET deve receber um `OperationID` próprio.
+
+O identificador deve ser reutilizado caso seja necessário repetir a mesma operação devido a um resultado indeterminado. Não gere um novo identificador para uma tentativa de repetição da mesma operação.
 
 ### 6.3. GET — consultar um valor
 
@@ -258,7 +269,13 @@ O indicador `found` permite distinguir uma chave inexistente de uma chave existe
 Remove uma chave do armazenamento:
 
 ```go
-deleted, err := client.DeleteContext(ctx, "usuario:123")
+operationID, err := memorydb.NewOperationID()
+if err != nil {
+    log.Printf("Erro ao gerar OperationID: %v", err)
+    return
+}
+
+deleted, err := client.DeleteContext(ctx, operationID, "usuario:123")
 if err != nil {
     log.Printf("Erro ao excluir: %v", err)
     return
@@ -306,7 +323,6 @@ func run() error {
     }
     defer client.Close()
 
-    // Verificar comunicação.
     if err := client.PingContext(ctx); err != nil {
         return fmt.Errorf("executar PING: %w", err)
     }
@@ -314,7 +330,12 @@ func run() error {
     key := "usuario:123"
 
     // CREATE: armazenar um valor.
-    if err := client.SetContext(ctx, key, []byte("João")); err != nil {
+    createID, err := memorydb.NewOperationID()
+    if err != nil {
+        return fmt.Errorf("gerar OperationID para CREATE: %w", err)
+    }
+
+    if err := client.SetContext(ctx, createID, key, []byte("João")); err != nil {
         return fmt.Errorf("armazenar valor: %w", err)
     }
 
@@ -331,7 +352,12 @@ func run() error {
     }
 
     // UPDATE: sobrescrever o valor da chave.
-    if err := client.SetContext(ctx, key, []byte("Maria")); err != nil {
+    updateID, err := memorydb.NewOperationID()
+    if err != nil {
+        return fmt.Errorf("gerar OperationID para UPDATE: %w", err)
+    }
+
+    if err := client.SetContext(ctx, updateID, key, []byte("Maria")); err != nil {
         return fmt.Errorf("atualizar valor: %w", err)
     }
 
@@ -348,7 +374,12 @@ func run() error {
     }
 
     // DELETE: remover a chave.
-    deleted, err := client.DeleteContext(ctx, key)
+    deleteID, err := memorydb.NewOperationID()
+    if err != nil {
+        return fmt.Errorf("gerar OperationID para DELETE: %w", err)
+    }
+
+    deleted, err := client.DeleteContext(ctx, deleteID, key)
     if err != nil {
         return fmt.Errorf("excluir chave: %w", err)
     }
@@ -447,11 +478,13 @@ func (api *API) Create(
     ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
     defer cancel()
 
-    err := api.client.SetContext(ctx, key, []byte("valor"))
+    operationID, err := newOperationID()
     if err != nil {
         api.handleMemoryDBError(w, err)
         return
     }
+
+    err = api.client.SetContext(ctx, operationID, key, []byte("valor"))
 
     w.WriteHeader(http.StatusCreated)
 }
@@ -490,11 +523,13 @@ func (api *API) Update(
     ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
     defer cancel()
 
-    err := api.client.SetContext(ctx, key, []byte("novo valor"))
+    operationID, err := newOperationID()
     if err != nil {
         api.handleMemoryDBError(w, err)
         return
     }
+
+    err = api.client.SetContext(ctx, operationID, key, []byte("novo valor"))
 
     w.WriteHeader(http.StatusNoContent)
 }
@@ -508,11 +543,13 @@ func (api *API) Delete(
     ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
     defer cancel()
 
-    deleted, err := api.client.DeleteContext(ctx, key)
+    operationID, err := newOperationID()
     if err != nil {
         api.handleMemoryDBError(w, err)
         return
     }
+
+    deleted, err := api.client.DeleteContext(ctx, operationID, key)
 
     if !deleted {
         http.NotFound(w, r)
@@ -551,6 +588,10 @@ func main() {
         log.Printf("Erro no servidor HTTP: %v", err)
     }
 }
+
+func newOperationID() (memorydb.OperationID, error) {
+    return memorydb.NewOperationID()
+}
 ```
 
 O exemplo utiliza `net/http` da biblioteca padrão do Go e os métodos HTTP POST, GET, PUT e DELETE.
@@ -564,6 +605,82 @@ A demonstração mantém o foco na integração com o driver. Em uma aplicação
 - Uma operação com resultado indeterminado não deve ser apresentada como uma falha comprovada de execução.
 
 O exemplo utiliza `Dial` para simplificar a inicialização. Em aplicações que precisam limitar o tempo de conexão, utilize `DialContext`.
+
+
+## 7. Idempotência e OperationID
+
+O driver utiliza `OperationID` para identificar operações de escrita (`SET` e `DELETE`) e permitir que uma mesma operação seja repetida sem executar novamente a mutação no servidor.
+
+O tipo `memorydb.OperationID` possui 16 bytes. Para gerar um identificador, utilize:
+
+```go
+operationID, err := memorydb.NewOperationID()
+if err != nil {
+    return err
+}
+```
+
+### 7.1. Regras de utilização
+
+- Gere um novo `OperationID` para cada nova operação lógica de SET ou DELETE.
+- Preserve o identificador durante toda a vida daquela operação.
+- Reutilize o mesmo identificador ao repetir uma operação cujo resultado não pôde ser confirmado.
+- Não gere um novo identificador para um retry da mesma operação.
+- Operações GET e PING não precisam de `OperationID`.
+
+### 7.2. Resultado indeterminado
+
+O driver disponibiliza `OperationOutcomeUnknownError` para indicar que não foi possível confirmar o resultado de uma operação.
+
+Isso pode ocorrer, por exemplo, quando a conexão é interrompida depois que a requisição foi enviada, mas antes de a resposta ser recebida.
+
+O identificador da requisição pode ser recuperado pelo campo `RequestID`. O `OperationID` original deve ser preservado para uma nova tentativa.
+
+Exemplo:
+
+```go
+operationID, err := memorydb.NewOperationID()
+if err != nil {
+    return err
+}
+
+err = client.SetContext(ctx, operationID, "usuario:123", []byte("João"))
+if err != nil {
+    var outcomeErr *memorydb.OperationOutcomeUnknownError
+
+    if errors.As(err, &outcomeErr) {
+        // Uma nova tentativa da mesma operação deve reutilizar operationID.
+        return fmt.Errorf(
+            "resultado indeterminado para RequestID %d: %w",
+            outcomeErr.RequestID,
+            err,
+        )
+    }
+
+    return err
+}
+```
+
+### 7.3. Reutilização e conflitos
+
+O servidor mantém os registros de idempotência em memória por uma janela de retenção de 24 horas após a conclusão da operação.
+
+Durante essa janela:
+
+- Mesmo `OperationID` e mesmo conteúdo lógico: o resultado original é reproduzido.
+- Mesmo `OperationID` com conteúdo diferente: o servidor retorna conflito.
+- Operações concorrentes com o mesmo identificador aguardam a execução original e recebem resultado equivalente.
+
+A capacidade padrão é de 100.000 registros. Quando a capacidade está esgotada, novas operações podem ser rejeitadas antes da execução.
+
+### 7.4. Limitações da garantia
+
+A idempotência é garantida somente enquanto o registro estiver retido na mesma instância do servidor.
+
+Como os registros são mantidos exclusivamente em memória, a garantia não sobrevive a reinicializações ou falhas que provoquem perda do estado do servidor.
+
+O mecanismo não representa uma garantia de execução exactly-once em qualquer cenário distribuído. Ele evita a repetição da mutação enquanto o registro correspondente estiver disponível na instância.
+
 
 ## 9. Contexto, timeout e cancelamento
 

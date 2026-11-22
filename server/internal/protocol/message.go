@@ -12,9 +12,10 @@ func (*PingCommand) isCommand() {}
 
 // SetCommand representa uma operação de gravação de valor.
 type SetCommand struct {
-	Key       string
-	Value     []byte
-	TTLMillis uint64
+	OperationID []byte
+	Key         string
+	Value       []byte
+	TTLMillis   uint64
 }
 
 func (*SetCommand) isCommand() {}
@@ -28,7 +29,8 @@ func (*GetCommand) isCommand() {}
 
 // DeleteCommand representa uma operação de remoção de chave.
 type DeleteCommand struct {
-	Key string
+	OperationID []byte
+	Key         string
 }
 
 func (*DeleteCommand) isCommand() {}

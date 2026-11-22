@@ -12,6 +12,7 @@ import (
 	memorydb "github.com/pescador95/memorydb/drivers/go"
 	"github.com/pescador95/memorydb/server/internal/codec/protobuf"
 	"github.com/pescador95/memorydb/server/internal/engine"
+	"github.com/pescador95/memorydb/server/internal/idempotency"
 	servertcp "github.com/pescador95/memorydb/server/internal/transport/tcp"
 )
 
@@ -35,7 +36,15 @@ func startTestServer(t *testing.T) *testServer {
 
 	commandEngine := engine.New()
 
-	handler, err := servertcp.NewHandler(commandEngine, messageCodec)
+	executor, err := idempotency.NewExecutor(&idempotency.Config{})
+	if err != nil {
+		t.Fatalf("NewExecutor() error = %v", err)
+	}
+
+	handler, err := servertcp.NewHandler(commandEngine, messageCodec, executor)
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
 	if err != nil {
 		_ = listener.Close()
 		t.Fatalf("criar handler: %v", err)
@@ -109,7 +118,7 @@ func TestServerSetGetDelete(t *testing.T) {
 	key := "usuario:1"
 	value := []byte("MemoryDB")
 
-	if err := client.Set(key, value); err != nil {
+	if err := client.Set(newOperationID(t), key, value); err != nil {
 		t.Fatalf("executar SET: %v", err)
 	}
 
@@ -126,7 +135,7 @@ func TestServerSetGetDelete(t *testing.T) {
 		t.Fatalf("valor incorreto: esperado %q, recebido %q", value, got)
 	}
 
-	deleted, err := client.Delete(key)
+	deleted, err := client.Delete(newOperationID(t), key)
 	if err != nil {
 		t.Fatalf("executar DELETE: %v", err)
 	}
@@ -149,7 +158,7 @@ func TestServerEmptyValueAndMissingKey(t *testing.T) {
 	server := startTestServer(t)
 	client := server.newClient(t)
 
-	if err := client.Set("valor-vazio", []byte{}); err != nil {
+	if err := client.Set(newOperationID(t), "valor-vazio", []byte{}); err != nil {
 		t.Fatalf("armazenar valor vazio: %v", err)
 	}
 
@@ -185,7 +194,7 @@ func TestServerMultipleClientsShareStorage(t *testing.T) {
 	key := "compartilhada"
 	value := []byte("dados compartilhados")
 
-	if err := writer.Set(key, value); err != nil {
+	if err := writer.Set(newOperationID(t), key, value); err != nil {
 		t.Fatalf("cliente escritor executar SET: %v", err)
 	}
 
@@ -214,18 +223,28 @@ func TestServerConcurrentClients(t *testing.T) {
 		clients[i] = server.newClient(t)
 	}
 
+	operationIDs := make([]memorydb.OperationID, clientCount)
+
+	for i := range operationIDs {
+		operationIDs[i] = newOperationID(t)
+	}
+
 	var wg sync.WaitGroup
 
 	for i, client := range clients {
 		wg.Add(1)
 
-		go func(index int, client *memorydb.Client) {
+		go func(
+			index int,
+			client *memorydb.Client,
+			operationID memorydb.OperationID,
+		) {
 			defer wg.Done()
 
 			key := fmt.Sprintf("cliente:%d", index)
 			value := []byte(fmt.Sprintf("valor:%d", index))
 
-			if err := client.Set(key, value); err != nil {
+			if err := client.Set(operationID, key, value); err != nil {
 				t.Errorf("cliente %d executar SET: %v", index, err)
 				return
 			}
@@ -249,7 +268,7 @@ func TestServerConcurrentClients(t *testing.T) {
 					got,
 				)
 			}
-		}(i, client)
+		}(i, client, operationIDs[i])
 	}
 
 	wg.Wait()
@@ -311,4 +330,15 @@ func TestServerShutdownWaitsForActiveConnections(t *testing.T) {
 	if err := server.server.Shutdown(shutdownCtx); err != nil {
 		t.Fatalf("concluir encerramento do servidor: %v", err)
 	}
+}
+
+func newOperationID(t *testing.T) memorydb.OperationID {
+	t.Helper()
+
+	operationID, err := memorydb.NewOperationID()
+	if err != nil {
+		t.Fatalf("gerar OperationID: %v", err)
+	}
+
+	return operationID
 }

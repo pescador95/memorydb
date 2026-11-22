@@ -10,6 +10,7 @@ import (
 	"github.com/pescador95/memorydb/server/internal/codec"
 	"github.com/pescador95/memorydb/server/internal/codec/protobuf"
 	"github.com/pescador95/memorydb/server/internal/engine"
+	"github.com/pescador95/memorydb/server/internal/idempotency"
 	"github.com/pescador95/memorydb/server/internal/protocol"
 	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
@@ -22,7 +23,13 @@ func newTestServer(t *testing.T) (*Server, net.Listener) {
 		t.Fatalf("Listen() error = %v", err)
 	}
 
-	handler, err := NewHandler(engine.New(), protobuf.New())
+	executor, err := idempotency.NewExecutor(&idempotency.Config{})
+	if err != nil {
+		listener.Close()
+		t.Fatalf("NewExecutor() error = %v", err)
+	}
+
+	handler, err := NewHandler(engine.New(), protobuf.New(), executor)
 	if err != nil {
 		listener.Close()
 		t.Fatalf("NewHandler() error = %v", err)
