@@ -15,6 +15,43 @@ import (
 	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
 
+type controlledListener struct {
+	conn            net.Conn
+	acceptErr       error
+	closeErr        error
+	acceptStarted   chan struct{}
+	acceptReturning chan struct{}
+	releaseAccept   chan struct{}
+}
+
+func newControlledListener(conn net.Conn) *controlledListener {
+	return &controlledListener{
+		conn:            conn,
+		acceptStarted:   make(chan struct{}),
+		acceptReturning: make(chan struct{}),
+		releaseAccept:   make(chan struct{}),
+	}
+}
+
+func (l *controlledListener) Accept() (net.Conn, error) {
+	close(l.acceptStarted)
+
+	if l.releaseAccept != nil {
+		<-l.releaseAccept
+	}
+
+	close(l.acceptReturning)
+	return l.conn, l.acceptErr
+}
+
+func (l *controlledListener) Close() error {
+	return l.closeErr
+}
+
+func (l *controlledListener) Addr() net.Addr {
+	return &net.TCPAddr{}
+}
+
 func newTestServer(t *testing.T) (*Server, net.Listener) {
 	t.Helper()
 
@@ -265,5 +302,76 @@ func TestServerShutdownBeforeServe(t *testing.T) {
 
 	if err := server.Serve(); err != nil {
 		t.Fatalf("Serve() após Shutdown() error = %v, want nil", err)
+	}
+}
+
+func TestServerReturnsUnexpectedAcceptError(t *testing.T) {
+	server, originalListener := newTestServer(t)
+	defer originalListener.Close()
+
+	acceptErr := errors.New("accept failed")
+	listener := newControlledListener(nil)
+	listener.releaseAccept = nil
+	listener.acceptErr = acceptErr
+	server.listener = listener
+
+	err := server.Serve()
+	if !errors.Is(err, acceptErr) {
+		t.Fatalf("Serve() error = %v, want wrapped accept error", err)
+	}
+}
+
+func TestServerClosesAcceptedConnectionDuringShutdown(t *testing.T) {
+	server, originalListener := newTestServer(t)
+	defer originalListener.Close()
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	listener := newControlledListener(serverConn)
+	server.listener = listener
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve()
+	}()
+
+	<-listener.acceptStarted
+
+	// Impede Serve de verificar o estado antes de o teste simular
+	// o início do desligamento.
+	server.mu.Lock()
+
+	close(listener.releaseAccept)
+	<-listener.acceptReturning
+
+	server.shuttingDown = true
+	server.mu.Unlock()
+
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve() error = %v, want nil", err)
+	}
+
+	_, err := clientConn.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("connection was not closed after shutdown")
+	}
+}
+
+func TestServerShutdownReturnsListenerCloseError(t *testing.T) {
+	server, originalListener := newTestServer(t)
+	defer originalListener.Close()
+
+	closeErr := errors.New("listener close failed")
+	listener := newControlledListener(nil)
+	listener.closeErr = closeErr
+	server.listener = listener
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err := server.Shutdown(ctx)
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Shutdown() error = %v, want wrapped listener close error", err)
 	}
 }

@@ -5,8 +5,62 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 )
+
+type chunkReader struct {
+	reader io.Reader
+	chunk  int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if len(p) > r.chunk {
+		p = p[:r.chunk]
+	}
+
+	return r.reader.Read(p)
+}
+
+type chunkWriter struct {
+	buffer bytes.Buffer
+	chunk  int
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	if len(p) > w.chunk {
+		p = p[:w.chunk]
+	}
+
+	return w.buffer.Write(p)
+}
+
+type zeroWriter struct{}
+
+func (w *zeroWriter) Write(p []byte) (int, error) {
+	return 0, nil
+}
+
+type payloadErrorWriter struct {
+	calls int
+	err   error
+}
+
+func (w *payloadErrorWriter) Write(p []byte) (int, error) {
+	w.calls++
+
+	if w.calls == 1 {
+		return len(p), nil
+	}
+
+	return 0, w.err
+}
+
+type invalidWriteCountWriter struct{}
+
+func (w *invalidWriteCountWriter) Write(p []byte) (int, error) {
+	return len(p) + 1, nil
+}
 
 func TestWriteAndReadFrame(t *testing.T) {
 	payload := []byte("memorydb test")
@@ -162,38 +216,6 @@ func TestWriteFrameRejectsWriterWithoutProgress(t *testing.T) {
 	}
 }
 
-type chunkReader struct {
-	reader io.Reader
-	chunk  int
-}
-
-func (r *chunkReader) Read(p []byte) (int, error) {
-	if len(p) > r.chunk {
-		p = p[:r.chunk]
-	}
-
-	return r.reader.Read(p)
-}
-
-type chunkWriter struct {
-	buffer bytes.Buffer
-	chunk  int
-}
-
-func (w *chunkWriter) Write(p []byte) (int, error) {
-	if len(p) > w.chunk {
-		p = p[:w.chunk]
-	}
-
-	return w.buffer.Write(p)
-}
-
-type zeroWriter struct{}
-
-func (w *zeroWriter) Write(p []byte) (int, error) {
-	return 0, nil
-}
-
 func TestReadFrameRejectsNilReader(t *testing.T) {
 	_, err := ReadFrame(nil)
 
@@ -226,5 +248,50 @@ func TestWriteAndReadFrameWithMaximumSize(t *testing.T) {
 
 	if !bytes.Equal(got, payload) {
 		t.Fatal("payload mismatch for maximum frame size")
+	}
+}
+
+func TestWriteFrameRejectsOversizedPayload(t *testing.T) {
+	payload := bytes.Repeat([]byte("a"), int(MaxFrameSize)+1)
+
+	var buffer bytes.Buffer
+
+	err := WriteFrame(&buffer, payload)
+
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("error = %v, want ErrFrameTooLarge", err)
+	}
+
+	if buffer.Len() != 0 {
+		t.Fatalf("writer received %d bytes, want 0", buffer.Len())
+	}
+}
+
+func TestWriteFrameReturnsPayloadWriteError(t *testing.T) {
+	expectedErr := errors.New("payload write failed")
+	writer := &payloadErrorWriter{err: expectedErr}
+
+	err := WriteFrame(writer, []byte("test"))
+
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("error = %v, want %v", err, expectedErr)
+	}
+
+	if writer.calls != 2 {
+		t.Fatalf("write calls = %d, want 2", writer.calls)
+	}
+}
+
+func TestWriteFrameRejectsInvalidWriteCount(t *testing.T) {
+	writer := &invalidWriteCountWriter{}
+
+	err := WriteFrame(writer, []byte("test"))
+
+	if err == nil {
+		t.Fatal("WriteFrame() expected error for invalid write count")
+	}
+
+	if !strings.Contains(err.Error(), "invalid write count") {
+		t.Fatalf("error = %v, want invalid write count error", err)
 	}
 }

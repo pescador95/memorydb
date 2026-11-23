@@ -252,3 +252,44 @@ func TestDecodeRejectsInvalidProtobuf(t *testing.T) {
 		t.Error("DecodeResponse() expected error for invalid Protobuf")
 	}
 }
+
+func TestEncodeRequestRejectsInvalidUTF8(t *testing.T) {
+	codec := New()
+
+	request := &protocol.Request{
+		Command: &protocol.SetCommand{
+			Key: string([]byte{0xFF}),
+		},
+	}
+
+	if _, err := codec.EncodeRequest(request); err == nil {
+		t.Error("EncodeRequest() expected error for invalid UTF-8")
+	}
+}
+
+func TestEncodeResponseRejectsInvalidUTF8(t *testing.T) {
+	codec := New()
+
+	response := &protocol.Response{
+		Result: &protocol.ErrorResult{
+			Code:    "INVALID_ARGUMENT",
+			Message: string([]byte{0xFF}),
+		},
+	}
+
+	if _, err := codec.EncodeResponse(response); err == nil {
+		t.Error("EncodeResponse() expected error for invalid UTF-8")
+	}
+}
+
+func TestDecodeRejectsMissingCommandOrResult(t *testing.T) {
+	codec := New()
+
+	if _, err := codec.DecodeRequest(nil); err == nil {
+		t.Error("DecodeRequest() expected error for missing command")
+	}
+
+	if _, err := codec.DecodeResponse(nil); err == nil {
+		t.Error("DecodeResponse() expected error for missing result")
+	}
+}

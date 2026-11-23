@@ -1,6 +1,7 @@
 package tcp
 
 import (
+	"errors"
 	"net"
 	"testing"
 
@@ -11,6 +12,43 @@ import (
 	"github.com/pescador95/memorydb/server/internal/protocol"
 	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
+
+type handlerTestCodec struct {
+	request           *protocol.Request
+	decodeRequestErr  error
+	encodeResponseErr error
+}
+
+func (c *handlerTestCodec) EncodeRequest(*protocol.Request) ([]byte, error) {
+	return []byte{1}, nil
+}
+
+func (c *handlerTestCodec) DecodeRequest([]byte) (*protocol.Request, error) {
+	return c.request, c.decodeRequestErr
+}
+
+func (c *handlerTestCodec) EncodeResponse(*protocol.Response) ([]byte, error) {
+	if c.encodeResponseErr != nil {
+		return nil, c.encodeResponseErr
+	}
+
+	return []byte{1}, nil
+}
+
+func (c *handlerTestCodec) DecodeResponse([]byte) (*protocol.Response, error) {
+	return nil, nil
+}
+
+func newTestIdempotencyExecutor(t *testing.T) *idempotency.Executor {
+	t.Helper()
+
+	executor, err := idempotency.NewExecutor(&idempotency.Config{})
+	if err != nil {
+		t.Fatalf("NewExecutor() error = %v", err)
+	}
+
+	return executor
+}
 
 func TestHandlerProcessesMultipleRequests(t *testing.T) {
 	serverSocket, clientSocket := net.Pipe()
@@ -688,5 +726,166 @@ func TestHandlerRejectsNilRequest(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestHandlerRejectsNilConnection(t *testing.T) {
+	handler, err := NewHandler(
+		engine.New(),
+		protobuf.New(),
+		newTestIdempotencyExecutor(t),
+	)
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+
+	if err := handler.Handle(nil); err == nil {
+		t.Fatal("expected error for nil connection")
+	}
+
+	var typedNilConnection *net.TCPConn
+
+	if err := handler.Handle(typedNilConnection); err == nil {
+		t.Fatal("expected error for typed nil connection")
+	}
+}
+
+func TestHandlerReturnsReadFrameError(t *testing.T) {
+	handler, err := NewHandler(
+		engine.New(),
+		protobuf.New(),
+		newTestIdempotencyExecutor(t),
+	)
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+
+	serverSocket, clientSocket := net.Pipe()
+
+	handlerDone := make(chan error, 1)
+
+	go func() {
+		handlerDone <- handler.Handle(serverSocket)
+	}()
+
+	// Envia somente parte do cabeçalho e encerra a conexão.
+	if _, err := clientSocket.Write([]byte{0, 0}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	if err := clientSocket.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if err := <-handlerDone; err == nil {
+		t.Fatal("expected read frame error")
+	}
+}
+
+func TestHandlerReturnsDecodeRequestError(t *testing.T) {
+	decodeErr := errors.New("decode failure")
+
+	handler, err := NewHandler(
+		engine.New(),
+		&handlerTestCodec{
+			decodeRequestErr: decodeErr,
+		},
+		newTestIdempotencyExecutor(t),
+	)
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+
+	serverSocket, clientSocket := net.Pipe()
+
+	handlerDone := make(chan error, 1)
+
+	go func() {
+		handlerDone <- handler.Handle(serverSocket)
+	}()
+
+	if err := transporttcp.WriteFrame(clientSocket, []byte{1}); err != nil {
+		t.Fatalf("WriteFrame() error = %v", err)
+	}
+
+	if err := <-handlerDone; !errors.Is(err, decodeErr) {
+		t.Errorf("Handle() error = %v, want %v", err, decodeErr)
+	}
+
+	_ = clientSocket.Close()
+}
+
+func TestHandlerReturnsEncodeResponseError(t *testing.T) {
+	encodeErr := errors.New("encode failure")
+
+	handler, err := NewHandler(
+		engine.New(),
+		&handlerTestCodec{
+			request: &protocol.Request{
+				RequestID: 1,
+				Command:   &protocol.PingCommand{},
+			},
+			encodeResponseErr: encodeErr,
+		},
+		newTestIdempotencyExecutor(t),
+	)
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+
+	serverSocket, clientSocket := net.Pipe()
+
+	handlerDone := make(chan error, 1)
+
+	go func() {
+		handlerDone <- handler.Handle(serverSocket)
+	}()
+
+	if err := transporttcp.WriteFrame(clientSocket, []byte{1}); err != nil {
+		t.Fatalf("WriteFrame() error = %v", err)
+	}
+
+	if err := <-handlerDone; !errors.Is(err, encodeErr) {
+		t.Errorf("Handle() error = %v, want %v", err, encodeErr)
+	}
+
+	_ = clientSocket.Close()
+}
+
+func TestHandlerReturnsWriteFrameError(t *testing.T) {
+	handler, err := NewHandler(
+		engine.New(),
+		&handlerTestCodec{
+			request: &protocol.Request{
+				RequestID: 1,
+				Command:   &protocol.PingCommand{},
+			},
+		},
+		newTestIdempotencyExecutor(t),
+	)
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+
+	serverSocket, clientSocket := net.Pipe()
+
+	handlerDone := make(chan error, 1)
+
+	go func() {
+		handlerDone <- handler.Handle(serverSocket)
+	}()
+
+	if err := transporttcp.WriteFrame(clientSocket, []byte{1}); err != nil {
+		t.Fatalf("WriteFrame() error = %v", err)
+	}
+
+	// O Handler já recebeu o frame. Fechar o cliente faz a escrita
+	// da resposta falhar.
+	if err := clientSocket.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if err := <-handlerDone; err == nil {
+		t.Fatal("expected write frame error")
 	}
 }

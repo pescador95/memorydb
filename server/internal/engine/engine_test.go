@@ -194,3 +194,99 @@ func TestRejectsMissingCommand(t *testing.T) {
 		t.Fatalf("expected INVALID_REQUEST, got %s", result.Code)
 	}
 }
+
+func TestRejectsNilCommands(t *testing.T) {
+	engine := New()
+
+	tests := []struct {
+		name    string
+		command protocol.Command
+	}{
+		{
+			name:    "PING",
+			command: (*protocol.PingCommand)(nil),
+		},
+		{
+			name:    "SET",
+			command: (*protocol.SetCommand)(nil),
+		},
+		{
+			name:    "GET",
+			command: (*protocol.GetCommand)(nil),
+		},
+		{
+			name:    "DELETE",
+			command: (*protocol.DeleteCommand)(nil),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := engine.Execute(&protocol.Request{
+				RequestID: 30,
+				Command:   tt.command,
+			})
+
+			if response.Success {
+				t.Fatal("expected request to fail")
+			}
+
+			if response.RequestID != 30 {
+				t.Fatalf("expected request ID 30, got %d", response.RequestID)
+			}
+
+			result, ok := response.Result.(*protocol.ErrorResult)
+			if !ok {
+				t.Fatalf("expected ErrorResult, got %T", response.Result)
+			}
+
+			if result.Code != ErrInvalidRequest {
+				t.Fatalf("expected INVALID_REQUEST, got %s", result.Code)
+			}
+		})
+	}
+}
+
+func TestRejectsEmptyKeyForGetAndDelete(t *testing.T) {
+	engine := New()
+
+	tests := []struct {
+		name    string
+		command protocol.Command
+	}{
+		{
+			name:    "GET",
+			command: &protocol.GetCommand{},
+		},
+		{
+			name:    "DELETE",
+			command: &protocol.DeleteCommand{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := engine.Execute(&protocol.Request{
+				RequestID: 40,
+				Command:   tt.command,
+			})
+
+			if response.Success {
+				t.Fatal("expected request to fail")
+			}
+
+			if response.RequestID != 40 {
+				t.Fatalf("expected request ID 40, got %d", response.RequestID)
+			}
+
+			result, ok := response.Result.(*protocol.ErrorResult)
+			if !ok {
+				t.Fatalf("expected ErrorResult, got %T", response.Result)
+			}
+
+			if result.Code != ErrInvalidArgument {
+				t.Fatalf("expected INVALID_ARGUMENT, got %s", result.Code)
+			}
+		})
+	}
+}

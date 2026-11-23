@@ -85,28 +85,6 @@ func (e *OperationOutcomeUnknownError) Unwrap() error {
 	return e.Cause
 }
 
-type partialWriteFailureConn struct {
-	net.Conn
-
-	writeCalls int
-	writeErr   error
-}
-
-func (c *partialWriteFailureConn) Write(p []byte) (int, error) {
-	c.writeCalls++
-
-	if c.writeCalls == 1 {
-		n := len(p) / 2
-		if n == 0 {
-			n = 1
-		}
-
-		return c.Conn.Write(p[:n])
-	}
-
-	return 0, c.writeErr
-}
-
 // Dial estabelece uma conexão TCP com o MemoryDB.
 //
 // Utiliza um contexto sem cancelamento para estabelecer a conexão.

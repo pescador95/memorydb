@@ -16,6 +16,251 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type cancelOnSecondErrContext struct {
+	context.Context
+	errCalls int
+}
+
+func (c *cancelOnSecondErrContext) Err() error {
+	c.errCalls++
+
+	if c.errCalls == 2 {
+		return context.Canceled
+	}
+
+	return nil
+}
+
+type signalingContext struct {
+	context.Context
+	checked    chan struct{}
+	doneCalled chan struct{}
+	once       sync.Once
+}
+
+func newSignalingContext(ctx context.Context) *signalingContext {
+	return &signalingContext{
+		Context:    ctx,
+		checked:    make(chan struct{}),
+		doneCalled: make(chan struct{}),
+	}
+}
+
+func (c *signalingContext) Err() error {
+	c.once.Do(func() {
+		close(c.checked)
+	})
+
+	return c.Context.Err()
+}
+
+func (c *signalingContext) Done() <-chan struct{} {
+	select {
+	case <-c.doneCalled:
+	default:
+		close(c.doneCalled)
+	}
+
+	return c.Context.Done()
+}
+
+type cancelOnThirdErrContext struct {
+	context.Context
+	mu       sync.Mutex
+	errCalls int
+	canceled bool
+	done     chan struct{}
+}
+
+func newCancelOnThirdErrContext() *cancelOnThirdErrContext {
+	return &cancelOnThirdErrContext{
+		Context: context.Background(),
+		done:    make(chan struct{}),
+	}
+}
+
+func (c *cancelOnThirdErrContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.errCalls++
+
+	if c.errCalls >= 3 && !c.canceled {
+		c.canceled = true
+		close(c.done)
+	}
+
+	if c.canceled {
+		return context.Canceled
+	}
+
+	return nil
+}
+
+func (c *cancelOnThirdErrContext) Done() <-chan struct{} {
+	return c.done
+}
+
+type cancelAndWaitForCloseConn struct {
+	net.Conn
+	remaining int
+	cancel    context.CancelFunc
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (c *cancelAndWaitForCloseConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+
+	if n > 0 {
+		c.remaining -= n
+
+		if c.remaining <= 0 {
+			c.cancel()
+			<-c.closed
+		}
+	}
+
+	return n, err
+}
+
+func (c *cancelAndWaitForCloseConn) Close() error {
+	err := c.Conn.Close()
+	c.closeOnce.Do(func() {
+		close(c.closed)
+	})
+	return err
+}
+
+type blockingWriteConn struct {
+	net.Conn
+
+	writeStarted chan struct{}
+	closed       chan struct{}
+
+	writeOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newBlockingWriteConn(conn net.Conn) *blockingWriteConn {
+	return &blockingWriteConn{
+		Conn:         conn,
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (c *blockingWriteConn) Write(p []byte) (int, error) {
+	c.writeOnce.Do(func() {
+		close(c.writeStarted)
+	})
+
+	// Simula uma escrita bloqueada até que a conexão seja encerrada.
+	<-c.closed
+
+	return 0, net.ErrClosed
+}
+
+func (c *blockingWriteConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+	})
+
+	return c.Conn.Close()
+}
+
+type callbackStartingContext struct {
+	context.Context
+
+	mu       sync.Mutex
+	done     chan struct{}
+	callback func()
+	canceled bool
+	started  chan struct{}
+}
+
+func newCallbackStartingContext() *callbackStartingContext {
+	return &callbackStartingContext{
+		Context: context.Background(),
+		done:    make(chan struct{}),
+		started: make(chan struct{}),
+	}
+}
+
+func (c *callbackStartingContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *callbackStartingContext) Err() error {
+	c.mu.Lock()
+
+	if c.canceled {
+		c.mu.Unlock()
+		return context.Canceled
+	}
+
+	if c.callback == nil {
+		c.mu.Unlock()
+		return nil
+	}
+
+	c.canceled = true
+	callback := c.callback
+	close(c.done)
+
+	c.mu.Unlock()
+
+	go func() {
+		close(c.started)
+		callback()
+	}()
+
+	<-c.started
+
+	return context.Canceled
+}
+
+func (c *callbackStartingContext) AfterFunc(f func()) func() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.callback = f
+
+	return func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if c.canceled {
+			return false
+		}
+
+		c.callback = nil
+		return true
+	}
+}
+
+type partialWriteFailureConn struct {
+	net.Conn
+
+	writeCalls int
+	writeErr   error
+}
+
+func (c *partialWriteFailureConn) Write(p []byte) (int, error) {
+	c.writeCalls++
+
+	if c.writeCalls == 1 {
+		n := len(p) / 2
+		if n == 0 {
+			n = 1
+		}
+
+		return c.Conn.Write(p[:n])
+	}
+
+	return 0, c.writeErr
+}
+
 // startTestServer inicia um servidor simulado para testar o driver.
 func startTestServer(t *testing.T, conn net.Conn) {
 	t.Helper()
@@ -808,22 +1053,36 @@ func TestClientOperationCanceledWhileWaiting(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	signalingCtx := newSignalingContext(ctx)
 
 	operationDone := make(chan error, 1)
 
 	go func() {
-		operationDone <- client.PingContext(ctx)
+		operationDone <- client.PingContext(signalingCtx)
 	}()
+
+	// Garante que acquireOperation já verificou o contexto
+	// e está prestes a aguardar o semáforo.
+	select {
+	case <-signalingCtx.doneCalled:
+	case <-time.After(2 * time.Second):
+		client.releaseOperation()
+		t.Fatal("operação não começou a aguardar o semáforo")
+	}
 
 	cancel()
 
 	select {
 	case err := <-operationDone:
 		if !errors.Is(err, context.Canceled) {
+			client.releaseOperation()
 			t.Fatalf("esperava context.Canceled, obtido: %v", err)
 		}
 
 	case <-time.After(2 * time.Second):
+		client.releaseOperation()
 		t.Fatal("operação não foi cancelada enquanto aguardava o semáforo")
 	}
 
@@ -984,43 +1243,6 @@ func TestClientDialContextRejectsNilContext(t *testing.T) {
 	}
 }
 
-type blockingWriteConn struct {
-	net.Conn
-
-	writeStarted chan struct{}
-	closed       chan struct{}
-
-	writeOnce sync.Once
-	closeOnce sync.Once
-}
-
-func newBlockingWriteConn(conn net.Conn) *blockingWriteConn {
-	return &blockingWriteConn{
-		Conn:         conn,
-		writeStarted: make(chan struct{}),
-		closed:       make(chan struct{}),
-	}
-}
-
-func (c *blockingWriteConn) Write(p []byte) (int, error) {
-	c.writeOnce.Do(func() {
-		close(c.writeStarted)
-	})
-
-	// Simula uma escrita bloqueada até que a conexão seja encerrada.
-	<-c.closed
-
-	return 0, net.ErrClosed
-}
-
-func (c *blockingWriteConn) Close() error {
-	c.closeOnce.Do(func() {
-		close(c.closed)
-	})
-
-	return c.Conn.Close()
-}
-
 func TestClientContextCancellationInterruptsBlockedWrite(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
@@ -1072,27 +1294,6 @@ func TestClientContextCancellationInterruptsBlockedWrite(t *testing.T) {
 	}
 }
 
-type cancelAfterReadConn struct {
-	net.Conn
-	remaining int
-	cancel    context.CancelFunc
-	once      sync.Once
-}
-
-func (c *cancelAfterReadConn) Read(p []byte) (int, error) {
-	n, err := c.Conn.Read(p)
-
-	if n > 0 {
-		c.remaining -= n
-
-		if c.remaining <= 0 {
-			c.once.Do(c.cancel)
-		}
-	}
-
-	return n, err
-}
-
 func TestClientCancellationDuringFinalResponseRead(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
@@ -1113,10 +1314,11 @@ func TestClientCancellationDuringFinalResponseRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	wrappedConn := &cancelAfterReadConn{
+	wrappedConn := &cancelAndWaitForCloseConn{
 		Conn:      clientConn,
 		remaining: 4 + len(responsePayload),
 		cancel:    cancel,
+		closed:    make(chan struct{}),
 	}
 
 	client, err := New(wrappedConn)
@@ -1146,47 +1348,34 @@ func TestClientCancellationDuringFinalResponseRead(t *testing.T) {
 
 	stateErr := client.checkState()
 
-	switch {
-	case err == nil:
-		// A conclusão da operação venceu a sincronização.
-		if stateErr != nil {
-			t.Fatalf(
-				"cliente deveria permanecer aberto após resposta válida: %v",
-				stateErr,
-			)
-		}
-
-	case errors.Is(err, context.Canceled):
-		// O cancelamento venceu a sincronização.
-		var outcomeErr *OperationOutcomeUnknownError
-
-		if !errors.As(err, &outcomeErr) {
-			t.Fatalf(
-				"esperava OperationOutcomeUnknownError, obtido: %T: %v",
-				err,
-				err,
-			)
-		}
-
-		if outcomeErr.RequestID != 1 {
-			t.Fatalf(
-				"request ID inesperado: obtido %d, esperado 1",
-				outcomeErr.RequestID,
-			)
-		}
-
-		if stateErr == nil ||
-			!strings.Contains(stateErr.Error(), "failed") {
-			t.Fatalf(
-				"cliente deveria estar em estado failed, obtido: %v",
-				stateErr,
-			)
-		}
-
-	default:
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf(
-			"esperava sucesso ou OperationOutcomeUnknownError com context.Canceled, obtido: %v",
+			"esperava OperationOutcomeUnknownError com context.Canceled, obtido: %T: %v",
 			err,
+			err,
+		)
+	}
+
+	var outcomeErr *OperationOutcomeUnknownError
+	if !errors.As(err, &outcomeErr) {
+		t.Fatalf(
+			"esperava OperationOutcomeUnknownError, obtido: %T: %v",
+			err,
+			err,
+		)
+	}
+
+	if outcomeErr.RequestID != 1 {
+		t.Fatalf(
+			"request ID inesperado: obtido %d, esperado 1",
+			outcomeErr.RequestID,
+		)
+	}
+
+	if stateErr == nil || !strings.Contains(stateErr.Error(), "failed") {
+		t.Fatalf(
+			"cliente deveria estar em estado failed, obtido: %v",
+			stateErr,
 		)
 	}
 }
@@ -1419,5 +1608,197 @@ func TestNewOperationID(t *testing.T) {
 
 	if first == second {
 		t.Fatal("identificadores gerados deveriam ser diferentes")
+	}
+}
+
+func TestServerErrorError(t *testing.T) {
+	err := &ServerError{
+		Code:    "TEST_ERROR",
+		Message: "mensagem de teste",
+	}
+
+	expected := "MemoryDB error [TEST_ERROR]: mensagem de teste"
+
+	if got := err.Error(); got != expected {
+		t.Fatalf("mensagem inesperada: obtida %q, esperada %q", got, expected)
+	}
+}
+
+func TestClientDial(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("criar listener: %v", err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	client, err := Dial(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial retornou erro: %v", err)
+	}
+	defer client.Close()
+
+	select {
+	case conn := <-accepted:
+		defer conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("servidor não aceitou a conexão")
+	}
+}
+
+func TestClientAcquireOperationRejectsNilContext(t *testing.T) {
+	client := newTestClient(t)
+
+	if err := client.acquireOperation(nil); err == nil {
+		t.Fatal("esperava erro para contexto nil")
+	}
+}
+
+func TestClientCheckStateRejectsInvalidState(t *testing.T) {
+	client := newTestClient(t)
+
+	client.stateMu.Lock()
+	client.state = clientState(255)
+	client.stateMu.Unlock()
+
+	err := client.checkState()
+	if err == nil {
+		t.Fatal("esperava erro para estado inválido")
+	}
+
+	if !strings.Contains(err.Error(), "invalid state") {
+		t.Fatalf("erro inesperado: %v", err)
+	}
+}
+
+func TestClientDeleteWithCanceledContext(t *testing.T) {
+	client := newTestClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	deleted, err := client.DeleteContext(
+		ctx,
+		newTestOperationID(t),
+		"user:1",
+	)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("esperava context.Canceled, obtido: %v", err)
+	}
+
+	if deleted {
+		t.Fatal("DELETE não deveria indicar remoção")
+	}
+
+	if err := client.checkState(); err != nil {
+		t.Fatalf("cliente não deveria ser invalidado: %v", err)
+	}
+}
+
+func TestClientRequestIDOverflow(t *testing.T) {
+	client := newTestClient(t)
+
+	client.requestID = ^uint64(0)
+
+	if err := client.Ping(); err != nil {
+		t.Fatalf("Ping retornou erro após overflow: %v", err)
+	}
+
+	if client.requestID != 1 {
+		t.Fatalf("requestID após overflow = %d, esperado 1", client.requestID)
+	}
+}
+
+func TestClientRejectsInvalidUTF8Request(t *testing.T) {
+	client := newTestClient(t)
+
+	invalidKey := string([]byte{0xff})
+
+	_, _, err := client.Get(invalidKey)
+	if err == nil {
+		t.Fatal("esperava erro ao serializar chave com UTF-8 inválido")
+	}
+
+	if !strings.Contains(err.Error(), "encode request") {
+		t.Fatalf("erro inesperado: %v", err)
+	}
+
+	if err := client.checkState(); err != nil {
+		t.Fatalf("cliente não deveria ser invalidado: %v", err)
+	}
+
+	if err := client.Ping(); err != nil {
+		t.Fatalf("cliente deveria continuar utilizável: %v", err)
+	}
+}
+
+func TestClientAcquireOperationReleasesGateAfterCancellation(t *testing.T) {
+	client := newTestClient(t)
+
+	ctx := &cancelOnSecondErrContext{
+		Context: context.Background(),
+	}
+
+	err := client.acquireOperation(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("esperava context.Canceled, obtido: %v", err)
+	}
+
+	if ctx.errCalls != 2 {
+		t.Fatalf("ctx.Err() chamado %d vezes, esperado 2", ctx.errCalls)
+	}
+
+	// Confirma que o semáforo foi liberado após o cancelamento.
+	if err := client.acquireOperation(context.Background()); err != nil {
+		t.Fatalf("semáforo deveria estar disponível: %v", err)
+	}
+
+	client.releaseOperation()
+}
+
+func TestClientCancellationBeforeCommunication(t *testing.T) {
+	client := newTestClient(t)
+	ctx := newCancelOnThirdErrContext()
+
+	err := client.PingContext(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("PingContext() error = %v, want %v", err, context.Canceled)
+	}
+
+	if err := client.checkState(); err != nil {
+		t.Fatalf("client state after cancellation = %v, want open", err)
+	}
+
+	if err := client.Ping(); err != nil {
+		t.Fatalf("Ping() after cancellation error = %v", err)
+	}
+}
+
+func TestClientCancellationWaitsForCallbackCompletion(t *testing.T) {
+	client := newTestClient(t)
+	ctx := newCallbackStartingContext()
+
+	err := client.PingContext(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("PingContext() error = %v, want %v", err, context.Canceled)
+	}
+
+	if err := client.checkState(); err != nil {
+		t.Fatalf("client state after cancellation = %v, want open", err)
+	}
+
+	if err := client.Ping(); err != nil {
+		t.Fatalf("Ping() after cancellation error = %v", err)
 	}
 }

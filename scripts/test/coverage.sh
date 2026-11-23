@@ -135,12 +135,83 @@ run_coverage() {
 
 run_coverage
 
-printf '\n===== RELATÓRIO HTML: server =====\n'
+printf '\n===== RELATÓRIOS HTML =====\n'
 
-go tool cover \
-    -html="$COVERAGE_DIR/server.out" \
-    -o="$COVERAGE_DIR/server.html"
+INDEX_FILE="$COVERAGE_DIR/index.html"
 
-printf 'Relatório gerado: %s\n' "$COVERAGE_DIR/server.html"
+cat > "$INDEX_FILE" <<'EOF'
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MemoryDB - Cobertura de Testes</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 0 20px;
+            line-height: 1.5;
+        }
+
+        h1 {
+            margin-bottom: 8px;
+        }
+
+        p {
+            color: #666;
+        }
+
+        ul {
+            padding-left: 20px;
+        }
+
+        li {
+            margin: 12px 0;
+        }
+
+        a {
+            color: #0969da;
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <h1>MemoryDB - Cobertura de Testes</h1>
+    <p>Relatórios individuais de cobertura por módulo.</p>
+    <ul>
+EOF
+
+for module in "${MODULES[@]}"; do
+    module_name="${module//\//_}"
+    profile="$COVERAGE_DIR/$module_name.out"
+    report="$COVERAGE_DIR/$module_name.html"
+
+    if [[ ! -f "$profile" ]]; then
+        printf 'ERRO: perfil de cobertura não encontrado: %s\n' \
+            "$profile" >&2
+        return 1
+    fi
+
+    go tool cover -html="$profile" -o="$report"
+
+    printf 'Relatório gerado: %s\n' "$report"
+
+    printf '        <li><a href="%s.html" target="_blank" rel="noopener noreferrer">%s</a></li>\n' \
+        "$module_name" "$module" >> "$INDEX_FILE"
+done
+
+cat >> "$INDEX_FILE" <<'EOF'
+    </ul>
+</body>
+</html>
+EOF
+
+printf 'Índice gerado: %s\n' "$INDEX_FILE"
 
 printf '\n===== ANÁLISE DE COBERTURA CONCLUÍDA =====\n'

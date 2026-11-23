@@ -45,10 +45,6 @@ func startTestServer(t *testing.T) *testServer {
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
-	if err != nil {
-		_ = listener.Close()
-		t.Fatalf("criar handler: %v", err)
-	}
 
 	server, err := servertcp.NewServer(listener, handler)
 	if err != nil {
@@ -151,6 +147,58 @@ func TestServerSetGetDelete(t *testing.T) {
 
 	if found {
 		t.Fatal("GET não deveria encontrar uma chave removida")
+	}
+}
+
+func TestServerSetIdempotencyAcrossTCP(t *testing.T) {
+	server := startTestServer(t)
+	client := server.newClient(t)
+
+	operationID := newOperationID(t)
+	key := "idempotencia:usuario:1"
+	value := []byte("valor original")
+
+	// Primeira execução: deve armazenar o valor.
+	if err := client.Set(operationID, key, value); err != nil {
+		t.Fatalf("primeiro SET: %v", err)
+	}
+
+	// Repetição da mesma operação lógica: deve retornar sucesso.
+	if err := client.Set(operationID, key, value); err != nil {
+		t.Fatalf("repetição do SET idempotente: %v", err)
+	}
+
+	// Mesmo identificador com conteúdo diferente: deve gerar conflito.
+	err := client.Set(operationID, key, []byte("valor conflitante"))
+	if err == nil {
+		t.Fatal("esperava conflito ao reutilizar OperationID com conteúdo diferente")
+	}
+
+	var serverErr *memorydb.ServerError
+	if !errors.As(err, &serverErr) {
+		t.Fatalf("erro = %T (%v), esperava *memorydb.ServerError", err, err)
+	}
+
+	if serverErr.Code != "OPERATION_ID_CONFLICT" {
+		t.Errorf(
+			"ServerError.Code = %q, esperado %q",
+			serverErr.Code,
+			"OPERATION_ID_CONFLICT",
+		)
+	}
+
+	// O conflito não deve alterar o valor originalmente armazenado.
+	got, found, err := client.Get(key)
+	if err != nil {
+		t.Fatalf("GET após conflito: %v", err)
+	}
+
+	if !found {
+		t.Fatal("GET deveria encontrar a chave")
+	}
+
+	if string(got) != string(value) {
+		t.Fatalf("valor após conflito = %q, esperado %q", got, value)
 	}
 }
 
