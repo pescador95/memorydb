@@ -8,17 +8,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/pescador95/memorydb/server/internal/codec/protobuf"
+	serverconfig "github.com/pescador95/memorydb/server/internal/config"
 	"github.com/pescador95/memorydb/server/internal/engine"
 	"github.com/pescador95/memorydb/server/internal/idempotency"
 	"github.com/pescador95/memorydb/server/internal/transport/tcp"
-)
-
-const (
-	defaultAddress  = ":6380"
-	shutdownTimeout = 10 * time.Second
 )
 
 // main inicia a aplicação MemoryDB.
@@ -30,21 +25,21 @@ func main() {
 
 // run configura as dependências e inicia o servidor.
 func run() error {
-	address := os.Getenv("MEMORYDB_ADDR")
-	if address == "" {
-		address = defaultAddress
+	config, err := serverconfig.Load()
+	if err != nil {
+		return fmt.Errorf("load server configuration: %w", err)
 	}
 
-	listener, err := net.Listen("tcp", address)
+	listener, err := net.Listen("tcp", config.Address)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", address, err)
+		return fmt.Errorf("listen on %s: %w", config.Address, err)
 	}
 	defer listener.Close()
 
 	messageCodec := protobuf.New()
 	commandEngine := engine.New()
 
-	executor, err := idempotency.NewExecutor(&idempotency.Config{})
+	executor, err := idempotency.NewExecutor(&config.Idempotency)
 	if err != nil {
 		return fmt.Errorf("create idempotency executor: %w", err)
 	}
@@ -86,7 +81,7 @@ func run() error {
 
 		shutdownCtx, cancel := context.WithTimeout(
 			context.Background(),
-			shutdownTimeout,
+			config.ShutdownTimeout,
 		)
 		defer cancel()
 

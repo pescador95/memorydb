@@ -6,14 +6,15 @@ MemoryDB é um banco de dados chave-valor em memória, implementado em Go. Na im
 
 A arquitetura separa responsabilidades de:
 
-- composição e ciclo de vida do servidor;
+- composição, configuração e ciclo de vida do servidor;
 - transporte TCP e framing;
 - codificação e decodificação de mensagens;
 - representação interna das solicitações e respostas;
 - execução dos comandos;
 - armazenamento em memória;
 - controle de idempotência para operações mutáveis;
-- comunicação de aplicações clientes por meio de um driver Go.
+- comunicação de aplicações clientes por meio de um driver Go;
+- definição compartilhada de nomes de variáveis de ambiente e valores padrão.
 
 O servidor mantém uma instância de `Engine`, que possui uma instância própria de `Storage`. Essa mesma instância de `Engine` é utilizada pelos handlers das conexões aceitas pelo servidor. Portanto, as conexões atendidas pelo mesmo processo compartilham o mesmo armazenamento.
 
@@ -23,39 +24,53 @@ As operações `PING` e `GET` não passam pelo Executor de idempotência.
 
 Os dados e os registros de idempotência permanecem exclusivamente na memória do processo. Não há persistência, recuperação após reinicialização ou replicação.
 
+As configurações operacionais do servidor e do cliente de demonstração são carregadas por seus respectivos pacotes de configuração. Os nomes das variáveis de ambiente e os valores padrão compartilhados são centralizados no módulo `shared`. O driver Go, por ser uma biblioteca, recebe suas configurações explicitamente por meio de sua API pública e não consulta diretamente o ambiente.
+
 A arquitetura descrita neste documento representa a implementação existente, não uma arquitetura-alvo.
 
 ## 2. Organização dos módulos Go
 
-O repositório utiliza múltiplos módulos Go coordenados pelo workspace da raiz (`go.work`).
+O repositório utiliza seis módulos Go coordenados pelo workspace da raiz (`go.work`).
 
 | Módulo | Diretório | Responsabilidade |
 |---|---|---|
-| Servidor | `server/` | Composição do servidor, execução de comandos, armazenamento, codec e integração TCP |
+| Servidor | `server/` | Composição do servidor, configuração, execução de comandos, armazenamento, codec e integração TCP |
 | Transporte TCP | `transport/tcp/go/` | Framing e abstração reutilizável de conexão TCP |
 | Driver Go | `drivers/go/` | Biblioteca cliente para aplicações Go |
 | Protocolo gerado | `protocol/generated/go/` | Tipos Go gerados a partir do schema Protobuf |
-| API de demonstração | `api/` | Executável que demonstra o uso do driver |
-| Contrato Protobuf | `protocol/proto/` | Schema independente da linguagem |
+| API de demonstração | `api/` | Executável que demonstra o uso do driver e carrega suas configurações |
+| Módulo compartilhado | `shared/` | Nomes de variáveis de ambiente e valores padrão compartilhados |
 
-Cada módulo mantém seu próprio `go.mod`. O `go.work` inclui os módulos locais utilizados no desenvolvimento e define substituições para dependências internas do projeto.
+O diretório `protocol/proto/` contém o contrato Protobuf independente da linguagem e não constitui um módulo Go separado.
+
+Cada módulo Go mantém seu próprio `go.mod`. O `go.work` inclui os módulos locais utilizados no desenvolvimento e define substituições para dependências internas do projeto.
 
 O driver e o servidor compartilham os módulos de transporte TCP e de tipos Protobuf gerados. O driver não importa os pacotes internos do servidor.
+
+O módulo `shared` centraliza definições utilizadas por mais de um componente. Atualmente, `shared/config` contém nomes de variáveis de ambiente e valores padrão compartilhados. A interpretação e a validação das configurações permanecem sob responsabilidade de cada componente consumidor.
 
 ### 2.1 Dependências entre módulos
 
 ```mermaid
 flowchart TD
     API["api/client"] --> Driver["drivers/go"]
+    API --> Shared["shared/config"]
     Driver --> TCP["transport/tcp/go"]
     Driver --> Generated["protocol/generated/go"]
 
     Server["server"] --> TCP
     Server --> Generated
+    Server --> Shared
 
     Schema["protocol/proto/memorydb/v1/memorydb.proto"]
     Schema -. geração .-> Generated
 ```
+
+O executável `api/client` carrega as configurações de conexão a partir do ambiente e injeta os valores obtidos na API pública do driver.
+
+O módulo `drivers/go` não depende de `shared/config` para ler variáveis de ambiente. Ele recebe endereço e timeout explicitamente por meio de `DialConfig`.
+
+O servidor utiliza `shared/config` para obter nomes de variáveis e valores padrão compartilhados, enquanto as configurações específicas do servidor são definidas e carregadas em `server/internal/config`.
 
 O schema `.proto` é a fonte do contrato externo. Os arquivos Go gerados devem ser tratados como artefatos de geração, não como arquivos para edição manual.
 
@@ -75,7 +90,8 @@ As responsabilidades internas do servidor estão distribuídas entre os seguinte
 
 | Pacote | Responsabilidade |
 |---|---|
-| `server/cmd/memorydb` | Inicialização, composição das dependências, configuração e encerramento |
+| `server/cmd/memorydb` | Inicialização, composição das dependências, carregamento de configurações e encerramento |
+| `server/internal/config` | Carregamento, aplicação de padrões e validação das configurações operacionais do servidor |
 | `server/internal/transport/tcp` | Aceitação de conexões e processamento de solicitações |
 | `server/internal/codec` | Contrato de codificação e decodificação |
 | `server/internal/codec/protobuf` | Adaptação entre o modelo interno e os tipos Protobuf |
@@ -92,6 +108,8 @@ flowchart TB
 
     subgraph Server["Módulo server"]
         Entry["cmd/memorydb"]
+        Config["internal/config"]
+        SharedConfig["shared/config"]
         TCPServer["transport/tcp.Server"]
         Handler["transport/tcp.Handler"]
         CodecPort["codec.Codec"]
@@ -105,6 +123,8 @@ flowchart TB
     TCPModule["Módulo transport/tcp/go"]
     Generated["Módulo protocol/generated/go"]
 
+    Entry --> Config
+    Config --> SharedConfig
     Entry --> TCPServer
     Entry --> Handler
     Entry --> Idempotency
@@ -137,22 +157,26 @@ O `Engine`, por outro lado, depende diretamente de `*storage.Storage`. Não exis
 
 O pacote `server/internal/idempotency` implementa o controle de idempotência das operações `SET` e `DELETE`.
 
-O Handler utiliza o Executor para reservar e verificar o `OperationID` antes de executar a operação no Engine. O Executor recebe a execução como uma função, mantendo o mecanismo de deduplicação desacoplado da implementação concreta do Engine.
+O Handler calcula o fingerprint da operação e utiliza o Executor para reservar e verificar o `OperationID` antes de executar a operação no Engine. O Executor recebe a execução como uma função, mantendo o mecanismo de deduplicação desacoplado da implementação concreta do Engine.
 
 O Executor mantém seus próprios registros em memória, separados dos dados de negócio armazenados pelo Storage.
 
 A instância do Executor é criada durante a composição do servidor e compartilhada entre os handlers das conexões aceitas pelo mesmo processo.
 
+Os nomes das variáveis de ambiente e os valores padrão compartilhados são definidos em `shared/config/defaults.go`. As regras de carregamento e validação específicas do servidor ficam em `server/internal/config/config.go`.
+
 ### 3.3 Responsabilidades do Handler, Executor e Engine
 
 A separação entre esses componentes é importante para compreender o fluxo de execução:
 
-- **Handler:** interpreta a solicitação interna, encaminha `SET` e `DELETE` ao Executor e executa diretamente no Engine os comandos `PING` e `GET`.
-- **Executor:** valida o identificador da operação, calcula e compara a identidade semântica da solicitação por meio do fingerprint, coordena operações concorrentes e controla os resultados armazenados para replay.
-- **Engine:** valida os comandos de negócio e executa suas operações sobre o Storage.
+- **Handler:** interpreta a solicitação interna, encaminha `SET` e `DELETE` ao fluxo de idempotência e executa diretamente no Engine os comandos `PING` e `GET`. Para operações mutáveis, calcula o fingerprint por meio de `idempotency.Fingerprint()` e fornece esse valor ao Executor.
+- **Executor:** valida o identificador da operação, compara fingerprints de operações previamente registradas, coordena operações concorrentes e controla a retenção, a capacidade e a reprodução dos resultados armazenados.
+- **Engine:** valida os comandos de negócio e executa suas operações sobre o Storage. Para operações mutáveis, é invocado pelo callback fornecido pelo Handler ao Executor.
 - **Storage:** mantém os dados chave-valor em memória e protege o acesso concorrente.
 
-O Engine não implementa idempotência e não valida o tamanho do `OperationID`. Essa responsabilidade pertence ao fluxo de idempotência utilizado pelo Handler.
+O cálculo do fingerprint é responsabilidade do fluxo de tratamento da solicitação, realizado pelo Handler por meio da função `idempotency.Fingerprint()`. O Executor recebe o fingerprint calculado e o utiliza para identificar repetições ou conflitos.
+
+O Engine não implementa idempotência e não valida o tamanho do `OperationID`. Essa responsabilidade pertence ao fluxo de idempotência utilizado pelo Handler e pelo Executor.
 
 ## 4. Transporte e contrato de comunicação
 
@@ -254,12 +278,13 @@ sequenceDiagram
     P-->>H: Request interno
 
     alt SET ou DELETE
-        H->>I: Execute(OperationID, RequestID, Fingerprint)
+        H->>H: Calcular fingerprint
+        H->>I: Execute(OperationID, RequestID, Fingerprint, callback)
         I->>I: Validar identificador e fingerprint
 
         alt Operação inédita
             I->>I: Reservar identificador
-            I->>E: Executar operação
+            I->>E: Executar callback
             E->>St: Mutação
             St-->>E: Resultado
             E-->>I: Response
@@ -286,9 +311,9 @@ sequenceDiagram
     H-->>C: Response TCP
 ```
 
-Para `SET` e `DELETE`, o Handler calcula o fingerprint da operação e solicita sua execução ao Executor de idempotência.
+Para `SET` e `DELETE`, o Handler calcula o fingerprint da operação por meio de `idempotency.Fingerprint()` e solicita sua execução ao Executor de idempotência, fornecendo o `OperationID`, o `RequestID`, o fingerprint e uma função que executa a operação no Engine.
 
-O Executor valida o `OperationID` e coordena a reserva do identificador. A reserva ocorre atomicamente antes da invocação do Engine. A execução da operação ocorre fora do mutex interno do Executor, permitindo que operações distintas avancem concorrentemente.
+O Executor valida o `OperationID` e coordena atomicamente a reserva do identificador. A execução da operação ocorre fora do mutex interno do Executor, por meio do callback fornecido pelo Handler, permitindo que operações distintas avancem concorrentemente.
 
 Quando uma operação com o mesmo identificador e fingerprint já está em andamento, a nova tentativa aguarda sua conclusão. Quando já existe um resultado terminal registrado, ele é reproduzido sem executar novamente a mutação.
 
@@ -361,10 +386,29 @@ O módulo `drivers/go` fornece uma biblioteca para aplicações Go se comunicare
 
 O driver depende do transporte TCP reutilizável e dos tipos Protobuf gerados. Não depende dos pacotes internos do servidor.
 
-A API inclui:
+A API de conexão inclui:
 
-- `Dial` e `DialContext`;
-- `New`;
+- `Dial(address)`;
+- `DialContext(ctx, address)`;
+- `DialWithConfig(config)`;
+- `DialContextWithConfig(ctx, config)`;
+- `New(conn)`.
+
+As funções `Dial` e `DialContext` são mantidas para compatibilidade com a API anterior. As funções `DialWithConfig` e `DialContextWithConfig` permitem configurar explicitamente o endereço e o timeout de estabelecimento da conexão.
+
+A configuração pública de conexão é representada por `DialConfig`, que contém:
+
+| Campo | Tipo | Responsabilidade |
+|---|---|---|
+| `Address` | `string` | Endereço TCP do servidor |
+| `Timeout` | `time.Duration` | Timeout para estabelecimento da conexão |
+
+A configuração é fornecida pela aplicação consumidora. O driver não lê variáveis de ambiente nem aplica padrões operacionais específicos do executável de demonstração.
+
+Um timeout igual a zero representa ausência de timeout específico no `net.Dialer`, mantendo o comportamento anterior. Valores negativos são rejeitados.
+
+A API também inclui:
+
 - `Close`;
 - `Ping` e `PingContext`;
 - `Set` e `SetContext`;
@@ -462,29 +506,41 @@ O erro `OPERATION_OUTCOME_UNKNOWN` retornado pelo servidor e o erro local `Opera
 
 O executável está em `server/cmd/memorydb/main.go`.
 
-A configuração de endereço utiliza:
+As configurações operacionais são carregadas pelo pacote `server/internal/config`, implementado em `server/internal/config/config.go`.
 
-| Configuração | Comportamento |
-|---|---|
-| `MEMORYDB_ADDR` | Endereço TCP utilizado pelo listener |
-| Valor padrão | `:6380` |
+Os nomes das variáveis de ambiente e os valores padrão compartilhados são definidos em `shared/config/defaults.go`.
+
+As variáveis podem ser definidas no ambiente de execução. Quando uma variável está ausente ou vazia, seu valor padrão é utilizado. Valores explicitamente informados, mas inválidos, impedem a inicialização.
+
+| Variável | Padrão | Descrição |
+|---|---:|---|
+| `MEMORYDB_ADDR` | `:6380` | Endereço TCP utilizado pelo listener |
+| `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Tempo máximo aguardado pelo encerramento gracioso |
+| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência após a conclusão |
+| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros de idempotência |
+
+As durações utilizam o formato aceito por `time.ParseDuration`, como `5s`, `30s`, `2m` e `24h`. Os valores de duração devem ser positivos. A capacidade deve ser um inteiro positivo.
+
+A ausência ou o valor vazio de uma variável utiliza o padrão correspondente. Um valor explicitamente informado que não possa ser interpretado ou que não satisfaça as validações resulta em erro de configuração.
+
+A configuração do endereço é carregada como texto. A validação de sua utilização como endereço TCP ocorre quando o executável tenta criar o listener por meio de `net.Listen`.
 
 O ponto de entrada realiza a composição do servidor:
 
-1. lê a configuração do endereço TCP;
-2. cria o listener TCP;
+1. carrega e valida as configurações operacionais;
+2. cria o listener TCP utilizando o endereço configurado;
 3. instancia o codec Protobuf;
 4. instancia o Engine;
-5. cria uma instância compartilhada do Executor de idempotência;
+5. cria uma instância compartilhada do Executor de idempotência, utilizando os parâmetros configurados;
 6. cria o Handler, injetando Engine, Codec e Executor;
 7. cria o servidor;
 8. inicia `Server.Serve()` em uma goroutine;
 9. trata `SIGINT` e `SIGTERM`;
-10. solicita encerramento com timeout de 10 segundos.
+10. solicita encerramento com o timeout configurado.
 
 O Executor é criado uma única vez durante a composição do servidor e compartilhado pelos handlers das conexões atendidas pelo mesmo processo.
 
-### 8.1 Semântica do shutdown
+### 8.1. Semântica do shutdown
 
 `Server.Shutdown(ctx)` marca o servidor como encerrando, fecha o listener e aguarda a conclusão das conexões ativas.
 
@@ -492,7 +548,7 @@ O método não fecha diretamente as conexões ativas.
 
 Se uma conexão não terminar, o método pode retornar o erro do contexto quando o prazo expirar, enquanto a conexão permanece aberta. Não há atualmente uma etapa de encerramento forçado das conexões ativas.
 
-O encerramento gracioso, portanto, depende de as conexões terminarem por conta própria dentro do prazo.
+O encerramento gracioso, portanto, depende de as conexões terminarem por conta própria dentro do prazo configurado.
 
 ## 9. Limites arquiteturais atuais
 
@@ -508,7 +564,8 @@ O encerramento gracioso, portanto, depende de as conexões terminarem por conta 
 | Deduplicação server-side | Implementada na instância do servidor |
 | Retry automático | Não implementado |
 | Multiplexação | Não implementada |
-| Timeouts de I/O configuráveis no servidor | Não identificados na implementação atual |
+| Timeout de estabelecimento de conexão do cliente | Configurável por `DialConfig` |
+| Timeouts de leitura e escrita TCP configuráveis no servidor | Não identificados na implementação atual |
 | Observabilidade estruturada por conexão | Não implementada no fluxo atual |
 | Shutdown forçado de conexões | Não implementado |
 
@@ -528,7 +585,7 @@ O `RequestID` continua sendo utilizado para correlacionar cada tentativa com sua
 
 #### Fingerprint
 
-O Executor utiliza um fingerprint SHA-256 determinístico para identificar os parâmetros semânticos da operação.
+O Handler utiliza `idempotency.Fingerprint()` para calcular um fingerprint SHA-256 determinístico dos campos semânticos da operação.
 
 O fingerprint considera:
 
@@ -541,14 +598,18 @@ O `OperationID` não integra o fingerprint.
 
 O fingerprint permite verificar se uma tentativa que reutiliza um identificador corresponde à mesma operação lógica. A utilização de um identificador já registrado com parâmetros diferentes resulta em conflito.
 
+O Executor recebe o fingerprint calculado pelo Handler e o utiliza para comparar a operação recebida com os registros existentes.
+
 #### Retenção e capacidade
 
 A implementação utiliza:
 
-- retenção de 24 horas após a conclusão da operação;
+- retenção padrão de 24 horas após a conclusão da operação;
 - capacidade padrão de 100.000 registros;
 - armazenamento exclusivamente em memória;
 - compartilhamento dos registros entre as conexões da mesma instância.
+
+A retenção e a capacidade podem ser configuradas no servidor por meio das variáveis `MEMORYDB_IDEMPOTENCY_RETENTION` e `MEMORYDB_IDEMPOTENCY_CAPACITY`, respectivamente.
 
 A capacidade contabiliza operações em andamento e concluídas.
 

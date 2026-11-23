@@ -14,6 +14,8 @@ A implementação atual oferece:
 - Atendimento concorrente de múltiplas conexões.
 - Driver cliente para aplicações Go.
 - Operações do driver com suporte a `context.Context`.
+- Configuração operacional por variáveis de ambiente nos executáveis do servidor e do cliente de demonstração.
+- Configuração explícita de conexão pela API pública do driver Go.
 - Idempotência server-side para SET e DELETE, por meio de `OperationID`.
 - Deduplicação de operações e reprodução de respostas enquanto os registros estão retidos.
 - Tratamento de erros de aplicação, falhas de comunicação e resultados indeterminados.
@@ -60,13 +62,47 @@ Linux:
 MEMORYDB_ADDR=127.0.0.1:6380 go run ./cmd/memorydb
 ```
 
-Para remover a variável na sessão atual do PowerShell:
+Também é possível configurar o encerramento gracioso e o Executor de idempotência.
+
+| Variável | Padrão | Descrição |
+|---|---:|---|
+| `MEMORYDB_ADDR` | `:6380` | Endereço TCP no qual o servidor escuta |
+| `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Tempo máximo aguardado pelo encerramento gracioso |
+| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência |
+| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros de idempotência |
+
+Exemplo PowerShell:
+
+```powershell
+$env:MEMORYDB_ADDR = "127.0.0.1:6381"
+$env:MEMORYDB_SHUTDOWN_TIMEOUT = "15s"
+$env:MEMORYDB_IDEMPOTENCY_RETENTION = "48h"
+$env:MEMORYDB_IDEMPOTENCY_CAPACITY = "200000"
+
+go run ./cmd/memorydb
+```
+
+Exemplo Linux:
+
+```bash
+MEMORYDB_ADDR=127.0.0.1:6381 \
+MEMORYDB_SHUTDOWN_TIMEOUT=15s \
+MEMORYDB_IDEMPOTENCY_RETENTION=48h \
+MEMORYDB_IDEMPOTENCY_CAPACITY=200000 \
+go run ./cmd/memorydb
+```
+
+As variáveis ausentes ou vazias utilizam seus respectivos valores padrão. Valores explicitamente informados, mas inválidos, impedem a inicialização do servidor.
+
+As configurações de duração aceitam os formatos reconhecidos por `time.ParseDuration`, como `5s`, `10m` e `24h`. Os valores de duração e capacidade devem ser positivos.
+
+Para remover uma variável na sessão atual do PowerShell:
 
 ```powershell
 Remove-Item Env:MEMORYDB_ADDR
 ```
 
-O endereço padrão e a variável de ambiente são definidos em `server/cmd/memorydb/main.go`.
+As configurações e seus valores padrão são implementados em `server/internal/config` e `shared/config`.
 
 **Segurança:** o servidor não possui autenticação, autorização ou TLS. Escutar em todas as interfaces pode permitir que outros equipamentos alcancem o serviço, dependendo da configuração da rede e do firewall. Não exponha o MemoryDB a redes não confiáveis.
 
@@ -78,13 +114,13 @@ Quando o servidor inicia corretamente, registra uma mensagem semelhante a:
 MemoryDB listening on [endereço]
 ```
 
-Se a porta estiver ocupada ou o endereço for inválido, o processo retorna um erro de inicialização.
+Se a porta estiver ocupada, o endereço for inválido ou alguma configuração não puder ser validada, o processo retorna um erro de inicialização.
 
 ### 3.3. Encerrar
 
 No terminal em que o servidor está em execução, pressione `Ctrl+C`.
 
-O executável trata SIGINT e SIGTERM e solicita o encerramento do servidor com timeout de 10 segundos.
+O executável trata SIGINT e SIGTERM e solicita o encerramento do servidor com o timeout configurado em `MEMORYDB_SHUTDOWN_TIMEOUT`. O padrão é 10 segundos.
 
 O shutdown fecha o listener e aguarda as conexões ativas terminarem. Se o prazo expirar, o servidor retorna erro; a implementação não força diretamente o fechamento das conexões ativas. O executável trata esse erro como falha e encerra pelo caminho de erro.
 
@@ -110,15 +146,43 @@ O cliente demonstra:
 
 O cliente gera `OperationID` para as operações SET e DELETE.
 
-O endereço utilizado é fixo: `127.0.0.1:6380`, definido em `api/client/main.go`.
+O cliente de demonstração utiliza as seguintes variáveis de ambiente:
 
-**Importante:** alterar `MEMORYDB_ADDR` no servidor não altera automaticamente o endereço utilizado pelo cliente de demonstração. Se o servidor estiver em outro endereço, o exemplo deverá ser ajustado.
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `MEMORYDB_CLIENT_ADDR` | `127.0.0.1:6380` | Endereço TCP do servidor MemoryDB |
+| `MEMORYDB_DIAL_TIMEOUT` | `5s` | Tempo máximo para estabelecer a conexão |
+
+Exemplo PowerShell:
+
+```powershell
+$env:MEMORYDB_CLIENT_ADDR = "127.0.0.1:6381"
+$env:MEMORYDB_DIAL_TIMEOUT = "10s"
+
+go run ./client
+```
+
+Exemplo Linux:
+
+```bash
+MEMORYDB_CLIENT_ADDR=127.0.0.1:6381 \
+MEMORYDB_DIAL_TIMEOUT=10s \
+go run ./client
+```
+
+As variáveis ausentes ou vazias utilizam seus respectivos valores padrão. Um timeout explicitamente informado, mas inválido ou não positivo, impede a execução do cliente.
+
+**Importante:** `MEMORYDB_ADDR` configura o endereço no qual o servidor escuta, enquanto `MEMORYDB_CLIENT_ADDR` configura o endereço ao qual o cliente de demonstração se conecta. Alterar a configuração do servidor não altera automaticamente a configuração do cliente.
+
+Se o servidor utilizar um endereço diferente do padrão, configure o endereço correspondente no cliente de demonstração.
 
 ## 5. Utilizar o driver Go em outra aplicação
 
 O módulo `drivers/go` disponibiliza uma biblioteca cliente para aplicações Go. Ele abstrai a conexão TCP, o framing e a serialização Protobuf.
 
 O driver não mantém o armazenamento localmente: as operações são encaminhadas ao servidor MemoryDB.
+
+O driver não realiza leitura automática de variáveis de ambiente. A aplicação consumidora deve fornecer explicitamente o endereço e, quando necessário, o timeout de conexão.
 
 ### 5.1. Instalação
 
@@ -163,9 +227,10 @@ O alias `memorydb` facilita a identificação dos tipos e funções da bibliotec
 
 ### 5.3. Métodos disponíveis
 
-| Operação | Método convencional | Método com contexto |
+| Operação | Método convencional | Método com contexto ou configuração |
 |---|---|---|
 | Conectar | `Dial(address)` | `DialContext(ctx, address)` |
+| Conectar com configuração | `DialWithConfig(config)` | `DialContextWithConfig(ctx, config)` |
 | Criar client a partir de conexão | `New(conn)` | — |
 | Verificar comunicação | `Ping()` | `PingContext(ctx)` |
 | Armazenar | `Set(operationID, key, value)` | `SetContext(ctx, operationID, key, value)` |
@@ -177,7 +242,37 @@ Os métodos sem contexto utilizam `context.Background()` internamente.
 
 `New(conn)` recebe uma conexão `net.Conn` existente e transfere sua propriedade ao client. Quando `Close()` for chamado, a conexão será encerrada.
 
-As operações `SET` e `DELETE` exigem um `OperationID`, utilizado pelo servidor para identificar uma operação lógica e evitar sua execução duplicada enquanto o registro correspondente estiver retido.
+Para configurar o estabelecimento da conexão, o driver disponibiliza o tipo `DialConfig`:
+
+```go
+type DialConfig struct {
+    Address string
+    Timeout time.Duration
+}
+```
+
+O campo `Address` informa o endereço TCP do servidor. O campo `Timeout` define o timeout utilizado para estabelecer a conexão.
+
+Um timeout igual a zero não estabelece um timeout próprio para a conexão. Valores negativos são inválidos.
+
+Exemplo:
+
+```go
+config := memorydb.DialConfig{
+    Address: "127.0.0.1:6380",
+    Timeout: 5 * time.Second,
+}
+
+client, err := memorydb.DialWithConfig(config)
+if err != nil {
+    return err
+}
+defer client.Close()
+```
+
+A aplicação consumidora pode carregar essas configurações de variáveis de ambiente, arquivos ou qualquer outro mecanismo de configuração e injetá-las no driver. A biblioteca não assume essa responsabilidade.
+
+As operações SET e DELETE exigem um `OperationID`, utilizado pelo servidor para identificar uma operação lógica e evitar sua execução duplicada enquanto o registro correspondente estiver retido.
 
 O tipo `memorydb.OperationID` possui 16 bytes. A função `memorydb.NewOperationID()` gera um identificador aleatório utilizando `crypto/rand`.
 
@@ -310,6 +405,30 @@ func main() {
 `DialContext` utiliza o contexto somente durante o estabelecimento da conexão. O contexto não fica associado ao client para controlar as operações posteriores.
 
 Para controlar cada operação, utilize os métodos específicos que recebem contexto.
+
+Quando for necessário combinar contexto e timeout explícito de conexão, utilize `DialContextWithConfig`:
+
+```go
+ctx, cancel := context.WithTimeout(
+    context.Background(),
+    10*time.Second,
+)
+defer cancel()
+
+client, err := memorydb.DialContextWithConfig(
+    ctx,
+    memorydb.DialConfig{
+        Address: "127.0.0.1:6380",
+        Timeout: 5 * time.Second,
+    },
+)
+if err != nil {
+    return err
+}
+defer client.Close()
+```
+
+O contexto continua controlando o cancelamento e o deadline da tentativa de conexão, enquanto `DialConfig.Timeout` configura o timeout do dialer.
 
 ## 6. Semântica dos comandos
 
@@ -547,6 +666,25 @@ Operações em andamento não expiram enquanto estiverem sendo executadas.
 
 A capacidade considera tanto operações em andamento quanto operações concluídas ainda retidas.
 
+Os parâmetros de retenção e capacidade podem ser alterados por variáveis de ambiente no servidor:
+
+| Variável | Padrão | Descrição |
+|---|---:|---|
+| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros concluídos |
+| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros |
+
+Exemplo:
+
+```bash
+MEMORYDB_IDEMPOTENCY_RETENTION=48h \
+MEMORYDB_IDEMPOTENCY_CAPACITY=200000 \
+go run ./cmd/memorydb
+```
+
+As durações aceitam os formatos reconhecidos por `time.ParseDuration`. A capacidade deve ser um inteiro positivo.
+
+Variáveis ausentes ou vazias utilizam os valores padrão. Valores explicitamente informados, mas inválidos ou não positivos, impedem a inicialização do servidor.
+
 Quando a capacidade está esgotada:
 
 - Novos identificadores são rejeitados.
@@ -556,7 +694,7 @@ Quando a capacidade está esgotada:
 
 O servidor não remove antecipadamente registros válidos apenas para liberar espaço.
 
-Os valores apresentados são os padrões da implementação atual. Não representam parâmetros configuráveis por variável de ambiente ou pela API pública do servidor.
+Os valores apresentados são os padrões da implementação atual, podendo ser alterados pelas variáveis de ambiente do servidor. Não existe, nesta etapa, uma API pública do driver para modificar a configuração do Executor.
 
 ### 8.6. Erros relacionados à idempotência
 
@@ -606,7 +744,7 @@ O client possui três estados internos:
 
 Clientes nos estados `closed` e `failed` não devem ser reutilizados.
 
-Após uma falha que invalide o client, crie uma nova conexão com `Dial` ou `DialContext`.
+Após uma falha que invalide o client, crie uma nova conexão com `Dial`, `DialContext`, `DialWithConfig` ou `DialContextWithConfig`.
 
 A idempotência server-side não altera o comportamento de serialização das operações na conexão. Ela permite reconhecer novas tentativas de uma operação lógica mesmo quando realizadas por uma nova conexão, desde que o registro correspondente ainda esteja retido na mesma instância do servidor.
 
@@ -683,7 +821,7 @@ Para SET e DELETE, o MemoryDB oferece idempotência server-side por meio do `ope
 
 Se o servidor ainda possuir o registro, reconhecerá a operação duplicada e reproduzirá a resposta armazenada, sem executar novamente a mutação.
 
-Essa recuperação depende de o registro original continuar disponível na memória da mesma instância. A retenção é de 24 horas após a conclusão, e os registros são perdidos em caso de reinicialização.
+Essa recuperação depende de o registro original continuar disponível na memória da mesma instância. A retenção padrão é de 24 horas após a conclusão, podendo ser alterada pela configuração do servidor. Os registros são perdidos em caso de reinicialização.
 
 O driver não executa retry automático. A geração e a reutilização do `OperationID` são responsabilidade da aplicação consumidora.
 
@@ -711,8 +849,13 @@ Depois de uma falha de comunicação ou cancelamento durante I/O, não reutilize
 | Situação | Causa provável | Ação recomendada |
 |---|---|---|
 | Servidor não está ativo | Processo não iniciado ou encerrado | Inicie o servidor e verifique o endereço |
-| Conexão recusada | Endereço ou porta incorretos, ou serviço indisponível | Confira `MEMORYDB_ADDR` e o endereço utilizado pelo client |
+| Conexão recusada | Endereço ou porta incorretos, ou serviço indisponível | Confira `MEMORYDB_ADDR` e `MEMORYDB_CLIENT_ADDR` |
 | Porta ocupada | Outro processo está utilizando a porta | Escolha outra porta ou encerre o processo conflitante |
+| Configuração de endereço inválida | Endereço informado incorretamente | Confira `MEMORYDB_ADDR` ou `MEMORYDB_CLIENT_ADDR` |
+| Timeout de conexão inválido | Valor inválido ou não positivo | Confira `MEMORYDB_DIAL_TIMEOUT` |
+| Timeout de shutdown inválido | Duração inválida ou não positiva | Confira `MEMORYDB_SHUTDOWN_TIMEOUT` |
+| Configuração de retenção inválida | Duração inválida ou não positiva | Confira `MEMORYDB_IDEMPOTENCY_RETENTION` |
+| Capacidade de idempotência inválida | Valor não inteiro ou não positivo | Confira `MEMORYDB_IDEMPOTENCY_CAPACITY` |
 | Chave vazia | SET, GET ou DELETE recebeu uma chave vazia | Envie uma chave não vazia |
 | TTL positivo | Funcionalidade ainda não implementada | Utilize `ttl_ms = 0` |
 | OperationID inválido | Identificador ausente ou diferente de 16 bytes | Gere um identificador com `memorydb.NewOperationID()` |
@@ -753,13 +896,14 @@ A implementação atual possui as seguintes limitações:
 - **Sem reconexão automática:** conexões interrompidas não são restabelecidas automaticamente.
 - **Sem retry automático:** comandos não são repetidos após falhas de comunicação. A aplicação consumidora controla novas tentativas.
 - **Idempotência limitada:** o mecanismo está disponível somente para SET e DELETE.
-- **Retenção de idempotência:** registros concluídos são mantidos por 24 horas após a conclusão.
-- **Capacidade de idempotência:** a configuração padrão permite até 100.000 registros por instância, incluindo operações em andamento.
+- **Retenção de idempotência:** registros concluídos são mantidos por 24 horas por padrão, com possibilidade de configuração por variável de ambiente.
+- **Capacidade de idempotência:** a configuração padrão permite até 100.000 registros por instância, incluindo operações em andamento. O limite pode ser alterado por variável de ambiente.
 - **Sem persistência da idempotência:** os registros são mantidos somente em memória e são perdidos quando o processo termina ou reinicia.
 - **Sem garantia após expiração:** depois da remoção de um registro expirado, o mesmo `OperationID` poderá ser tratado como uma nova operação.
 - **Sem garantia de execução exatamente uma vez:** a proteção contra duplicação é limitada à existência do registro na memória da instância.
 - **Resultado indeterminado:** uma interrupção durante a comunicação pode impedir que o cliente saiba se o comando foi executado.
-- **Cliente de demonstração com endereço fixo:** utiliza `127.0.0.1:6380`.
+- **Sem API pública de configuração do Executor:** os parâmetros de idempotência são configurados no servidor, não pelo driver.
+- **Sem configuração automática por ambiente no driver:** a biblioteca recebe endereço e timeout explicitamente. A aplicação consumidora é responsável por obter e fornecer esses valores.
 - **Sem interface HTTP ou REST:** o protocolo disponível é TCP com framing e Protobuf.
 - **Sem driver Java implementado e validado nesta etapa:** a integração Java não faz parte do escopo funcional atual.
 
@@ -805,6 +949,12 @@ Para SET e DELETE, uma nova tentativa pode utilizar o mesmo `OperationID` e os m
 
 Não. Ele controla somente o estabelecimento da conexão. Para controlar operações posteriores, utilize `PingContext`, `SetContext`, `GetContext` ou `DeleteContext`.
 
+### Posso configurar o timeout de conexão pelo driver?
+
+Sim. Utilize `DialConfig` com `DialWithConfig` ou `DialContextWithConfig`.
+
+O driver não lê variáveis de ambiente automaticamente. A aplicação consumidora deve obter o valor desejado e fornecê-lo na configuração.
+
 ### O driver reconecta automaticamente?
 
 Não. Após falha de comunicação ou cancelamento durante I/O, é necessário criar um novo client.
@@ -823,11 +973,15 @@ Não. Para repetir uma operação cujo resultado seja desconhecido, reutilize o 
 
 ### Por quanto tempo o servidor mantém um OperationID?
 
-O servidor mantém os registros de operações concluídas por 24 horas após sua conclusão. Operações em andamento não expiram enquanto estiverem sendo executadas.
+O servidor mantém os registros de operações concluídas por 24 horas por padrão. Esse período pode ser alterado por `MEMORYDB_IDEMPOTENCY_RETENTION`.
+
+Operações em andamento não expiram enquanto estiverem sendo executadas.
 
 ### Existe limite de OperationIDs?
 
-Sim. A capacidade padrão é de 100.000 registros por instância, incluindo operações em andamento. Quando a capacidade está esgotada, novas operações são rejeitadas até que haja espaço disponível. O identificador rejeitado não é reservado.
+Sim. A capacidade padrão é de 100.000 registros por instância, incluindo operações em andamento. O limite pode ser alterado por `MEMORYDB_IDEMPOTENCY_CAPACITY`.
+
+Quando a capacidade está esgotada, novas operações são rejeitadas até que haja espaço disponível. O identificador rejeitado não é reservado.
 
 ### O que acontece quando a capacidade de idempotência está esgotada?
 
@@ -859,13 +1013,34 @@ Não gere um novo `OperationID` para repetir a mesma operação lógica. Para PI
 
 ### O que acontece quando o servidor é encerrado?
 
-O servidor fecha o listener e aguarda as conexões ativas, respeitando o timeout de 10 segundos. Se o contexto expirar, o executável trata o erro e encerra pelo caminho de falha. O shutdown não força diretamente o fechamento das conexões ativas.
+O servidor fecha o listener e aguarda as conexões ativas, respeitando o timeout configurado por `MEMORYDB_SHUTDOWN_TIMEOUT`, cujo padrão é 10 segundos.
+
+Se o contexto expirar, o executável trata o erro e encerra pelo caminho de falha. O shutdown não força diretamente o fechamento das conexões ativas.
 
 Os dados em memória e os registros de idempotência são perdidos quando o processo termina.
 
-Para executar os testes automatizados, também são necessários:
+### Como configurar o endereço do servidor e do cliente?
 
-- Bash disponível no ambiente.
+O servidor utiliza `MEMORYDB_ADDR`, cujo padrão é `:6380`.
+
+O cliente de demonstração utiliza `MEMORYDB_CLIENT_ADDR`, cujo padrão é `127.0.0.1:6380`.
+
+As variáveis são independentes. Quando o servidor utilizar um endereço diferente do padrão, configure o endereço correspondente no cliente.
+
+### Quais são os valores padrão das configurações?
+
+| Configuração | Variável | Padrão |
+|---|---|---:|
+| Endereço do servidor | `MEMORYDB_ADDR` | `:6380` |
+| Endereço do cliente de demonstração | `MEMORYDB_CLIENT_ADDR` | `127.0.0.1:6380` |
+| Timeout de conexão do cliente | `MEMORYDB_DIAL_TIMEOUT` | `5s` |
+| Timeout de shutdown | `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` |
+| Retenção de idempotência | `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` |
+| Capacidade de idempotência | `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` |
+
+Variáveis ausentes ou vazias utilizam seus respectivos padrões. Valores explicitamente informados, mas inválidos, provocam erro de configuração.
+
+Para executar os testes automatizados, também é necessário ter Bash disponível no ambiente.
 
 ## 14. Executar testes e validar o projeto
 
@@ -887,7 +1062,7 @@ Esse comando executa o pipeline completo, composto pelas seguintes etapas:
 6. **coverage:** executa os testes e gera relatórios de cobertura.
 7. **uncovered:** identifica arquivos e blocos de código não cobertos pelos testes.
 
-O pipeline percorre os cinco módulos Go do workspace e interrompe a execução quando alguma etapa falha.
+O pipeline percorre os seis módulos Go do workspace e interrompe a execução quando alguma etapa falha.
 
 ### 14.1. Executar uma etapa específica
 
@@ -925,7 +1100,7 @@ Os relatórios são artefatos locais de execução e não devem ser versionados 
 
 ### 14.3. Documentação dos testes
 
-O detalhamento dos comandos, módulos verificados, critérios de validação e interpretação dos resultados está disponível no [Guia de testes](../tecnica/TESTES.md)
+O detalhamento dos comandos, módulos verificados, critérios de validação e interpretação dos resultados está disponível no [Guia de testes](../tecnica/TESTES.md).
 
 ## 15. Referências técnicas
 
@@ -935,6 +1110,9 @@ O detalhamento dos comandos, módulos verificados, critérios de validação e i
 | Componentes | `docs/tecnica/COMPONENTES.md` |
 | Requisitos | `docs/requisitos/REQUISITOS.md` |
 | Contrato Protobuf | `protocol/proto/memorydb/v1/memorydb.proto` |
+| Configuração compartilhada | `shared/config/defaults.go` |
+| Configuração do servidor | `server/internal/config/config.go` |
+| Configuração do cliente de demonstração | `api/client/internal/config/config.go` |
 | Engine | `server/internal/engine/engine.go` |
 | Storage | `server/internal/storage/storage.go` |
 | Modelo interno | `server/internal/protocol/message.go` |

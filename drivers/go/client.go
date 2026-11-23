@@ -87,7 +87,7 @@ func (e *OperationOutcomeUnknownError) Unwrap() error {
 
 // Dial estabelece uma conexão TCP com o MemoryDB.
 //
-// Utiliza um contexto sem cancelamento para estabelecer a conexão.
+// Utiliza um contexto sem cancelamento e não define timeout próprio.
 func Dial(address string) (*Client, error) {
 	return DialContext(context.Background(), address)
 }
@@ -98,13 +98,40 @@ func Dial(address string) (*Client, error) {
 // da conexão. Após a conexão ser estabelecida, esse contexto não é
 // associado ao cliente. Cada operação pode receber seu próprio contexto.
 func DialContext(ctx context.Context, address string) (*Client, error) {
+	return DialContextWithConfig(ctx, DialConfig{
+		Address: address,
+	})
+}
+
+// DialWithConfig estabelece uma conexão TCP utilizando uma configuração.
+//
+// Quando Timeout é zero, não é aplicado um timeout próprio à conexão.
+func DialWithConfig(config DialConfig) (*Client, error) {
+	return DialContextWithConfig(context.Background(), config)
+}
+
+// DialContextWithConfig estabelece uma conexão TCP utilizando uma
+// configuração e um contexto.
+//
+// O menor prazo entre o timeout configurado e o deadline do contexto
+// determina o limite para o estabelecimento da conexão.
+func DialContextWithConfig(
+	ctx context.Context,
+	config DialConfig,
+) (*Client, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("context cannot be nil")
 	}
 
-	dialer := &net.Dialer{}
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
 
-	conn, err := dialer.DialContext(ctx, "tcp", address)
+	dialer := &net.Dialer{
+		Timeout: config.Timeout,
+	}
+
+	conn, err := dialer.DialContext(ctx, "tcp", config.Address)
 	if err != nil {
 		return nil, fmt.Errorf("connect to MemoryDB: %w", err)
 	}

@@ -11,6 +11,7 @@ MODULES=(
     "drivers/go"
     "protocol/generated/go"
     "server"
+    "shared"
     "transport/tcp/go"
 )
 

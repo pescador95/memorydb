@@ -896,7 +896,7 @@ func TestClientDialContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	client, err := DialContext(ctx, "127.0.0.1:6380")
+	client, err := DialContext(ctx, testDialAddress)
 	if err == nil {
 		if client != nil {
 			client.Close()
@@ -1236,7 +1236,7 @@ func TestClientContextDeadlineInterruptsBlockedOperation(t *testing.T) {
 }
 
 func TestClientDialContextRejectsNilContext(t *testing.T) {
-	_, err := DialContext(nil, "127.0.0.1:6380")
+	_, err := DialContext(nil, testDialAddress)
 
 	if err == nil {
 		t.Fatal("DialContext(nil) expected error, got nil")
@@ -1800,5 +1800,89 @@ func TestClientCancellationWaitsForCallbackCompletion(t *testing.T) {
 
 	if err := client.Ping(); err != nil {
 		t.Fatalf("Ping() after cancellation error = %v", err)
+	}
+}
+
+func TestClientDialWithConfig(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("criar listener: %v", err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	client, err := DialWithConfig(DialConfig{
+		Address: listener.Addr().String(),
+		Timeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("DialWithConfig retornou erro: %v", err)
+	}
+	defer client.Close()
+
+	select {
+	case conn := <-accepted:
+		defer conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("servidor não aceitou a conexão")
+	}
+}
+
+func TestClientDialContextWithConfigRejectsInvalidConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		config DialConfig
+	}{
+		{
+			name: "empty address",
+			config: DialConfig{
+				Timeout: time.Second,
+			},
+		},
+		{
+			name: "negative timeout",
+			config: DialConfig{
+				Address: testDialAddress,
+				Timeout: -time.Second,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := DialContextWithConfig(
+				context.Background(),
+				tt.config,
+			)
+
+			if err == nil {
+				if client != nil {
+					_ = client.Close()
+				}
+				t.Fatal("esperava erro para configuração inválida")
+			}
+
+			if client != nil {
+				t.Fatal("cliente deveria ser nil")
+			}
+		})
+	}
+}
+
+func TestClientDialContextWithConfigRejectsNilContext(t *testing.T) {
+	_, err := DialContextWithConfig(nil, DialConfig{
+		Address: testDialAddress,
+	})
+
+	if err == nil {
+		t.Fatal("esperava erro para contexto nil")
 	}
 }

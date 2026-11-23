@@ -13,6 +13,8 @@ As descrições refletem a implementação conhecida do projeto. Funcionalidades
 | Componente | Localização | Responsabilidade |
 |---|---|---|
 | Executável do servidor | `server/cmd/memorydb` | Compor as dependências e controlar a inicialização e o encerramento do servidor |
+| Configuração do servidor | `server/internal/config` | Carregar, validar e disponibilizar as configurações operacionais do servidor |
+| Configuração compartilhada | `shared/config` | Centralizar nomes de variáveis de ambiente e valores padrão compartilhados |
 | Server TCP | `server/internal/transport/tcp/server.go` | Aceitar conexões e controlar seu ciclo de vida |
 | Handler TCP | `server/internal/transport/tcp/handler.go` | Processar solicitações de uma conexão e coordenar a execução dos comandos |
 | Codec | `server/internal/codec/codec.go` | Definir as operações de serialização e desserialização |
@@ -26,6 +28,9 @@ As descrições refletem a implementação conhecida do projeto. Funcionalidades
 | Tipos Protobuf gerados | `protocol/generated/go` | Disponibilizar os tipos Go gerados a partir do schema |
 | Schema Protobuf | `protocol/proto/memorydb/v1/memorydb.proto` | Definir o contrato externo de comunicação |
 | Cliente de demonstração | `api/client` | Demonstrar o consumo do driver Go |
+| Configuração do cliente de demonstração | `api/client/internal/config` | Carregar e validar as configurações utilizadas pelo executável cliente |
+
+O projeto possui múltiplos módulos Go coordenados pelo workspace da raiz. O diretório `protocol/proto` contém o schema de origem e não constitui um módulo Go independente.
 
 ## 3. Executável do servidor
 
@@ -35,40 +40,47 @@ As descrições refletem a implementação conhecida do projeto. Funcionalidades
 
 O ponto de entrada chama `run()`. A função `run`:
 
-1. Lê a variável de ambiente `MEMORYDB_ADDR`.
-2. Utiliza `:6380` quando a variável não está definida.
-3. Cria um listener TCP.
-4. Instancia o codec Protobuf.
-5. Instancia o Engine.
-6. Cria uma instância compartilhada do Executor de idempotência.
-7. Cria o Handler, injetando Engine, Codec e Executor.
-8. Cria o servidor TCP.
-9. Inicia `Server.Serve()` em uma goroutine.
-10. Aguarda o encerramento do servidor ou um sinal do sistema operacional.
-11. Solicita o encerramento por meio de `Shutdown`, com timeout de 10 segundos.
+1. Carrega e valida as configurações operacionais do servidor.
+2. Cria um listener TCP usando o endereço configurado.
+3. Instancia o codec Protobuf.
+4. Instancia o Engine.
+5. Cria uma instância compartilhada do Executor de idempotência com os parâmetros configurados.
+6. Cria o Handler, injetando Engine, Codec e Executor.
+7. Cria o servidor TCP.
+8. Inicia `Server.Serve()` em uma goroutine.
+9. Aguarda o encerramento do servidor ou um sinal do sistema operacional.
+10. Solicita o encerramento por meio de `Shutdown`, utilizando o timeout configurado.
 
 Sinais tratados:
 
 - `SIGINT`;
 - `SIGTERM`.
 
-O timeout de shutdown é definido pela constante `shutdownTimeout`.
-
 O listener é fechado ao final de `run()` por meio de `defer`.
 
-**Configuração:**
+### 3.1 Configuração
+
+As configurações específicas do servidor são carregadas por `server/internal/config`, utilizando também os nomes e valores padrão compartilhados disponibilizados por `shared/config`.
 
 | Variável | Padrão | Descrição |
-|---|---|---|
+|---|---:|---|
 | `MEMORYDB_ADDR` | `:6380` | Endereço TCP no qual o servidor escuta |
+| `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Timeout do encerramento gracioso |
+| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência após a conclusão |
+| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros de idempotência |
 
-**Limitações:**
+Variáveis ausentes ou vazias utilizam os valores padrão. Valores explicitamente informados, mas inválidos, fazem o carregamento da configuração retornar erro e impedem a inicialização normal do servidor.
 
-- Não há arquivo de configuração ou sistema de configuração externo identificado.
+As configurações de duração utilizam o formato aceito por `time.ParseDuration`. Os valores de duração e capacidade precisam ser positivos.
+
+A configuração `MEMORYDB_ADDR` é utilizada pelo listener do servidor. Ela não altera automaticamente o endereço configurado no cliente de demonstração.
+
+### 3.2 Limitações
+
 - Não há configuração de TLS.
 - Não há autenticação ou autorização.
-- O timeout de shutdown é uma constante no executável, não uma configuração externa.
-- A capacidade do Executor utiliza o valor padrão definido na implementação, sem configuração externa identificada.
+- O encerramento gracioso não força diretamente o fechamento das conexões ativas quando o timeout expira.
+- Não há configuração identificada para timeouts de leitura e escrita das conexões TCP.
 
 ## 4. Server TCP
 
@@ -181,7 +193,7 @@ O fechamento da conexão é registrado com `defer`.
 
 As operações `SET` e `DELETE` passam pelo mecanismo de idempotência antes de serem executadas no Engine.
 
-O Handler calcula o fingerprint da operação e utiliza o `OperationID` recebido no comando para solicitar sua execução ao Executor.
+O Handler calcula o fingerprint da operação por meio de `idempotency.Fingerprint()` e utiliza o `OperationID` recebido no comando para solicitar sua execução ao Executor.
 
 O Executor recebe:
 
@@ -490,7 +502,7 @@ O `OperationID` identifica a operação lógica entre tentativas. O `RequestID` 
 
 ### 10.2 Fingerprint
 
-O Executor recebe um fingerprint SHA-256 determinístico dos parâmetros semânticos da operação.
+O Handler calcula um fingerprint SHA-256 determinístico dos parâmetros semânticos da operação, utilizando `idempotency.Fingerprint()`.
 
 O fingerprint utiliza um esquema versionado e considera:
 
@@ -504,6 +516,8 @@ O fingerprint utiliza um esquema versionado e considera:
 O `OperationID` não integra o fingerprint.
 
 Assim, o mesmo identificador somente pode ser reutilizado quando os parâmetros semânticos forem equivalentes.
+
+O Executor recebe o fingerprint calculado pelo Handler e é responsável por compará-lo com o registro existente. O cálculo do fingerprint não é responsabilidade do Executor.
 
 ### 10.3 Método `Execute`
 
@@ -558,15 +572,22 @@ Quando os identificadores são diferentes, as operações podem executar concorr
 
 ### 10.6 Capacidade e retenção
 
-A implementação utiliza:
+A implementação utiliza os seguintes valores padrão:
 
-| Propriedade | Valor |
+| Propriedade | Valor padrão |
 |---|---|
-| Capacidade padrão | 100.000 registros |
+| Capacidade | 100.000 registros |
 | Retenção | 24 horas após a conclusão |
 | Escopo | Global por instância do servidor |
 | Armazenamento | Memória |
 | Evicção antecipada de registros válidos | Não permitida |
+
+A capacidade e a retenção são configuráveis na inicialização do servidor:
+
+| Variável | Padrão | Descrição |
+|---|---:|---|
+| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros |
+| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Retenção dos registros concluídos |
 
 A capacidade contabiliza operações em andamento e concluídas.
 
@@ -575,8 +596,6 @@ Registros válidos não são removidos antecipadamente para liberar espaço.
 Quando a capacidade está esgotada, operações inéditas são rejeitadas antes da execução e não reservam o identificador.
 
 Operações em andamento não expiram pela janela de retenção.
-
-A capacidade padrão não deve ser confundida com uma configuração externa: não há configuração de inicialização identificada para alterá-la.
 
 ### 10.7 Resultados e falhas
 
@@ -761,6 +780,8 @@ A conexão utiliza mutexes separados para leitura e escrita. Assim, pode haver u
 
 **Responsabilidade:** disponibilizar uma API Go para aplicações clientes acessarem o MemoryDB.
 
+O driver é uma biblioteca e não carrega automaticamente configurações de variáveis de ambiente. A aplicação consumidora é responsável por carregar suas configurações e fornecê-las ao driver por meio de sua API.
+
 ### 13.1 Tipo `Client`
 
 O cliente encapsula:
@@ -771,7 +792,7 @@ O cliente encapsula:
 - controle de fechamento;
 - contador de `request_id`.
 
-O valor zero de `Client` não é utilizável. A criação deve ocorrer por `Dial`, `DialContext` ou `New`.
+O valor zero de `Client` não é utilizável. A criação deve ocorrer por `Dial`, `DialContext`, `DialWithConfig`, `DialContextWithConfig` ou `New`.
 
 ### 13.2 Identificador de operação
 
@@ -801,18 +822,35 @@ Para repetir uma tentativa da mesma operação, deve ser reutilizado o identific
 
 O driver não gera identificadores implicitamente e não realiza retries automáticos.
 
-### 13.3 Construção e fechamento
+### 13.3 Construção, configuração e fechamento
+
+O driver disponibiliza as seguintes formas de construção:
 
 | Método | Comportamento |
 |---|---|
 | `Dial(address)` | Estabelece conexão TCP |
 | `DialContext(ctx, address)` | Estabelece conexão TCP utilizando contexto |
+| `DialWithConfig(config)` | Estabelece conexão utilizando configuração explícita |
+| `DialContextWithConfig(ctx, config)` | Estabelece conexão utilizando configuração explícita e contexto |
 | `New(conn)` | Cria cliente a partir de uma conexão existente |
 | `Close()` | Encerra a conexão e impede novas operações |
 
+A configuração explícita utiliza:
+
+```go
+type DialConfig struct {
+    Address string
+    Timeout time.Duration
+}
+```
+
+`Dial` e `DialContext` são preservados como formas de construção compatíveis com a API anterior. Os métodos com configuração permitem que a aplicação consumidora forneça endereço e timeout sem transferir ao driver a responsabilidade de ler variáveis de ambiente.
+
+A validação da configuração rejeita endereço vazio e timeout negativo. Timeout igual a zero representa ausência de timeout explícito de conexão.
+
 Quando criado por `New`, o cliente assume a propriedade da conexão e a encerra ao executar `Close`.
 
-`DialContext` utiliza o contexto para controlar somente o estabelecimento da conexão. Ele não fica associado às operações posteriores.
+`DialContext` e `DialContextWithConfig` utilizam o contexto para controlar somente o estabelecimento da conexão. Ele não fica associado às operações posteriores.
 
 ### 13.4 Operações
 
@@ -948,6 +986,7 @@ Se o servidor for reiniciado, ou se o registro expirar, a proteção de deduplic
 - A aplicação consumidora é responsável por gerar e reutilizar `OperationID`.
 - A garantia de idempotência depende da retenção do registro na mesma instância do servidor.
 - Não há garantia de execução exatamente uma vez.
+- O driver não carrega variáveis de ambiente automaticamente; a aplicação consumidora deve fornecer a configuração.
 
 ## 14. Schema Protobuf e tipos gerados
 
@@ -1002,7 +1041,22 @@ Ele utiliza a API pública do driver para se comunicar com o servidor. Não aces
 
 As operações mutáveis demonstradas geram e fornecem `OperationID` ao driver.
 
-**Ponto de atenção:** a demonstração utiliza o endereço `127.0.0.1:6380`. Esse endereço é definido na própria aplicação de demonstração e não é obtido automaticamente da variável `MEMORYDB_ADDR` do servidor.
+### 15.1 Configuração
+
+A aplicação de demonstração possui configuração própria, carregada por `api/client/internal/config`.
+
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `MEMORYDB_CLIENT_ADDR` | `127.0.0.1:6380` | Endereço do servidor ao qual o cliente se conecta |
+| `MEMORYDB_DIAL_TIMEOUT` | `5s` | Timeout para estabelecer a conexão TCP |
+
+Variáveis ausentes ou vazias utilizam os valores padrão. Valores explicitamente informados, mas inválidos, fazem o carregamento da configuração retornar erro.
+
+A aplicação injeta os valores carregados na configuração do driver por meio de `DialWithConfig`.
+
+O driver não consulta essas variáveis diretamente.
+
+O endereço do cliente é independente do endereço de escuta do servidor. Portanto, ao alterar `MEMORYDB_ADDR` para utilizar outra porta ou endereço, também é necessário configurar `MEMORYDB_CLIENT_ADDR` de acordo com o endereço no qual o servidor está acessível.
 
 ## 16. Testes por componente
 
@@ -1117,10 +1171,11 @@ Para reproduzir as verificações, deve-se utilizar o pipeline centralizado desc
 | Storage | Engine depende de implementação concreta | Substituição do backend exige alteração do Engine |
 | TTL | Campo existe no schema, mas TTL positivo é rejeitado | Não há expiração de entradas |
 | Idempotência | Registros mantidos somente em memória | A garantia não sobrevive à reinicialização |
-| Capacidade | Valor padrão de 100.000 registros | Novas operações podem ser rejeitadas quando a capacidade está esgotada |
+| Capacidade | Limite padrão de 100.000 registros, configurável | Novas operações podem ser rejeitadas quando a capacidade está esgotada |
+| Retenção | Padrão de 24 horas após a conclusão, configurável | Após a expiração, o identificador pode deixar de ser reconhecido |
 | Multiplexação | Driver serializa operações por conexão | Uma operação por vez em cada conexão |
 | Observabilidade | Não há registro estruturado de falhas de conexão no servidor | Diagnóstico operacional limitado |
-| Timeouts de I/O | Não há configuração de timeouts identificada no servidor | Conexões podem permanecer bloqueadas |
+| Timeouts de I/O | Não há configuração identificada para timeouts de leitura e escrita no servidor | Conexões podem permanecer bloqueadas |
 | Distribuição | Executor e Storage são locais à instância | Não há coordenação entre processos ou instâncias |
 
 ## 18. Evoluções que envolvem múltiplos componentes
@@ -1131,7 +1186,7 @@ Para reproduzir as verificações, deve-se utilizar o pipeline centralizado desc
 | TTL | Schema, modelo interno, Engine e Storage | Expiração de entradas |
 | Shutdown forçado | Server e Connection | Fechamento das conexões após o prazo |
 | Observabilidade | Server, Handler e driver | Registro e diagnóstico de falhas |
-| Timeouts | Server, Handler e configuração | Controle de operações de rede bloqueadas |
+| Timeouts de I/O | Server, Handler e configuração | Controle de operações de rede bloqueadas |
 | Multiplexação | Protocolo, Handler e driver | Operações simultâneas na mesma conexão |
 | Segurança | Server, transporte e autenticação | Proteção da comunicação e do acesso |
 | Escalabilidade | Storage, protocolo e coordenação | Suporte a múltiplas instâncias e distribuição |
@@ -1154,5 +1209,6 @@ Para reproduzir as verificações, deve-se utilizar o pipeline centralizado desc
 - Documentar cenários de falha e concorrência.
 - Manter exemplos alinhados à API pública atual.
 - Distinguir funcionalidades implementadas de evoluções planejadas.
+- Manter as configurações documentadas alinhadas aos nomes das variáveis, valores padrão e regras de validação efetivamente implementados.
 
 A documentação complementa os comentários do código e não deve substituí-los quando o contrato de uma API pública exigir explicação no próprio código.

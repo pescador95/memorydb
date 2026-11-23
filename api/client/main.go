@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 
+	clientconfig "github.com/pescador95/memorydb/api/client/internal/config"
 	memorydb "github.com/pescador95/memorydb/drivers/go"
 )
 
@@ -12,14 +13,29 @@ func main() {
 		log.Fatal(err)
 	}
 }
-
 func run() error {
-	client, err := memorydb.Dial("127.0.0.1:6380")
+	config, err := clientconfig.Load()
+	if err != nil {
+		return fmt.Errorf("carregar configuração do cliente: %w", err)
+	}
+
+	client, err := memorydb.DialWithConfig(memorydb.DialConfig{
+		Address: config.Address,
+		Timeout: config.DialTimeout,
+	})
 	if err != nil {
 		return fmt.Errorf("conectar ao MemoryDB: %w", err)
 	}
 	defer client.Close()
 
+	if err := executeExample(client); err != nil {
+		return fmt.Errorf("executar demonstração: %w", err)
+	}
+
+	return nil
+}
+
+func executeExample(client *memorydb.Client) error {
 	if err := client.Ping(); err != nil {
 		return fmt.Errorf("executar PING: %w", err)
 	}
@@ -75,6 +91,5 @@ func run() error {
 	}
 
 	fmt.Printf("GET após DELETE: chave encontrada = %t\n", foundAfterDelete)
-
 	return nil
 }
