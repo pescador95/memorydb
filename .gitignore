@@ -75,3 +75,6 @@ service-account.json
 
 # Arquivos de configuração local
 local.*
+
+# Relatórios locais de cobertura de testes
+/coverage/

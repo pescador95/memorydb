@@ -6,25 +6,26 @@ Este documento descreve os componentes implementados no MemoryDB, suas responsab
 
 A arquitetura geral, a direção das dependências e os fluxos entre módulos estão documentados em `docs/tecnica/ARQUITETURA.md`.
 
-As descrições deste documento refletem o código existente. Funcionalidades planejadas ou não implementadas são identificadas como limitações.
+As descrições refletem a implementação conhecida do projeto. Funcionalidades planejadas ou não implementadas são identificadas como limitações ou evoluções.
 
 ## 2. Mapa dos componentes
 
 | Componente | Localização | Responsabilidade |
 |---|---|---|
-| Executável do servidor | `server/cmd/memorydb` | Inicializar e encerrar o servidor |
+| Executável do servidor | `server/cmd/memorydb` | Compor as dependências e controlar a inicialização e o encerramento do servidor |
 | Server TCP | `server/internal/transport/tcp/server.go` | Aceitar conexões e controlar seu ciclo de vida |
-| Handler TCP | `server/internal/transport/tcp/handler.go` | Processar solicitações de uma conexão |
-| Codec | `server/internal/codec/codec.go` | Definir operações de serialização |
-| Codec Protobuf | `server/internal/codec/protobuf/codec.go` | Converter mensagens internas e Protobuf |
-| Modelo interno | `server/internal/protocol/message.go` | Representar comandos, solicitações e respostas |
+| Handler TCP | `server/internal/transport/tcp/handler.go` | Processar solicitações de uma conexão e coordenar a execução dos comandos |
+| Codec | `server/internal/codec/codec.go` | Definir as operações de serialização e desserialização |
+| Codec Protobuf | `server/internal/codec/protobuf/codec.go` | Converter mensagens internas e mensagens Protobuf |
+| Modelo interno | `server/internal/protocol/message.go` | Representar comandos, solicitações, resultados e respostas |
 | Engine | `server/internal/engine` | Validar e executar comandos |
-| Storage | `server/internal/storage` | Armazenar dados em memória |
-| Transporte TCP reutilizável | `transport/tcp/go` | Implementar framing e conexão |
+| Executor de idempotência | `server/internal/idempotency` | Controlar identificadores, fingerprints, concorrência, replay, capacidade e retenção |
+| Storage | `server/internal/storage` | Armazenar pares chave-valor em memória |
+| Transporte TCP reutilizável | `transport/tcp/go` | Implementar framing e abstração de conexão |
 | Driver Go | `drivers/go` | Expor uma API cliente para aplicações Go |
-| Tipos Protobuf gerados | `protocol/generated/go` | Disponibilizar tipos gerados |
-| Schema Protobuf | `protocol/proto/memorydb/v1/memorydb.proto` | Definir o contrato externo |
-| Cliente de demonstração | `api/client` | Demonstrar o consumo do driver |
+| Tipos Protobuf gerados | `protocol/generated/go` | Disponibilizar os tipos Go gerados a partir do schema |
+| Schema Protobuf | `protocol/proto/memorydb/v1/memorydb.proto` | Definir o contrato externo de comunicação |
+| Cliente de demonstração | `api/client` | Demonstrar o consumo do driver Go |
 
 ## 3. Executável do servidor
 
@@ -34,16 +35,17 @@ As descrições deste documento refletem o código existente. Funcionalidades pl
 
 O ponto de entrada chama `run()`. A função `run`:
 
-1. lê a variável de ambiente `MEMORYDB_ADDR`;
-2. utiliza `:6380` quando a variável não está definida;
-3. cria um listener TCP;
-4. instancia o codec Protobuf;
-5. instancia o engine;
-6. cria o handler;
-7. cria o servidor TCP;
-8. inicia `Server.Serve()` em uma goroutine;
-9. aguarda encerramento do servidor ou sinal do sistema operacional;
-10. solicita shutdown com timeout de 10 segundos.
+1. Lê a variável de ambiente `MEMORYDB_ADDR`.
+2. Utiliza `:6380` quando a variável não está definida.
+3. Cria um listener TCP.
+4. Instancia o codec Protobuf.
+5. Instancia o Engine.
+6. Cria uma instância compartilhada do Executor de idempotência.
+7. Cria o Handler, injetando Engine, Codec e Executor.
+8. Cria o servidor TCP.
+9. Inicia `Server.Serve()` em uma goroutine.
+10. Aguarda o encerramento do servidor ou um sinal do sistema operacional.
+11. Solicita o encerramento por meio de `Shutdown`, com timeout de 10 segundos.
 
 Sinais tratados:
 
@@ -66,6 +68,7 @@ O listener é fechado ao final de `run()` por meio de `defer`.
 - Não há configuração de TLS.
 - Não há autenticação ou autorização.
 - O timeout de shutdown é uma constante no executável, não uma configuração externa.
+- A capacidade do Executor utiliza o valor padrão definido na implementação, sem configuração externa identificada.
 
 ## 4. Server TCP
 
@@ -73,7 +76,7 @@ O listener é fechado ao final de `run()` por meio de `defer`.
 
 **Tipo principal:** `Server`
 
-**Responsabilidade:** aceitar conexões TCP e delegar seu processamento ao handler.
+**Responsabilidade:** aceitar conexões TCP e delegar seu processamento ao Handler.
 
 ### 4.1 Construção
 
@@ -82,18 +85,18 @@ O listener é fechado ao final de `run()` por meio de `defer`.
 - um `net.Listener`;
 - uma instância de `Handler`.
 
-A função rejeita listener ou handler nulos.
+A função rejeita listener ou Handler nulos.
 
 ### 4.2 Método `Serve`
 
 `Serve()`:
 
 - impede que o mesmo servidor seja iniciado simultaneamente mais de uma vez;
-- não inicia a aceitação quando o servidor já está em encerramento;
+- não inicia a aceitação de conexões quando o servidor já está em encerramento;
 - aceita conexões pelo listener;
 - cria uma goroutine para cada conexão aceita;
 - contabiliza as conexões ativas com `sync.WaitGroup`;
-- delega o processamento ao `Handler.Handle`.
+- delega o processamento ao método `Handler.Handle`.
 
 Se a aceitação falhar durante o encerramento, o método retorna normalmente. Se falhar fora do encerramento, retorna um erro contextualizado.
 
@@ -112,16 +115,16 @@ Consequentemente, falhas individuais de processamento não são propagadas pelo 
 
 `Shutdown(ctx)`:
 
-1. marca o servidor como encerrando;
-2. fecha o listener;
-3. aguarda as conexões ativas terminarem;
-4. retorna quando todas terminam ou quando o contexto é cancelado.
+1. Marca o servidor como encerrando.
+2. Fecha o listener.
+3. Aguarda as conexões ativas terminarem.
+4. Retorna quando todas terminam ou quando o contexto é cancelado.
 
 O método trata `net.ErrClosed` como fechamento já realizado.
 
 **Limitação importante:** o shutdown não fecha diretamente as conexões ativas. Se uma conexão permanecer bloqueada, o método poderá retornar `ctx.Err()` ao expirar o prazo, sem interromper automaticamente aquela conexão.
 
-O servidor também não implementa uma segunda etapa de encerramento forçado.
+A implementação atual também não possui uma segunda etapa de encerramento forçado das conexões.
 
 ### 4.4 Concorrência
 
@@ -135,16 +138,19 @@ A aceitação de novas conexões e o início do encerramento são coordenados pe
 
 **Tipo principal:** `Handler`
 
-**Responsabilidade:** integrar o transporte TCP, o codec e o engine.
+**Responsabilidade:** integrar o transporte TCP, o codec, o Executor de idempotência e o Engine.
 
 ### 5.1 Construção
 
-`NewHandler(commandEngine, messageCodec)` recebe:
+`NewHandler(commandEngine, messageCodec, executor)` recebe:
 
 - `*engine.Engine`;
-- `codec.Codec`.
+- `codec.Codec`;
+- `*idempotency.Executor`.
 
 A função rejeita dependências nulas.
+
+O Executor é compartilhado entre os Handlers das conexões do mesmo servidor. Isso permite que operações com o mesmo `OperationID`, mesmo quando recebidas por conexões diferentes, sejam coordenadas pela mesma instância do mecanismo de idempotência.
 
 ### 5.2 Método `Handle`
 
@@ -158,20 +164,47 @@ O método processa solicitações sequencialmente até que a conexão seja encer
 
 Fluxo:
 
-1. valida a conexão;
-2. cria `transport/tcp/go.Connection`;
-3. lê um frame;
-4. decodifica o payload com `DecodeRequest`;
-5. executa o comando por meio de `Engine.Execute`;
-6. codifica a resposta com `EncodeResponse`;
-7. escreve o frame de resposta;
-8. repete o fluxo.
+1. Valida a conexão.
+2. Cria uma instância de `transport/tcp/go.Connection`.
+3. Lê um frame.
+4. Decodifica o payload com `DecodeRequest`.
+5. Identifica o tipo de comando.
+6. Encaminha `SET` e `DELETE` ao Executor de idempotência.
+7. Encaminha `PING` e `GET` diretamente ao Engine.
+8. Codifica a resposta com `EncodeResponse`.
+9. Escreve o frame de resposta.
+10. Repete o fluxo.
 
 O fechamento da conexão é registrado com `defer`.
 
-### 5.3 Tratamento de erros
+### 5.3 Execução de operações mutáveis
 
-O handler retorna erros contextualizados quando ocorre:
+As operações `SET` e `DELETE` passam pelo mecanismo de idempotência antes de serem executadas no Engine.
+
+O Handler calcula o fingerprint da operação e utiliza o `OperationID` recebido no comando para solicitar sua execução ao Executor.
+
+O Executor recebe:
+
+- o `OperationID`;
+- o `RequestID` da tentativa atual;
+- o fingerprint da operação;
+- uma função que executa o comando no Engine.
+
+A execução do Engine ocorre fora do mutex interno do Executor.
+
+O Executor coordena a reserva do identificador, a execução original, a espera de chamadas concorrentes e o armazenamento do resultado terminal reproduzível.
+
+O Engine não implementa deduplicação e não conhece o mecanismo de idempotência.
+
+### 5.4 Execução de operações não mutáveis
+
+As operações `PING` e `GET` não utilizam o Executor.
+
+Esses comandos são encaminhados diretamente ao Engine, pois não fazem parte do contrato inicial de idempotência.
+
+### 5.5 Tratamento de erros
+
+O Handler retorna erros contextualizados quando ocorre:
 
 - falha na criação da conexão;
 - falha na leitura do frame;
@@ -183,7 +216,19 @@ EOF durante a leitura é tratado como encerramento normal da conexão.
 
 Uma solicitação que não pode ser decodificada não gera uma resposta estruturada de aplicação. O processamento da conexão é encerrado.
 
-Erros de validação de comandos, por outro lado, são respostas normais do engine e são enviados ao cliente.
+Erros de validação de comandos são representados como respostas do Engine e enviados ao cliente.
+
+Erros relacionados ao mecanismo de idempotência são convertidos em respostas estruturadas de aplicação, incluindo:
+
+| Código | Significado |
+|---|---|
+| `INVALID_OPERATION_ID` | Identificador de operação inválido |
+| `OPERATION_ID_CONFLICT` | Identificador reutilizado com parâmetros semanticamente diferentes |
+| `IDEMPOTENCY_CAPACITY_REACHED` | Capacidade de registros de idempotência esgotada |
+| `OPERATION_OUTCOME_UNKNOWN` | Resultado da execução não pode ser determinado |
+| `INTERNAL_ERROR` | Erro interno não classificado por um código específico do Executor |
+
+Essas respostas permitem que o cliente reconheça erros informados pelo servidor e os diferencie de falhas de comunicação. Isso não significa que toda resposta de erro represente uma falha de transporte ou invalide a conexão.
 
 ## 6. Codec
 
@@ -197,15 +242,15 @@ Métodos:
 
 ```go
 type Codec interface {
-    EncodeRequest(request *protocol.Request) ([]byte, error)
+    EncodeRequest(*protocol.Request) ([]byte, error)
     DecodeRequest(data []byte) (*protocol.Request, error)
 
-    EncodeResponse(response *protocol.Response) ([]byte, error)
+    EncodeResponse(*protocol.Response) ([]byte, error)
     DecodeResponse(data []byte) (*protocol.Response, error)
 }
 ```
 
-A interface não determina o formato de serialização. A implementação concreta pode utilizar outro formato, desde que satisfaça o contrato.
+A interface não determina o formato de serialização. Uma implementação concreta pode utilizar outro formato, desde que satisfaça o contrato.
 
 A implementação atualmente utilizada pelo servidor é `codec/protobuf.Codec`.
 
@@ -227,7 +272,7 @@ A implementação utiliza:
 
 `New()` cria uma instância do codec Protobuf.
 
-A implementação declara explicitamente que satisfaz `codec.Codec`.
+A implementação declara explicitamente que satisfaz a interface `codec.Codec`.
 
 ### 7.2 Codificação de solicitações
 
@@ -242,16 +287,23 @@ A implementação declara explicitamente que satisfaz `codec.Codec`.
 
 O identificador `RequestID` é transportado para `request_id`.
 
+Nos comandos `SET` e `DELETE`, o `OperationID` é transportado para o campo `operation_id`.
+
+O identificador é representado por `bytes` no contrato Protobuf e deve conter exatamente 16 bytes para ser aceito pelo mecanismo de idempotência do servidor.
+
 ### 7.3 Decodificação de solicitações
 
 `DecodeRequest`:
 
-1. desserializa os bytes Protobuf;
-2. recupera o `request_id`;
-3. identifica o comando selecionado no `oneof`;
-4. cria o comando correspondente no modelo interno.
+1. Desserializa os bytes Protobuf.
+2. Recupera o `request_id`.
+3. Identifica o comando selecionado no `oneof`.
+4. Cria o comando correspondente no modelo interno.
+5. Copia os campos do comando, incluindo `operation_id` para `SET` e `DELETE`.
 
 Comandos ausentes ou não reconhecidos retornam erro de decodificação.
+
+A validação do tamanho e da obrigatoriedade do `OperationID` é realizada no fluxo de idempotência do Handler/Executor, não pelo codec.
 
 ### 7.4 Codificação de respostas
 
@@ -265,7 +317,7 @@ Comandos ausentes ou não reconhecidos retornam erro de decodificação.
 | `DeleteResult` | `Response_Delete` |
 | `ErrorResult` | `Response_Error` |
 
-O identificador e o estado de sucesso também são transportados.
+O identificador da solicitação, o estado de sucesso e o resultado correspondente também são transportados.
 
 ### 7.5 Decodificação de respostas
 
@@ -277,7 +329,7 @@ O codec atual é específico para o schema Protobuf do MemoryDB.
 
 A implementação valida solicitações e respostas nulas nos métodos de codificação e rejeita tipos de comando ou resultado não suportados.
 
-**Ponto de atenção:** os casos de tipos internos representados por ponteiros tipados nulos devem ser tratados com cuidado. Nos `switch` de codificação, um tipo concreto reconhecido não garante que o ponteiro recebido seja diferente de `nil`. A validação desses casos deve ser mantida em mente ao evoluir o codec.
+**Ponto de atenção:** tipos internos representados por ponteiros tipados nulos exigem tratamento explícito. Um `switch` que reconhece o tipo concreto não garante, por si só, que o ponteiro recebido seja diferente de `nil`. A validação desses casos deve ser preservada ao evoluir o codec.
 
 ## 8. Modelo interno
 
@@ -292,11 +344,13 @@ A interface interna `Command` é implementada por:
 | Tipo | Campos | Descrição |
 |---|---|---|
 | `PingCommand` | Nenhum | Solicitação de disponibilidade |
-| `SetCommand` | `Key`, `Value`, `TTLMillis` | Gravação de valor |
+| `SetCommand` | `OperationID`, `Key`, `Value`, `TTLMillis` | Gravação de valor com identificação de operação |
 | `GetCommand` | `Key` | Consulta de valor |
-| `DeleteCommand` | `Key` | Remoção de chave |
+| `DeleteCommand` | `OperationID`, `Key` | Remoção de chave com identificação de operação |
 
-A interface utiliza um método não exportado para restringir os tipos que podem implementá-la dentro do pacote.
+O `OperationID` dos comandos `SET` e `DELETE` é representado internamente por `[]byte`.
+
+A interface utiliza um método não exportado para restringir os tipos que podem implementá-la fora do pacote.
 
 ### 8.2 Solicitação
 
@@ -306,6 +360,8 @@ A interface utiliza um método não exportado para restringir os tipos que podem
 |---|---|---|
 | `RequestID` | `uint64` | Identificador para correlação |
 | `Command` | `Command` | Comando solicitado |
+
+O `RequestID` identifica a tentativa de comunicação. Ele não é utilizado como identificador estável de uma operação lógica.
 
 ### 8.3 Resultados
 
@@ -331,109 +387,7 @@ A interface `Result` é implementada por:
 
 O modelo interno preserva a separação entre o contrato externo e a lógica de execução.
 
-### 8.5. Contrato aprovado de idempotência
-
-**Estado: especificado e aprovado em 22/11/2026; ainda não implementado.**
-
-O modelo interno deverá ser evoluído para representar um identificador de operação independente do `RequestID`.
-
-#### Identificadores
-
-| Campo | Responsabilidade |
-|---|---|
-| `RequestID` | Identificar a tentativa de requisição e correlacionar a resposta |
-| `OperationID` | Identificar a mesma operação lógica entre tentativas |
-
-O `OperationID` deverá possuir 128 bits. No contrato Protobuf, será representado por `bytes`, com validação de tamanho exato de 16 bytes.
-
-O identificador será obrigatório para os comandos `SET` e `DELETE`. Não será exigido para `PING` e `GET` no contrato inicial.
-
-#### Gerenciador de idempotência
-
-Está prevista a criação de um componente `IdempotencyManager`, responsável por controlar os registros de operações.
-
-Responsabilidades previstas:
-
-- reservar identificadores antes da execução;
-- garantir reserva atômica para identificadores concorrentes;
-- comparar fingerprints;
-- aguardar a conclusão de operações duplicadas em andamento;
-- armazenar resultados terminais reproduzíveis;
-- reproduzir resultados sem executar novamente a mutação;
-- controlar retenção e capacidade;
-- rejeitar novos identificadores quando a capacidade estiver esgotada;
-- preservar registros quando o resultado da execução for indeterminado e não houver comprovação de que a mutação não ocorreu.
-
-O componente deverá ser independente do Storage de dados de negócio. Os registros de idempotência não serão armazenados como pares chave-valor da aplicação.
-
-#### Contrato de execução
-
-O gerenciador deverá considerar:
-
-| Situação | Comportamento previsto |
-|---|---|
-| Primeiro uso do identificador | Reservar e permitir a execução |
-| Mesmo identificador e fingerprint igual, concluído | Reproduzir o resultado armazenado |
-| Mesmo identificador e fingerprint diferente | Retornar conflito |
-| Mesmo identificador e fingerprint igual, em andamento | Aguardar a execução original |
-| Capacidade esgotada | Rejeitar sem executar nem reservar |
-| Resultado terminal de aplicação | Armazenar a resposta reproduzível |
-| Falha comprovadamente anterior à mutação | Permitir liberação segura da reserva |
-| Resultado indeterminado | Não liberar a reserva de forma que permita execução duplicada |
-
-A resposta reproduzida deverá utilizar o `RequestID` da tentativa atual. O resultado de negócio deverá ser semanticamente equivalente ao resultado original.
-
-#### Capacidade e retenção
-
-| Propriedade | Valor aprovado |
-|---|---|
-| Capacidade padrão | 100.000 registros |
-| Configuração | Configurável na inicialização |
-| Escopo | Global por instância |
-| Retenção | 24 horas após conclusão |
-| Armazenamento | Memória |
-| Evicção antecipada | Não permitida para registros válidos |
-
-A capacidade contará operações em andamento e concluídas. Registros em andamento não expiram pela janela de retenção.
-
-A rejeição por capacidade não cria reserva. A operação poderá ser tentada novamente quando houver espaço disponível.
-
-#### Integração prevista
-
-O fluxo de execução deverá ser organizado de forma que a deduplicação aconteça antes da chamada ao Engine:
-
-```text
-Handler
-   |
-   v
-Codec / Modelo interno
-   |
-   v
-IdempotencyManager
-   |
-   |-- identificador existente --> replay ou conflito
-   |
-   |-- identificador inédito
-   v
-Engine
-   |
-   v
-Storage
-```
-
-O gerenciador deverá coordenar a execução original e o armazenamento do resultado, sem permitir que duas requisições concorrentes com o mesmo identificador executem a mesma mutação.
-
-A posição exata do componente, suas interfaces e seu mecanismo de sincronização deverão ser definidos durante a implementação e cobertos por testes de concorrência.
-
-#### Limites
-
-A garantia será de no máximo uma execução por identificador enquanto o registro estiver retido na mesma instância.
-
-Como o gerenciador será inicialmente volátil, a garantia não sobreviverá a reinicialização ou perda do processo.
-
-Não se trata de *exactly-once*. Essa garantia exigiria persistência atômica da mutação e do registro de deduplicação.
-
-O driver deverá permitir que a aplicação forneça e reutilize o `OperationID`. Não deverá gerar um novo identificador para uma tentativa de recuperação da mesma operação lógica, nem executar retries automáticos implícitos.
+O `OperationID` não é um campo do envelope `Request`. Ele pertence aos comandos mutáveis `SetCommand` e `DeleteCommand`.
 
 ## 9. Engine
 
@@ -441,13 +395,13 @@ O driver deverá permitir que a aplicação forneça e reutilize o `OperationID`
 
 **Tipo principal:** `Engine`
 
-**Responsabilidade:** validar e executar comandos utilizando o storage.
+**Responsabilidade:** validar e executar comandos utilizando o Storage.
 
 ### 9.1 Construção
 
 `engine.New()` cria uma instância de `Engine` e instancia internamente um `storage.Storage`.
 
-O engine não recebe uma interface de storage nem uma instância externa pelo construtor atual.
+O Engine não recebe uma interface de Storage nem uma instância externa pelo construtor atual.
 
 ### 9.2 Método `Execute`
 
@@ -484,27 +438,201 @@ Os códigos de erro estão definidos em `server/internal/engine/command.go`:
 - `INVALID_ARGUMENT`;
 - `UNSUPPORTED_FEATURE`.
 
-### 9.4 Limitações
+### 9.4 Relação com a idempotência
 
-- O engine depende concretamente de `*storage.Storage`.
-- Não há interface de repositório ou storage.
+O Engine não implementa deduplicação e não mantém registros de `OperationID`.
+
+A coordenação de idempotência pertence ao Handler e ao pacote `server/internal/idempotency`.
+
+Para `SET` e `DELETE`, o Handler solicita a execução ao Executor, que invoca o Engine somente quando a operação precisa ser executada.
+
+Para `PING` e `GET`, o Handler chama o Engine diretamente.
+
+Essa separação mantém o Engine responsável pela validação e execução dos comandos, sem incorporar o ciclo de vida dos registros de idempotência.
+
+### 9.5 Limitações
+
+- O Engine depende concretamente de `*storage.Storage`.
+- Não há interface de repositório ou Storage.
 - Não há transações.
 - Não há TTL funcional.
-- Não há deduplicação de operações.
-- Não há identificação estável de operações entre tentativas.
-- Não há idempotency key; o driver ainda não expõe `OperationID` nem oferece recuperação idempotente. A evolução está especificada, mas não implementada.
+- O Engine não valida `OperationID`.
+- O Engine não implementa deduplicação.
+- A execução de comandos mutáveis depende da coordenação externa realizada pelo Handler e pelo Executor.
 
-## 10. Storage
+## 10. Executor de idempotência
+
+**Localização:** `server/internal/idempotency`
+
+**Tipo principal:** `Executor`
+
+**Responsabilidade:** coordenar a execução de operações mutáveis identificadas por `OperationID`, impedindo a repetição da execução enquanto o registro correspondente estiver retido na mesma instância do servidor.
+
+O Executor mantém registros próprios em memória, separados do Storage de dados de negócio.
+
+Ele é criado durante a composição do servidor e compartilhado entre os Handlers das conexões da mesma instância.
+
+### 10.1 Identificador de operação
+
+O identificador possui exatamente 16 bytes (128 bits).
+
+É obrigatório para:
+
+- `SET`;
+- `DELETE`.
+
+Não é utilizado para:
+
+- `PING`;
+- `GET`.
+
+O `OperationID` identifica a operação lógica entre tentativas. O `RequestID` identifica cada tentativa de comunicação.
+
+### 10.2 Fingerprint
+
+O Executor recebe um fingerprint SHA-256 determinístico dos parâmetros semânticos da operação.
+
+O fingerprint utiliza um esquema versionado e considera:
+
+| Parâmetro | SET | DELETE |
+|---|---|---|
+| Tipo da operação | Sim | Sim |
+| Chave | Sim | Sim |
+| Valor | Sim | Não |
+| TTL | Sim | Não |
+
+O `OperationID` não integra o fingerprint.
+
+Assim, o mesmo identificador somente pode ser reutilizado quando os parâmetros semânticos forem equivalentes.
+
+### 10.3 Método `Execute`
+
+O Executor disponibiliza o método:
+
+```go
+Execute(
+    operationID []byte,
+    requestID uint64,
+    fingerprint [32]byte,
+    execute func() *protocol.Response,
+)
+```
+
+O método recebe o identificador da operação, o identificador da tentativa, o fingerprint e uma função que executa a operação original.
+
+O fluxo geral é:
+
+1. Valida o `OperationID`.
+2. Procura um registro existente.
+3. Compara o fingerprint.
+4. Verifica se a operação está em andamento ou concluída.
+5. Reserva atomicamente um identificador inédito, quando necessário.
+6. Executa a função recebida fora do mutex interno.
+7. Armazena o resultado terminal reproduzível, quando aplicável.
+8. Disponibiliza o resultado às chamadas concorrentes ou posteriores.
+
+A execução fora do mutex permite que operações com identificadores diferentes avancem concorrentemente.
+
+### 10.4 Comportamento por situação
+
+| Situação | Comportamento |
+|---|---|
+| `OperationID` inédito e capacidade disponível | Reserva e executa a operação |
+| Mesmo ID e mesmo fingerprint, operação concluída | Reproduz o resultado original |
+| Mesmo ID e mesmo fingerprint, operação em andamento | Aguarda a execução original |
+| Mesmo ID e fingerprint diferente | Retorna conflito |
+| ID inválido | Rejeita a operação |
+| Capacidade esgotada para um ID inédito | Rejeita antes da execução, sem reservar o identificador |
+
+Quando uma operação é reproduzida, o resultado semântico original é preservado e o `RequestID` é atualizado para corresponder à tentativa atual.
+
+Isso permite que uma nova tentativa receba uma resposta correlacionada ao seu próprio `RequestID`, sem executar novamente a mutação.
+
+### 10.5 Concorrência
+
+O Executor coordena operações concorrentes com o mesmo identificador.
+
+Quando duas chamadas apresentam o mesmo `OperationID` e fingerprint enquanto a primeira ainda está em andamento, a segunda aguarda a conclusão da execução original.
+
+Quando os identificadores são diferentes, as operações podem executar concorrentemente, sem manter o mutex interno durante a execução do Engine.
+
+### 10.6 Capacidade e retenção
+
+A implementação utiliza:
+
+| Propriedade | Valor |
+|---|---|
+| Capacidade padrão | 100.000 registros |
+| Retenção | 24 horas após a conclusão |
+| Escopo | Global por instância do servidor |
+| Armazenamento | Memória |
+| Evicção antecipada de registros válidos | Não permitida |
+
+A capacidade contabiliza operações em andamento e concluídas.
+
+Registros válidos não são removidos antecipadamente para liberar espaço.
+
+Quando a capacidade está esgotada, operações inéditas são rejeitadas antes da execução e não reservam o identificador.
+
+Operações em andamento não expiram pela janela de retenção.
+
+A capacidade padrão não deve ser confundida com uma configuração externa: não há configuração de inicialização identificada para alterá-la.
+
+### 10.7 Resultados e falhas
+
+Respostas terminais reproduzíveis, inclusive erros determinísticos, são armazenadas para replay.
+
+O Executor não deve liberar uma reserva quando não é possível determinar se a mutação foi executada.
+
+Essa situação é representada por resultado indeterminado.
+
+Entre os erros definidos pelo pacote estão:
+
+- `ErrInvalidOperationID`;
+- `ErrFingerprintConflict`;
+- `ErrCapacityReached`;
+- `ErrOutcomeUnknown`;
+- `ErrNilExecution`.
+
+Uma falha comprovadamente anterior à execução da mutação pode permitir a liberação da reserva. Quando o resultado é indeterminado, a reserva não deve ser liberada de forma que permita uma execução duplicada.
+
+### 10.8 Clonagem de respostas
+
+O Executor mantém cópias das respostas utilizadas para replay.
+
+A clonagem evita que a resposta entregue a uma chamada seja modificada externamente e altere o resultado armazenado para tentativas posteriores.
+
+A resposta reproduzida mantém o resultado semântico original e utiliza o `RequestID` da tentativa atual.
+
+### 10.9 Garantias e limitações
+
+A garantia é de no máximo uma execução por `OperationID` enquanto o registro permanecer retido na mesma instância do servidor.
+
+O mecanismo não oferece:
+
+- persistência dos registros de idempotência;
+- recuperação após reinicialização ou crash;
+- deduplicação entre instâncias diferentes;
+- garantia de execução exatamente uma vez;
+- retry automático no driver.
+
+O encerramento ou reinício do processo elimina os registros.
+
+A expiração de um registro após o período de retenção também encerra a garantia de deduplicação daquele identificador.
+
+A aplicação consumidora é responsável por fornecer e reutilizar o mesmo `OperationID` nas tentativas da mesma operação lógica.
+
+## 11. Storage
 
 **Localização:** `server/internal/storage`
 
 **Tipos principais:** `Storage` e `Entry`
 
-**Responsabilidade:** manter os pares chave-valor em memória.
+**Responsabilidade:** manter pares chave-valor em memória.
 
-### 10.1 Estrutura
+### 11.1 Estrutura
 
-O storage utiliza:
+O Storage utiliza:
 
 - um mapa `map[string]Entry`;
 - `sync.RWMutex` para sincronização;
@@ -512,11 +640,11 @@ O storage utiliza:
 
 A estrutura `Entry` mantém o valor em um campo não exportado.
 
-### 10.2 API
+### 11.2 API
 
 | Método | Comportamento |
 |---|---|
-| `New()` | Cria um storage vazio |
+| `New()` | Cria um Storage vazio |
 | `Set(key, value)` | Armazena uma cópia do valor |
 | `Get(key)` | Retorna uma cópia do valor e indica se a chave existe |
 | `Delete(key)` | Remove a chave e informa se ela existia |
@@ -531,13 +659,13 @@ Get(key string) ([]byte, bool)
 Delete(key string) bool
 ```
 
-### 10.3 Isolamento dos dados
+### 11.3 Isolamento dos dados
 
-O storage copia os bytes recebidos em `Set` e os bytes retornados em `Get`.
+O Storage copia os bytes recebidos em `Set` e os bytes retornados em `Get`.
 
 Essa estratégia evita que alterações posteriores nos slices do chamador modifiquem diretamente os dados armazenados ou que o chamador altere o conteúdo interno por meio do valor retornado.
 
-### 10.4 Concorrência
+### 11.4 Concorrência
 
 `Set` e `Delete` utilizam lock exclusivo.
 
@@ -545,7 +673,7 @@ Essa estratégia evita que alterações posteriores nos slices do chamador modif
 
 O controle permite operações concorrentes sem acesso desprotegido ao mapa.
 
-### 10.5 Limitações
+### 11.5 Limitações
 
 - Dados exclusivamente em memória.
 - Sem persistência.
@@ -553,8 +681,9 @@ O controle permite operações concorrentes sem acesso desprotegido ao mapa.
 - Sem replicação.
 - Sem limite de memória configurável identificado.
 - Sem política de eviction identificada.
+- Os registros de idempotência não são armazenados neste componente.
 
-## 11. Transporte TCP reutilizável
+## 12. Transporte TCP reutilizável
 
 **Módulo:** `transport/tcp/go`
 
@@ -562,7 +691,7 @@ O controle permite operações concorrentes sem acesso desprotegido ao mapa.
 
 **Responsabilidade:** fornecer framing e abstração de conexão sem dependência do Protobuf ou do servidor.
 
-### 11.1 Framing
+### 12.1 Framing
 
 **Arquivo:** `transport/tcp/go/framing.go`
 
@@ -580,24 +709,26 @@ Erros exportados:
 
 `ReadFrame`:
 
-1. valida a presença do reader;
-2. lê integralmente o cabeçalho;
-3. interpreta o tamanho em Big Endian;
-4. rejeita tamanho zero;
-5. rejeita payload maior que o limite;
-6. lê integralmente o payload.
+1. Valida a presença do reader.
+2. Lê integralmente o cabeçalho.
+3. Interpreta o tamanho em Big Endian.
+4. Rejeita tamanho zero.
+5. Rejeita payload maior que o limite.
+6. Lê integralmente o payload.
 
 `WriteFrame`:
 
-1. valida a presença do writer;
-2. rejeita payload vazio;
-3. rejeita payload acima do limite;
-4. escreve o cabeçalho Big Endian;
-5. escreve o payload integralmente.
+1. Valida a presença do writer.
+2. Rejeita payload vazio.
+3. Rejeita payload acima do limite.
+4. Escreve o cabeçalho Big Endian.
+5. Escreve o payload integralmente.
 
 A função interna `writeFull` trata escritas parciais e rejeita contagens inválidas ou escritas sem progresso.
 
-### 11.2 Connection
+O limite de 1 MiB é aplicado ao payload de cada frame, sem incluir o cabeçalho de quatro bytes.
+
+### 12.2 Connection
 
 **Arquivo:** `transport/tcp/go/connection.go`
 
@@ -620,7 +751,7 @@ A conexão utiliza mutexes separados para leitura e escrita. Assim, pode haver u
 
 `Close` não depende dos mutexes de leitura e escrita. O fechamento da conexão subjacente pode interromper operações de rede bloqueadas.
 
-## 12. Driver Go
+## 13. Driver Go
 
 **Módulo:** `drivers/go`
 
@@ -630,7 +761,7 @@ A conexão utiliza mutexes separados para leitura e escrita. Assim, pode haver u
 
 **Responsabilidade:** disponibilizar uma API Go para aplicações clientes acessarem o MemoryDB.
 
-### 12.1 Tipo `Client`
+### 13.1 Tipo `Client`
 
 O cliente encapsula:
 
@@ -642,7 +773,35 @@ O cliente encapsula:
 
 O valor zero de `Client` não é utilizável. A criação deve ocorrer por `Dial`, `DialContext` ou `New`.
 
-### 12.2 Construção e fechamento
+### 13.2 Identificador de operação
+
+**Arquivo:** `drivers/go/operation_id.go`
+
+O driver disponibiliza o tipo:
+
+```go
+type OperationID [OperationIDSize]byte
+```
+
+A constante `OperationIDSize` define o tamanho de 16 bytes.
+
+A função:
+
+```go
+NewOperationID() (OperationID, error)
+```
+
+gera um identificador utilizando `crypto/rand`.
+
+A aplicação consumidora é responsável por gerar e manter o identificador associado à operação lógica.
+
+Para uma nova operação lógica, deve ser gerado um novo identificador.
+
+Para repetir uma tentativa da mesma operação, deve ser reutilizado o identificador original.
+
+O driver não gera identificadores implicitamente e não realiza retries automáticos.
+
+### 13.3 Construção e fechamento
 
 | Método | Comportamento |
 |---|---|
@@ -655,22 +814,22 @@ Quando criado por `New`, o cliente assume a propriedade da conexão e a encerra 
 
 `DialContext` utiliza o contexto para controlar somente o estabelecimento da conexão. Ele não fica associado às operações posteriores.
 
-### 12.3 Operações
+### 13.4 Operações
 
 | Método | Comportamento |
 |---|---|
 | `Ping()` | Verifica a disponibilidade do servidor |
 | `PingContext(ctx)` | Executa PING com contexto |
-| `Set(key, value)` | Grava um valor |
-| `SetContext(ctx, key, value)` | Grava um valor com contexto |
+| `Set(operationID, key, value)` | Grava um valor com identificador de operação |
+| `SetContext(ctx, operationID, key, value)` | Grava um valor com contexto e identificador de operação |
 | `Get(key)` | Recupera valor e existência |
 | `GetContext(ctx, key)` | Recupera valor e existência com contexto |
-| `Delete(key)` | Remove uma chave |
-| `DeleteContext(ctx, key)` | Remove uma chave com contexto |
+| `Delete(operationID, key)` | Remove uma chave com identificador de operação |
+| `DeleteContext(ctx, operationID, key)` | Remove uma chave com contexto e identificador de operação |
 
 O `Set` do driver atual não expõe parâmetro de TTL. O servidor recebe o campo `ttl_ms` no contrato Protobuf, mas rejeita valores positivos.
 
-### 12.4 Serialização das operações
+### 13.5 Serialização das operações
 
 O cliente permite que seus métodos sejam chamados concorrentemente.
 
@@ -678,7 +837,7 @@ Entretanto, `operationGate` permite somente uma operação por vez na conexão.
 
 A serialização é necessária porque o protocolo atual não implementa multiplexação. O cliente envia uma solicitação e aguarda a resposta correspondente antes de liberar a conexão para a próxima operação.
 
-### 12.5 Estados internos
+### 13.6 Estados internos
 
 O cliente possui três estados:
 
@@ -692,9 +851,9 @@ A transição para `failed` fecha a conexão e impede novas operações.
 
 `Close` pode ser chamado concorrentemente com operações. Como o fechamento interrompe o I/O, uma operação que já começou pode terminar com resultado indeterminado.
 
-### 12.6 Contextos e cancelamento
+### 13.7 Contextos e cancelamento
 
-O cliente diferencia o cancelamento enquanto aguarda a conexão do cancelamento durante a comunicação.
+O cliente diferencia o cancelamento enquanto aguarda a conexão para executar uma operação do cancelamento durante a comunicação.
 
 | Momento | Resultado | Estado esperado |
 |---|---|---|
@@ -708,7 +867,7 @@ Como a solicitação pode já ter sido processada pelo servidor, não é possív
 
 A implementação sincroniza a conclusão e a interrupção por meio de fases internas da operação. O resultado observado depende de qual transição é efetivada primeiro.
 
-### 12.7 `ServerError`
+### 13.8 `ServerError`
 
 **Tipo:** `ServerError`
 
@@ -721,9 +880,9 @@ Campos:
 | `Code` | Código do erro |
 | `Message` | Mensagem retornada |
 
-O erro indica uma rejeição de aplicação reconhecida. Ele não invalida automaticamente a conexão.
+O erro indica uma rejeição ou falha de aplicação informada pelo servidor. Ele não invalida automaticamente a conexão.
 
-### 12.8 `OperationOutcomeUnknownError`
+### 13.9 `OperationOutcomeUnknownError`
 
 **Tipo:** `OperationOutcomeUnknownError`
 
@@ -757,26 +916,40 @@ Possíveis situações:
 
 O erro não afirma que a operação falhou. Ele informa que o cliente não possui confirmação suficiente para determinar se o servidor executou a operação.
 
-### 12.9 Comportamento após resultado indeterminado
+Esse erro local do driver deve ser distinguido da resposta de protocolo `OPERATION_OUTCOME_UNKNOWN`, que é produzida pelo servidor quando o próprio mecanismo de idempotência identifica um resultado indeterminado.
 
-Quando o resultado é indeterminado, o cliente invalida a conexão.
+### 13.10 Recuperação de operações mutáveis
 
-Não há retry automático, reconexão transparente ou recuperação de resposta anterior.
+Quando uma operação mutável retorna `OperationOutcomeUnknownError`, a aplicação pode realizar uma nova tentativa utilizando o mesmo `OperationID`.
 
-A aplicação cliente não deve repetir cegamente a operação. O comando pode ter sido executado antes da perda da resposta.
+A repetição precisa preservar os parâmetros semânticos da operação original.
 
-### 12.10 Limitações do driver
+Para `SET`, isso inclui:
+
+- a mesma chave;
+- o mesmo valor;
+- o mesmo TTL.
+
+Para `DELETE`, inclui a mesma chave.
+
+O servidor utiliza o Executor para reconhecer a operação original e reproduzir o resultado, desde que o registro correspondente permaneça retido na mesma instância.
+
+O driver não realiza retry automático, reconexão transparente ou recuperação de resposta anterior.
+
+Se o servidor for reiniciado, ou se o registro expirar, a proteção de deduplicação deixa de estar disponível.
+
+### 13.11 Limitações do driver
 
 - Não há multiplexação.
 - Não há retry automático.
 - Não há reconexão automática.
-- Não há idempotency key.
-- Não há deduplicação no servidor.
-- `request_id` é local à conexão e utilizado para correlação.
 - Não há recuperação de resultado após reconexão.
-- O driver ainda não expõe `OperationID` nem oferece recuperação idempotente; a evolução está especificada, mas não implementada.
+- O `RequestID` é utilizado para correlação, não para deduplicação.
+- A aplicação consumidora é responsável por gerar e reutilizar `OperationID`.
+- A garantia de idempotência depende da retenção do registro na mesma instância do servidor.
+- Não há garantia de execução exatamente uma vez.
 
-## 13. Schema Protobuf e tipos gerados
+## 14. Schema Protobuf e tipos gerados
 
 **Schema:** `protocol/proto/memorydb/v1/memorydb.proto`
 
@@ -786,17 +959,36 @@ O schema define os envelopes de solicitação e resposta, os comandos, os result
 
 O campo `request_id` é definido como `uint64`.
 
-Os comandos e resultados são representados por `oneof`, garantindo uma seleção entre as alternativas declaradas no contrato.
+Os comandos e resultados são representados por `oneof`, permitindo selecionar uma das alternativas declaradas no contrato.
 
-O campo `ttl_ms` existe em `SetCommand`, mas sua funcionalidade não está implementada no engine.
+### 14.1 Identificadores
+
+Os comandos `SET` e `DELETE` possuem o campo `operation_id`, representado como `bytes`.
+
+Esse campo transporta o identificador de operação de 16 bytes utilizado pelo mecanismo de idempotência.
+
+O campo é obrigatório para esses comandos. A validação de tamanho é realizada pelo fluxo de idempotência no servidor.
+
+O `request_id` permanece independente do `operation_id`:
+
+- `request_id` identifica a tentativa;
+- `operation_id` identifica a operação lógica entre tentativas.
+
+### 14.2 TTL
+
+O campo `ttl_ms` existe em `SetCommand`, mas sua funcionalidade não está implementada no Engine.
+
+Valores positivos são rejeitados com `UNSUPPORTED_FEATURE`.
+
+### 14.3 Geração dos tipos
 
 Os arquivos gerados devem ser atualizados a partir do schema por meio do processo de geração adotado pelo projeto.
 
-**[LACUNA]** O processo oficial de geração, incluindo versão e instalação das ferramentas, deve ser documentado em um procedimento reproduzível se ainda não estiver definido em outro documento do repositório.
+Os arquivos Go gerados devem ser tratados como artefatos de geração, não como arquivos para edição manual.
 
-O contrato aprovado prevê a inclusão de OperationID no envelope Request. A alteração do schema e a regeneração dos tipos ainda não foram realizadas.
+**Ponto de atenção:** o processo oficial de geração, incluindo versão e instalação das ferramentas, deve ser documentado em um procedimento reproduzível caso ainda não esteja definido em outro documento do repositório.
 
-## 14. API de demonstração
+## 15. API de demonstração
 
 **Localização:** `api/client`
 
@@ -808,7 +1000,15 @@ Ele utiliza a API pública do driver para se comunicar com o servidor. Não aces
 
 É uma aplicação de demonstração, não uma segunda implementação do servidor.
 
-## 15. Testes por componente
+As operações mutáveis demonstradas geram e fornecem `OperationID` ao driver.
+
+**Ponto de atenção:** a demonstração utiliza o endereço `127.0.0.1:6380`. Esse endereço é definido na própria aplicação de demonstração e não é obtido automaticamente da variável `MEMORYDB_ADDR` do servidor.
+
+## 16. Testes por componente
+
+Os testes automatizados são executados por meio dos scripts centralizados em `scripts/test/`. O repositório possui múltiplos módulos Go, e o pipeline percorre os módulos configurados no workspace.
+
+Os procedimentos de execução, os comandos disponíveis, os critérios de validação e os relatórios de cobertura estão descritos no [Guia de testes](./TESTES.md).
 
 Os testes estão distribuídos junto aos módulos e pacotes.
 
@@ -820,13 +1020,46 @@ Os testes estão distribuídos junto aos módulos e pacotes.
 | Codec Protobuf | `server/internal/codec/protobuf/codec_test.go` | Round-trip, conversões e mensagens inválidas |
 | Engine | `server/internal/engine/engine_test.go` | Comandos, validações e erros |
 | Storage | `server/internal/storage/storage_test.go` | Operações, cópia de bytes e concorrência |
-| Handler | `server/internal/transport/tcp/handler_test.go` | Processamento sequencial de solicitações |
+| Executor de idempotência | `server/internal/idempotency/executor_test.go` | Concorrência, replay, conflitos, capacidade, expiração e resultados indeterminados |
+| Fingerprint | `server/internal/idempotency/fingerprint_test.go` | Determinismo, diferenciação de operações e parâmetros semânticos |
+| Handler | `server/internal/transport/tcp/handler_test.go` | Processamento de solicitações, integração com idempotência, replay e erros |
 | Server TCP | `server/internal/transport/tcp/server_test.go` | Aceitação de clientes, concorrência e shutdown |
 | Integração | `server/internal/integration/server_test.go` | Comunicação entre driver e servidor |
 
-### 15.1 Testes do driver para resultados indeterminados
+### 16.1 Testes do Executor de idempotência
 
-A cobertura recente do driver inclui cenários específicos de:
+A cobertura do Executor inclui cenários de:
+
+- execução de uma operação inédita;
+- replay de operação concluída;
+- rejeição de identificador reutilizado com fingerprint diferente;
+- concorrência entre chamadas com o mesmo identificador;
+- execução concorrente de identificadores diferentes;
+- rejeição por capacidade esgotada;
+- expiração de registros concluídos;
+- preservação de operações em andamento;
+- rejeição de identificadores inválidos;
+- tratamento de execução nula;
+- tratamento de respostas nulas ou tipadas nulas;
+- preservação de resultados indeterminados;
+- clonagem de respostas para replay.
+
+### 16.2 Testes do Handler para idempotência
+
+A cobertura do Handler inclui:
+
+- encaminhamento de `SET` e `DELETE` ao Executor;
+- execução direta de `PING` e `GET`;
+- replay de operações;
+- atualização do `RequestID` durante replay;
+- rejeição de `OperationID` inválido;
+- rejeição de conflito de fingerprint;
+- rejeição por capacidade esgotada;
+- tratamento de comandos tipados nulos.
+
+### 16.3 Testes do driver para resultados indeterminados
+
+A cobertura do driver inclui cenários específicos de:
 
 - escrita parcial;
 - execução de SET no servidor seguida de perda da resposta;
@@ -836,75 +1069,74 @@ A cobertura recente do driver inclui cenários específicos de:
 - cancelamento antes do início da operação;
 - concorrência entre conclusão e cancelamento.
 
-### 15.2 Validação recente do driver
+### 16.4 Validação dos módulos
 
-Há registro de execução bem-sucedida dos seguintes comandos no módulo `drivers/go`:
+Em 22/11/2026, foi registrada validação dos módulos do workspace com testes, detector de condições de corrida e análise estática.
+
+Comandos executados:
 
 ```bash
-go test -v -count=1 ./drivers/go
-go test -race -count=1 ./drivers/go
-go test -race -count=20 ./drivers/go
-go vet ./drivers/go
+for module in server transport/tcp/go protocol/generated/go drivers/go api; do
+    (
+        cd "$module" &&
+        go test ./... &&
+        go vet ./...
+    ) || exit 1
+done
 ```
 
-Esses resultados dizem respeito ao módulo do driver. Não representam uma nova validação consolidada de todos os módulos do workspace.
+Também foi executada a suíte com detector de condições de corrida e repetição dos testes:
 
-Também há registro de validações anteriores das demais áreas e de execução manual ponta a ponta em 15/11/2026.
+```bash
+for module in server transport/tcp/go protocol/generated/go drivers/go api; do
+    (
+        cd "$module" &&
+        go test -race -count=20 ./...
+    ) || exit 1
+done
+```
 
-## 16. Pontos de atenção e limitações transversais
+Segundo o registro dessa validação, os testes e as análises estáticas dos módulos foram concluídos sem erros.
+
+Também foram verificados:
+
+- formatação com `gofmt`;
+- consistência do diff com `git diff --check`;
+- sincronização entre o branch local e o remoto.
+
+Esses resultados correspondem à validação registrada em 22/11/2026 e não substituem a execução dos testes após alterações futuras.
+
+Para reproduzir as verificações, deve-se utilizar o pipeline centralizado descrito no [Guia de testes](./TESTES.md), em vez de depender dos comandos manuais registrados nesta seção.
+
+## 17. Limitações transversais
 
 | Ponto | Situação observada | Consequência |
 |---|---|---|
-| Erros do handler | Retorno de `Handler.Handle` descartado pelo servidor | Falhas individuais não são registradas nesse ponto |
+| Erros do Handler | Retorno de `Handler.Handle` descartado pelo servidor | Falhas individuais não são propagadas nem registradas nesse ponto |
 | Shutdown | Conexões ativas não são fechadas diretamente | O prazo pode expirar sem encerrar todas as conexões |
-| Storage | Engine depende de implementação concreta | Substituição do backend exige alteração do engine |
+| Storage | Engine depende de implementação concreta | Substituição do backend exige alteração do Engine |
 | TTL | Campo existe no schema, mas TTL positivo é rejeitado | Não há expiração de entradas |
-| Idempotência | Não há identificador estável nem deduplicação | Repetição após resultado indeterminado pode executar novamente |
-| Persistência | Storage somente em memória | Dados são perdidos no encerramento do processo |
+| Idempotência | Registros mantidos somente em memória | A garantia não sobrevive à reinicialização |
+| Capacidade | Valor padrão de 100.000 registros | Novas operações podem ser rejeitadas quando a capacidade está esgotada |
 | Multiplexação | Driver serializa operações por conexão | Uma operação por vez em cada conexão |
 | Observabilidade | Não há registro estruturado de falhas de conexão no servidor | Diagnóstico operacional limitado |
-| Timeouts de I/O | Não há configuração identificada no servidor | Conexões podem permanecer bloqueadas |
+| Timeouts de I/O | Não há configuração de timeouts identificada no servidor | Conexões podem permanecer bloqueadas |
+| Distribuição | Executor e Storage são locais à instância | Não há coordenação entre processos ou instâncias |
 
-## 17. Evoluções que envolvem múltiplos componentes
+## 18. Evoluções que envolvem múltiplos componentes
 
 | Evolução | Componentes envolvidos | Resultado esperado |
 |---|---|---|
-| Idempotência | Schema, modelo interno, Handler, IdempotencyManager, Engine e driver | Identificação estável e deduplicação de operações |
-| Deduplicação | Handler, engine e armazenamento de resultados | Evitar execução duplicada e recuperar resposta anterior |
-| TTL | Schema, modelo interno, engine e storage | Expiração de entradas |
 | Persistência | Storage e recuperação | Preservação de dados após reinicialização |
+| TTL | Schema, modelo interno, Engine e Storage | Expiração de entradas |
 | Shutdown forçado | Server e Connection | Fechamento das conexões após o prazo |
 | Observabilidade | Server, Handler e driver | Registro e diagnóstico de falhas |
 | Timeouts | Server, Handler e configuração | Controle de operações de rede bloqueadas |
-| Multiplexação | Protocolo, handler e driver | Operações simultâneas na mesma conexão |
+| Multiplexação | Protocolo, Handler e driver | Operações simultâneas na mesma conexão |
+| Segurança | Server, transporte e autenticação | Proteção da comunicação e do acesso |
+| Escalabilidade | Storage, protocolo e coordenação | Suporte a múltiplas instâncias e distribuição |
 
-### 17.1. Considerações para idempotência
-
-O contrato inicial de idempotência foi aprovado em 22/11/2026 e está documentado na seção 8.5.
-
-As decisões principais já estão definidas:
-
-- `RequestID` e `OperationID` possuem responsabilidades distintas.
-- `OperationID` possui 128 bits e é representado por `bytes` no Protobuf.
-- A idempotência inicial abrange `SET` e `DELETE`.
-- O escopo é global por instância do servidor.
-- A retenção é de 24 horas após a conclusão.
-- A capacidade padrão é de 100.000 registros, configurável na inicialização.
-- Registros válidos não podem ser removidos antecipadamente.
-- Operações concorrentes com o mesmo identificador e fingerprint devem compartilhar a execução original.
-- Identificadores reutilizados com conteúdo diferente devem gerar conflito.
-- O resultado original deverá ser reproduzido com o `RequestID` da tentativa atual.
-- A garantia inicial não sobrevive à reinicialização do processo.
-
-A implementação ainda deverá definir e testar os detalhes internos de sincronização, tratamento de falhas e armazenamento de resultados.
-
-O projeto não deverá anunciar *exactly-once*. A garantia prevista é limitada à retenção do registro na mesma instância do servidor.
-
-Para sobreviver a crash ou reinicialização, a mutação e o registro de deduplicação precisarão de persistência com atomicidade.
-
-A aplicação consumidora deverá decidir explicitamente quando repetir uma operação, reutilizando o mesmo `OperationID`. O driver não deverá realizar retries automáticos implícitos.
-
-## 18. Diretrizes de manutenção dos componentes
+## 19. Diretrizes de manutenção dos componentes
 
 ### Comentários no código
 

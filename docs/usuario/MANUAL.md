@@ -2,23 +2,21 @@
 
 ## 1. Visão geral
 
-MemoryDB é um servidor chave-valor em memória que permite armazenar, consultar, substituir e remover valores por meio de comandos enviados por TCP.
+MemoryDB é um servidor chave-valor em memória, implementado em Go, que permite armazenar, consultar, substituir e remover valores por meio de comandos enviados por TCP.
 
 A comunicação utiliza mensagens Protocol Buffers (Protobuf), encapsuladas em frames com prefixo de tamanho.
 
 A implementação atual oferece:
 
 - Comandos PING, SET, GET e DELETE.
-- Chaves do tipo `string`.
-- Valores do tipo `[]byte`.
+- Chaves do tipo `string` e valores do tipo `[]byte`.
 - Armazenamento compartilhado entre conexões da mesma instância.
 - Atendimento concorrente de múltiplas conexões.
 - Driver cliente para aplicações Go.
 - Operações do driver com suporte a `context.Context`.
-- Identificação de operações mutáveis por `OperationID`.
-- Idempotência server-side para SET e DELETE.
-- Deduplicação de operações durante o período de retenção.
-- Tratamento de erros de aplicação e de resultados indeterminados.
+- Idempotência server-side para SET e DELETE, por meio de `OperationID`.
+- Deduplicação de operações e reprodução de respostas enquanto os registros estão retidos.
+- Tratamento de erros de aplicação, falhas de comunicação e resultados indeterminados.
 
 O armazenamento e os registros de idempotência são exclusivamente em memória. Os dados e o histórico de operações são perdidos quando o processo do servidor termina ou é reiniciado.
 
@@ -30,8 +28,9 @@ Para executar o projeto localmente:
 - Repositório MemoryDB clonado.
 - Workspace Go disponível no arquivo `go.work` da raiz.
 - Porta TCP disponível para o servidor, por padrão `6380`.
+- Utilitários de linha de comando utilizados pelos scripts, como `find`, `xargs`, `awk`, `sort`, `tail`, `mktemp` e `rm`.
 
-O projeto é organizado em módulos Go independentes. Os comandos de execução devem ser realizados no módulo correspondente.
+O projeto é organizado em módulos Go independentes. A raiz do repositório contém um workspace Go, mas não é, por si só, um módulo Go. Por isso, os comandos de execução e validação devem ser realizados no módulo correspondente.
 
 ## 3. Executar o servidor
 
@@ -109,7 +108,9 @@ O cliente demonstra:
 5. DELETE da chave.
 6. GET após a exclusão para confirmar que ela não existe.
 
-O cliente utiliza o endereço fixo `127.0.0.1:6380`, definido em `api/client/main.go`.
+O cliente gera `OperationID` para as operações SET e DELETE.
+
+O endereço utilizado é fixo: `127.0.0.1:6380`, definido em `api/client/main.go`.
 
 **Importante:** alterar `MEMORYDB_ADDR` no servidor não altera automaticamente o endereço utilizado pelo cliente de demonstração. Se o servidor estiver em outro endereço, o exemplo deverá ser ajustado.
 
@@ -176,9 +177,9 @@ Os métodos sem contexto utilizam `context.Background()` internamente.
 
 `New(conn)` recebe uma conexão `net.Conn` existente e transfere sua propriedade ao client. Quando `Close()` for chamado, a conexão será encerrada.
 
-As operações `SET` e `DELETE` exigem um `OperationID`, utilizado pelo servidor para identificar uma operação lógica e evitar sua execução duplicada durante o período de retenção do registro.
+As operações `SET` e `DELETE` exigem um `OperationID`, utilizado pelo servidor para identificar uma operação lógica e evitar sua execução duplicada enquanto o registro correspondente estiver retido.
 
-O tipo `memorydb.OperationID` possui 16 bytes. A função `memorydb.NewOperationID()` gera um identificador aleatório.
+O tipo `memorydb.OperationID` possui 16 bytes. A função `memorydb.NewOperationID()` gera um identificador aleatório utilizando `crypto/rand`.
 
 A aplicação consumidora deve:
 
@@ -322,9 +323,7 @@ O PING não comprova a disponibilidade de funcionalidades adicionais, persistên
 
 ### 6.2. SET
 
-Armazena um valor associado a uma chave.
-
-Se a chave já existir, o valor anterior será substituído.
+Armazena um valor associado a uma chave. Se a chave já existir, o valor anterior será substituído.
 
 Chaves são strings e valores são bytes. O armazenamento realiza uma cópia dos bytes recebidos.
 
@@ -414,7 +413,7 @@ O contrato externo está definido em:
 
 O prefixo informa somente o tamanho do payload, sem incluir os quatro bytes do próprio prefixo.
 
-O payload máximo permitido é de 1 MiB.
+O payload máximo permitido é de 1 MiB. Frames com tamanho zero são inválidos.
 
 Como TCP é um fluxo de bytes, uma mensagem pode ser recebida em partes. O transporte implementa leitura completa do frame e trata escritas parciais.
 
@@ -436,8 +435,6 @@ Uma resposta possui:
 O `request_id` é utilizado para correlação entre solicitação e resposta. Ele não funciona como chave de idempotência.
 
 Nas operações SET e DELETE, o campo `operation_id` identifica a operação lógica.
-
-A distinção é importante:
 
 | Identificador | Finalidade | Comportamento em uma nova tentativa |
 |---|---|---|
@@ -479,16 +476,9 @@ A existência do contrato não significa que já exista um driver implementado e
 
 A idempotência server-side permite que o servidor reconheça tentativas repetidas de uma mesma operação mutável.
 
-O mecanismo está disponível para:
+O mecanismo está disponível para SET e DELETE. PING e GET não utilizam esse mecanismo.
 
-- SET.
-- DELETE.
-
-PING e GET não utilizam esse mecanismo.
-
-O objetivo é reduzir o risco de execução duplicada quando uma aplicação não recebe a resposta de uma operação e precisa tentar novamente.
-
-A idempotência não representa persistência nem garantia de execução exatamente uma vez diante de falhas ou reinicializações.
+O objetivo é reduzir o risco de execução duplicada quando uma aplicação não recebe a resposta de uma operação e precisa tentar novamente. A idempotência não representa persistência nem garantia de execução exatamente uma vez diante de falhas ou reinicializações.
 
 ### 8.2. Identificador da operação
 
@@ -503,15 +493,13 @@ if err != nil {
 }
 ```
 
-Cada operação lógica deve receber um identificador próprio.
-
-Uma nova tentativa da mesma operação deve utilizar o mesmo identificador e os mesmos parâmetros originais.
+Cada operação lógica deve receber um identificador próprio. Uma nova tentativa da mesma operação deve utilizar o mesmo identificador e os mesmos parâmetros originais.
 
 Não gere um novo identificador para repetir uma operação cujo resultado anterior seja desconhecido.
 
 ### 8.3. Impressão digital da operação
 
-O servidor calcula uma impressão digital dos parâmetros relevantes da operação.
+O servidor calcula uma impressão digital dos parâmetros relevantes da operação utilizando SHA-256 e um esquema versionado.
 
 Para SET, são considerados:
 
@@ -525,7 +513,7 @@ Para DELETE, são considerados:
 - Tipo da operação.
 - Chave.
 
-O `OperationID` identifica a operação lógica, mas não substitui a validação de seus parâmetros.
+O `OperationID` identifica a operação lógica, mas não substitui a validação de seus parâmetros. Ele não faz parte da impressão digital.
 
 A impressão digital permite detectar a reutilização incompatível de um identificador.
 
@@ -568,6 +556,8 @@ Quando a capacidade está esgotada:
 
 O servidor não remove antecipadamente registros válidos apenas para liberar espaço.
 
+Os valores apresentados são os padrões da implementação atual. Não representam parâmetros configuráveis por variável de ambiente ou pela API pública do servidor.
+
 ### 8.6. Erros relacionados à idempotência
 
 | Código | Significado |
@@ -575,17 +565,15 @@ O servidor não remove antecipadamente registros válidos apenas para liberar es
 | `INVALID_OPERATION_ID` | Identificador ausente ou com tamanho diferente de 16 bytes |
 | `OPERATION_ID_CONFLICT` | Identificador já utilizado com parâmetros diferentes |
 | `IDEMPOTENCY_CAPACITY_REACHED` | Capacidade de registros esgotada |
-| `OPERATION_OUTCOME_UNKNOWN` | Resultado da execução não pode ser determinado |
+| `OPERATION_OUTCOME_UNKNOWN` | O servidor não consegue determinar o resultado da execução |
 
-O driver também disponibiliza o tipo `OperationOutcomeUnknownError` para representar situações em que o cliente não consegue confirmar o resultado da operação.
+O código `OPERATION_OUTCOME_UNKNOWN` é um erro estruturado do protocolo, retornado pelo servidor. Ele não deve ser confundido com o tipo `OperationOutcomeUnknownError` do driver Go, que representa uma falha observada pelo cliente ao não conseguir confirmar o resultado da comunicação.
 
 ### 8.7. Limites da garantia
 
 O mecanismo oferece deduplicação enquanto o registro da operação permanece retido na memória da instância.
 
-Não existe persistência dos registros de idempotência.
-
-Consequentemente:
+Não existe persistência dos registros de idempotência. Consequentemente:
 
 - Uma reinicialização elimina o histórico de operações.
 - Após a expiração do registro, o mesmo identificador poderá ser tratado como uma nova operação.
@@ -612,19 +600,19 @@ O client possui três estados internos:
 
 | Estado | Comportamento |
 |---|---|
-| `open` | Disponível para executar operações. |
-| `closed` | Encerrado por `Close()`. |
-| `failed` | Invalidado após falha de comunicação ou protocolo. |
+| `open` | Disponível para executar operações |
+| `closed` | Encerrado por `Close()` |
+| `failed` | Invalidado após falha de comunicação ou protocolo |
 
 Clientes nos estados `closed` e `failed` não devem ser reutilizados.
 
 Após uma falha que invalide o client, crie uma nova conexão com `Dial` ou `DialContext`.
 
-A idempotência server-side não altera o comportamento de serialização das operações na conexão. Ela permite reconhecer novas tentativas de uma operação lógica mesmo quando realizadas por uma nova conexão.
+A idempotência server-side não altera o comportamento de serialização das operações na conexão. Ela permite reconhecer novas tentativas de uma operação lógica mesmo quando realizadas por uma nova conexão, desde que o registro correspondente ainda esteja retido na mesma instância do servidor.
 
 ## 10. Tratamento de erros
 
-O driver diferencia erros estruturados retornados pelo servidor de falhas de comunicação.
+O driver diferencia erros estruturados retornados pelo servidor de falhas de comunicação observadas pelo cliente.
 
 ### 10.1. ServerError
 
@@ -639,19 +627,19 @@ Exemplos de códigos utilizados pela implementação:
 
 | Código | Significado |
 |---|---|
-| `INVALID_REQUEST` | Solicitação inválida ou comando ausente/não suportado. |
-| `INVALID_ARGUMENT` | Argumento inválido, como chave vazia. |
-| `UNSUPPORTED_FEATURE` | Funcionalidade não suportada, como TTL positivo. |
-| `INVALID_OPERATION_ID` | Identificador de operação inválido. |
-| `OPERATION_ID_CONFLICT` | Reutilização de identificador com parâmetros diferentes. |
-| `IDEMPOTENCY_CAPACITY_REACHED` | Capacidade de registros de idempotência esgotada. |
-| `OPERATION_OUTCOME_UNKNOWN` | Resultado da execução não pode ser determinado. |
+| `INVALID_REQUEST` | Solicitação inválida ou comando ausente/não suportado |
+| `INVALID_ARGUMENT` | Argumento inválido, como chave vazia |
+| `UNSUPPORTED_FEATURE` | Funcionalidade não suportada, como TTL positivo |
+| `INVALID_OPERATION_ID` | Identificador de operação inválido |
+| `OPERATION_ID_CONFLICT` | Reutilização de identificador com parâmetros diferentes |
+| `IDEMPOTENCY_CAPACITY_REACHED` | Capacidade de registros de idempotência esgotada |
+| `OPERATION_OUTCOME_UNKNOWN` | Resultado da execução não pode ser determinado |
 
 Quando o servidor retorna uma resposta estruturada de erro, o driver disponibiliza `ServerError` e não invalida automaticamente a conexão.
 
 ### 10.2. OperationOutcomeUnknownError
 
-`OperationOutcomeUnknownError` representa uma situação em que o client não consegue determinar se o servidor executou a operação.
+`OperationOutcomeUnknownError` é um tipo de erro do driver Go. Ele representa uma situação em que o cliente não consegue determinar se o servidor executou a operação.
 
 Pode ocorrer quando:
 
@@ -687,9 +675,7 @@ Para esse exemplo, inclua os pacotes `errors` e `log` nos imports.
 
 O `request_id` não permite consultar o resultado anterior nem impede a execução duplicada de comandos.
 
-Para SET e DELETE, o MemoryDB oferece idempotência server-side por meio do `operation_id`.
-
-Quando o resultado de uma dessas operações for desconhecido, o consumidor pode realizar uma nova tentativa utilizando:
+Para SET e DELETE, o MemoryDB oferece idempotência server-side por meio do `operation_id`. Quando o resultado de uma dessas operações for desconhecido, o consumidor pode realizar uma nova tentativa utilizando:
 
 - Uma nova conexão com o servidor, caso o client anterior tenha sido invalidado.
 - O mesmo `OperationID` utilizado na tentativa original.
@@ -697,20 +683,11 @@ Quando o resultado de uma dessas operações for desconhecido, o consumidor pode
 
 Se o servidor ainda possuir o registro, reconhecerá a operação duplicada e reproduzirá a resposta armazenada, sem executar novamente a mutação.
 
-O comportamento depende das seguintes regras:
-
-- Mesmo `OperationID` e mesmos parâmetros: a resposta anterior é reproduzida, quando o registro está retido.
-- Mesmo `OperationID` e parâmetros diferentes: o servidor rejeita a solicitação com `OPERATION_ID_CONFLICT`.
-- `OperationID` inválido: a solicitação é rejeitada com `INVALID_OPERATION_ID`.
-- Capacidade esgotada: novas operações são rejeitadas com `IDEMPOTENCY_CAPACITY_REACHED`, sem reservar o identificador rejeitado.
-
-A idempotência é limitada às operações SET e DELETE. PING e GET não utilizam esse mecanismo.
+Essa recuperação depende de o registro original continuar disponível na memória da mesma instância. A retenção é de 24 horas após a conclusão, e os registros são perdidos em caso de reinicialização.
 
 O driver não executa retry automático. A geração e a reutilização do `OperationID` são responsabilidade da aplicação consumidora.
 
 **Importante:** não gere um novo `OperationID` para repetir uma operação cujo resultado seja desconhecido. Um novo identificador representa uma nova operação lógica e não oferece a proteção contra duplicação da tentativa anterior.
-
-A possibilidade de uma nova tentativa segura também depende de o registro original continuar disponível na memória da instância. A retenção é de 24 horas após a conclusão, e os registros são perdidos em caso de reinicialização.
 
 ### 10.3. Cancelamento e falhas de comunicação
 
@@ -718,14 +695,14 @@ O comportamento do driver depende do momento da interrupção:
 
 | Situação | Comportamento |
 |---|---|
-| Falha ao estabelecer conexão | Retorna erro na inicialização. |
-| Erro estruturado do servidor | Retorna `ServerError`; client não é invalidado automaticamente. |
-| Cancelamento enquanto aguarda acesso à conexão | Operação cancelada; conexão preservada. |
-| Falha de comunicação durante I/O | Client passa para `failed`; resultado pode ser desconhecido. |
-| Cancelamento durante I/O | Conexão encerrada; client passa para `failed`. |
-| Resposta inválida ou incompatível | Client é invalidado; resultado pode ser desconhecido. |
-| Uso após `Close()` | Operação rejeitada. |
-| Uso após falha de comunicação | Operação rejeitada. |
+| Falha ao estabelecer conexão | Retorna erro na inicialização |
+| Erro estruturado do servidor | Retorna `ServerError`; client não é invalidado automaticamente |
+| Cancelamento enquanto aguarda acesso à conexão | Operação cancelada; conexão preservada |
+| Falha de comunicação durante I/O | Client passa para `failed`; resultado pode ser desconhecido |
+| Cancelamento durante I/O | Conexão encerrada; client passa para `failed` |
+| Resposta inválida ou incompatível | Client é invalidado; resultado pode ser desconhecido |
+| Uso após `Close()` | Operação rejeitada |
+| Uso após falha de comunicação | Operação rejeitada |
 
 Depois de uma falha de comunicação ou cancelamento durante I/O, não reutilize o client.
 
@@ -733,24 +710,24 @@ Depois de uma falha de comunicação ou cancelamento durante I/O, não reutilize
 
 | Situação | Causa provável | Ação recomendada |
 |---|---|---|
-| Servidor não está ativo | Processo não iniciado ou encerrado. | Inicie o servidor e verifique o endereço. |
-| Conexão recusada | Endereço ou porta incorretos, ou serviço indisponível. | Confira `MEMORYDB_ADDR` e o endereço utilizado pelo client. |
-| Porta ocupada | Outro processo está utilizando a porta. | Escolha outra porta ou encerre o processo conflitante. |
-| Chave vazia | SET, GET ou DELETE recebeu uma chave vazia. | Envie uma chave não vazia. |
-| TTL positivo | A funcionalidade ainda não está implementada. | Utilize `ttl_ms = 0`. |
-| OperationID inválido | Identificador ausente ou diferente de 16 bytes. | Gere um identificador com `memorydb.NewOperationID()`. |
-| OperationID em conflito | Mesmo identificador utilizado com parâmetros diferentes. | Confira os parâmetros e gere outro identificador somente se for uma nova operação lógica. |
-| Capacidade de idempotência esgotada | Limite de registros atingido. | Aguarde a liberação de registros expirados antes de tentar novamente. |
-| Frame com tamanho zero | Payload inválido. | Envie um payload Protobuf válido. |
-| Frame maior que 1 MiB | Payload excede o limite do transporte. | Reduza o tamanho da mensagem. |
-| Frame incompleto | A mensagem não foi transmitida integralmente. | Confira o tamanho declarado e o envio dos bytes. |
-| Payload Protobuf inválido | Serialização incompatível ou mensagem malformada. | Confira o schema e a serialização. |
-| Chave inexistente em GET | Chave não está armazenada. | Verifique `found`; isso não representa erro. |
-| DELETE de chave inexistente | Chave não estava armazenada. | Verifique `deleted`; isso não representa erro. |
-| Contexto cancelado antes da operação | Cancelamento ou deadline antes do início do I/O. | Verifique o prazo e o estado do contexto. |
-| Contexto cancelado durante I/O | Comunicação interrompida. | Crie outro client e, para SET ou DELETE, reutilize o mesmo OperationID e os mesmos parâmetros. |
-| OperationOutcomeUnknownError | Não foi possível confirmar o resultado. | Para SET ou DELETE, considere uma nova tentativa com o mesmo OperationID e parâmetros, desde que o registro ainda possa estar retido. |
-| Client fechado ou com falha | Ciclo de vida encerrado ou conexão invalidada. | Crie um novo client. |
+| Servidor não está ativo | Processo não iniciado ou encerrado | Inicie o servidor e verifique o endereço |
+| Conexão recusada | Endereço ou porta incorretos, ou serviço indisponível | Confira `MEMORYDB_ADDR` e o endereço utilizado pelo client |
+| Porta ocupada | Outro processo está utilizando a porta | Escolha outra porta ou encerre o processo conflitante |
+| Chave vazia | SET, GET ou DELETE recebeu uma chave vazia | Envie uma chave não vazia |
+| TTL positivo | Funcionalidade ainda não implementada | Utilize `ttl_ms = 0` |
+| OperationID inválido | Identificador ausente ou diferente de 16 bytes | Gere um identificador com `memorydb.NewOperationID()` |
+| OperationID em conflito | Mesmo identificador utilizado com parâmetros diferentes | Confira os parâmetros; use outro identificador somente para uma nova operação lógica |
+| Capacidade de idempotência esgotada | Limite de registros atingido | Aguarde a expiração de registros concluídos antes de tentar novamente |
+| Frame com tamanho zero | Payload inválido | Envie um payload Protobuf válido |
+| Frame maior que 1 MiB | Payload excede o limite do transporte | Reduza o tamanho da mensagem |
+| Frame incompleto | A mensagem não foi transmitida integralmente | Confira o tamanho declarado e o envio dos bytes |
+| Payload Protobuf inválido | Serialização incompatível ou mensagem malformada | Confira o schema e a serialização |
+| Chave inexistente em GET | Chave não está armazenada | Verifique `found`; isso não representa erro |
+| DELETE de chave inexistente | Chave não estava armazenada | Verifique `deleted`; isso não representa erro |
+| Contexto cancelado antes do I/O | Cancelamento ou deadline antes do início da comunicação | Verifique o prazo e o estado do contexto |
+| Contexto cancelado durante I/O | Comunicação interrompida | Crie outro client; para SET ou DELETE, reutilize o mesmo `OperationID` e os mesmos parâmetros |
+| `OperationOutcomeUnknownError` | Cliente não conseguiu confirmar o resultado | Para SET ou DELETE, considere uma nova tentativa com o mesmo `OperationID` e parâmetros, desde que o registro ainda possa estar retido |
+| Client fechado ou com falha | Ciclo de vida encerrado ou conexão invalidada | Crie um novo client |
 
 Erros de framing e decodificação não são necessariamente convertidos em `ErrorResult`. Em geral, eles encerram o processamento da conexão.
 
@@ -780,7 +757,7 @@ A implementação atual possui as seguintes limitações:
 - **Capacidade de idempotência:** a configuração padrão permite até 100.000 registros por instância, incluindo operações em andamento.
 - **Sem persistência da idempotência:** os registros são mantidos somente em memória e são perdidos quando o processo termina ou reinicia.
 - **Sem garantia após expiração:** depois da remoção de um registro expirado, o mesmo `OperationID` poderá ser tratado como uma nova operação.
-- **Sem garantia de execução exatamente uma vez:** a proteção contra duplicação é limitada à existência do registro na memória da instância, não abrangendo reinicializações ou perda de estado.
+- **Sem garantia de execução exatamente uma vez:** a proteção contra duplicação é limitada à existência do registro na memória da instância.
 - **Resultado indeterminado:** uma interrupção durante a comunicação pode impedir que o cliente saiba se o comando foi executado.
 - **Cliente de demonstração com endereço fixo:** utiliza `127.0.0.1:6380`.
 - **Sem interface HTTP ou REST:** o protocolo disponível é TCP com framing e Protobuf.
@@ -792,15 +769,11 @@ Não utilize o MemoryDB como armazenamento durável nem exponha o serviço a red
 
 ### Os dados ficam disponíveis para mais de um cliente?
 
-Sim. Clientes conectados à mesma instância utilizam o mesmo armazenamento em memória.
-
-Cada processo do servidor possui seu próprio storage. Instâncias independentes não compartilham automaticamente os dados.
+Sim. Clientes conectados à mesma instância utilizam o mesmo armazenamento em memória. Cada processo do servidor possui seu próprio storage. Instâncias independentes não compartilham automaticamente os dados.
 
 ### Os dados continuam disponíveis após reiniciar?
 
-Não. O armazenamento atual é exclusivamente em memória.
-
-Os registros de idempotência também são perdidos quando o processo termina ou reinicia.
+Não. O armazenamento atual é exclusivamente em memória. Os registros de idempotência também são perdidos quando o processo termina ou reinicia.
 
 ### Posso utilizar TTL?
 
@@ -816,9 +789,7 @@ Não. O servidor espera frames contendo mensagens serializadas conforme o contra
 
 ### Posso utilizar outro cliente além do Go?
 
-Sim, desde que o cliente implemente corretamente o framing TCP e o contrato Protobuf.
-
-Para SET e DELETE, também é necessário enviar um `operation_id` de 16 bytes e respeitar as regras de idempotência.
+Sim, desde que o cliente implemente corretamente o framing TCP e o contrato Protobuf. Para SET e DELETE, também é necessário enviar um `operation_id` de 16 bytes e respeitar as regras de idempotência.
 
 Isso não significa que já exista um driver pronto para todas as linguagens.
 
@@ -826,11 +797,9 @@ Isso não significa que já exista um driver pronto para todas as linguagens.
 
 Sim. O driver Go disponibiliza métodos com `context.Context`.
 
-Se o cancelamento ocorrer enquanto o client aguarda para iniciar uma operação, a conexão permanece disponível.
+Se o cancelamento ocorrer enquanto o client aguarda para iniciar uma operação, a conexão permanece disponível. Se ocorrer durante a comunicação de rede, a conexão é encerrada porque o resultado da operação pode ser desconhecido.
 
-Se ocorrer durante a comunicação de rede, a conexão é encerrada porque o resultado da operação pode ser desconhecido.
-
-Para SET e DELETE, uma nova tentativa pode utilizar o mesmo `OperationID` e os mesmos parâmetros da operação original.
+Para SET e DELETE, uma nova tentativa pode utilizar o mesmo `OperationID` e os mesmos parâmetros da operação original, desde que o registro ainda esteja retido.
 
 ### O contexto de DialContext controla as operações posteriores?
 
@@ -842,41 +811,27 @@ Não. Após falha de comunicação ou cancelamento durante I/O, é necessário c
 
 ### Posso executar várias operações simultaneamente no mesmo client?
 
-As chamadas podem partir de goroutines diferentes, mas o driver serializa as operações na mesma conexão.
-
-O servidor atende múltiplas conexões simultaneamente.
+As chamadas podem partir de goroutines diferentes, mas o driver serializa as operações na mesma conexão. O servidor atende múltiplas conexões simultaneamente.
 
 ### O que é OperationID?
 
-É um identificador de 16 bytes utilizado para reconhecer uma operação lógica nas operações SET e DELETE.
-
-O driver disponibiliza `memorydb.NewOperationID()` para gerar identificadores.
-
-Cada operação lógica deve possuir seu próprio identificador.
+É um identificador de 16 bytes utilizado para reconhecer uma operação lógica nas operações SET e DELETE. O driver disponibiliza `memorydb.NewOperationID()` para gerar identificadores. Cada operação lógica deve possuir seu próprio identificador.
 
 ### Preciso gerar um novo OperationID a cada tentativa?
 
-Não. Para repetir uma operação cujo resultado seja desconhecido, reutilize o mesmo identificador e os mesmos parâmetros da tentativa original.
-
-Gere um novo identificador somente para uma nova operação lógica.
+Não. Para repetir uma operação cujo resultado seja desconhecido, reutilize o mesmo identificador e os mesmos parâmetros da tentativa original. Gere um novo identificador somente para uma nova operação lógica.
 
 ### Por quanto tempo o servidor mantém um OperationID?
 
-O servidor mantém os registros de operações concluídas por 24 horas após sua conclusão.
-
-Operações em andamento não expiram enquanto estiverem sendo executadas.
+O servidor mantém os registros de operações concluídas por 24 horas após sua conclusão. Operações em andamento não expiram enquanto estiverem sendo executadas.
 
 ### Existe limite de OperationIDs?
 
-Sim. A capacidade padrão é de 100.000 registros por instância, incluindo operações em andamento.
-
-Quando a capacidade está esgotada, novas operações são rejeitadas até que haja espaço disponível. O identificador rejeitado não é reservado.
+Sim. A capacidade padrão é de 100.000 registros por instância, incluindo operações em andamento. Quando a capacidade está esgotada, novas operações são rejeitadas até que haja espaço disponível. O identificador rejeitado não é reservado.
 
 ### O que acontece quando a capacidade de idempotência está esgotada?
 
-O servidor rejeita novas operações com `IDEMPOTENCY_CAPACITY_REACHED`, sem executar a mutação e sem reservar o identificador rejeitado.
-
-Uma nova tentativa poderá ser realizada quando houver capacidade disponível.
+O servidor rejeita novas operações com `IDEMPOTENCY_CAPACITY_REACHED`, sem executar a mutação e sem reservar o identificador rejeitado. Uma nova tentativa poderá ser realizada quando houver capacidade disponível.
 
 ### GET e PING também são idempotentes?
 
@@ -884,9 +839,7 @@ Não utilizam o mecanismo de deduplicação por `OperationID`. Esse mecanismo es
 
 ### O que acontece se reutilizar um OperationID com parâmetros diferentes?
 
-O servidor rejeita a operação com `OPERATION_ID_CONFLICT`.
-
-O identificador não pode ser utilizado para representar operações lógicas diferentes enquanto seu registro estiver retido.
+O servidor rejeita a operação com `OPERATION_ID_CONFLICT`. O identificador não pode ser utilizado para representar operações lógicas diferentes enquanto seu registro estiver retido.
 
 ### A idempotência funciona após reiniciar o servidor?
 
@@ -894,25 +847,87 @@ Não. Os registros são mantidos somente em memória. Após reiniciar o processo
 
 ### O que significa OperationOutcomeUnknownError?
 
-Significa que o client não conseguiu confirmar se o servidor executou a operação.
+É um erro do driver Go que indica que o cliente não conseguiu confirmar se o servidor executou a operação.
 
-Para SET e DELETE, a aplicação pode realizar uma nova tentativa utilizando o mesmo `OperationID` da operação original. O servidor poderá reconhecer a duplicata e reproduzir a resposta anterior, desde que o registro ainda esteja retido.
+Para SET e DELETE, a aplicação pode realizar uma nova tentativa utilizando o mesmo `OperationID` e os mesmos parâmetros da operação original. O servidor poderá reconhecer a duplicata e reproduzir a resposta anterior, desde que o registro ainda esteja retido. Utilize uma nova conexão se o client anterior tiver sido invalidado.
 
-Utilize uma nova conexão se o client anterior tiver sido invalidado.
+Não gere um novo `OperationID` para repetir a mesma operação lógica. Para PING e GET, não existe deduplicação por `OperationID`.
 
-Não gere um novo `OperationID` para repetir a mesma operação lógica.
+### O que significa OPERATION_OUTCOME_UNKNOWN?
 
-Para PING e GET, não existe deduplicação por `OperationID`.
+É um código de erro estruturado do protocolo, retornado pelo servidor quando o mecanismo de execução não consegue determinar o resultado da operação. Não é o mesmo que o tipo `OperationOutcomeUnknownError` do driver, que representa a impossibilidade de o cliente confirmar o resultado da comunicação.
 
 ### O que acontece quando o servidor é encerrado?
 
-O servidor fecha o listener e aguarda as conexões ativas, respeitando o timeout de 10 segundos.
-
-Se o contexto expirar, o executável trata o erro e encerra pelo caminho de falha. O shutdown não força diretamente o fechamento das conexões ativas.
+O servidor fecha o listener e aguarda as conexões ativas, respeitando o timeout de 10 segundos. Se o contexto expirar, o executável trata o erro e encerra pelo caminho de falha. O shutdown não força diretamente o fechamento das conexões ativas.
 
 Os dados em memória e os registros de idempotência são perdidos quando o processo termina.
 
-## 14. Referências técnicas
+Para executar os testes automatizados, também são necessários:
+
+- Bash disponível no ambiente.
+
+## 14. Executar testes e validar o projeto
+
+O MemoryDB disponibiliza scripts para executar os testes automatizados e as verificações técnicas nos módulos Go do projeto.
+
+Na raiz do repositório, execute:
+
+```bash
+./scripts/test.sh
+```
+
+Esse comando executa o pipeline completo, composto pelas seguintes etapas:
+
+1. **format:** verifica a formatação dos arquivos Go com `gofmt`.
+2. **vet:** executa análise estática com `go vet`.
+3. **unit:** executa os testes unitários.
+4. **race:** executa os testes com detector de condições de corrida.
+5. **build:** verifica a compilação dos módulos.
+6. **coverage:** executa os testes e gera relatórios de cobertura.
+7. **uncovered:** identifica arquivos e blocos de código não cobertos pelos testes.
+
+O pipeline percorre os cinco módulos Go do workspace e interrompe a execução quando alguma etapa falha.
+
+### 14.1. Executar uma etapa específica
+
+Também é possível executar cada etapa individualmente:
+
+```bash
+./scripts/test.sh format
+./scripts/test.sh vet
+./scripts/test.sh unit
+./scripts/test.sh race
+./scripts/test.sh build
+./scripts/test.sh coverage
+./scripts/test.sh uncovered
+```
+
+Para consultar os comandos disponíveis:
+
+```bash
+./scripts/test.sh help
+```
+
+### 14.2. Relatórios de cobertura
+
+A etapa `coverage` gera os perfis de cobertura dos módulos no diretório `coverage/` e um relatório HTML do servidor:
+
+```text
+coverage/server.html
+```
+
+A etapa `uncovered` utiliza os perfis existentes para identificar blocos não cobertos. Ela não executa os testes novamente.
+
+Para obter resultados atualizados, execute `coverage` antes de `uncovered`.
+
+Os relatórios são artefatos locais de execução e não devem ser versionados no Git.
+
+### 14.3. Documentação dos testes
+
+O detalhamento dos comandos, módulos verificados, critérios de validação e interpretação dos resultados está disponível no [Guia de testes](../tecnica/TESTES.md)
+
+## 15. Referências técnicas
 
 | Assunto | Arquivo |
 |---|---|
@@ -939,8 +954,10 @@ Os dados em memória e os registros de idempotência são perdidos quando o proc
 | Workspace Go | `go.work` |
 | Guia específico do driver Go | `drivers/go/README.md` |
 | Roadmap | `memorydb-roadmap.md` |
+| Guia de testes | `docs/tecnica/TESTES.md` |
+| Scripts de validação | `scripts/test.sh` e `scripts/test/` |
 
-## 15. Referências externas
+## 16. Referências externas
 
 - Repositório: https://github.com/pescador95/memorydb
 - Documentação oficial do Go: https://go.dev/doc/
@@ -948,7 +965,8 @@ Os dados em memória e os registros de idempotência são perdidos quando o proc
 - Gerenciamento de módulos Go: https://go.dev/doc/modules/managing-dependencies
 - Pacote `context`: https://pkg.go.dev/context
 - Pacote `errors`: https://pkg.go.dev/errors
-- Pacote `net/http`: https://pkg.go.dev/net/http
+- Pacote `crypto/rand`: https://pkg.go.dev/crypto/rand
+- Protocol Buffers: https://protobuf.dev/
 
 ---
 

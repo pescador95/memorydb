@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 PROTO_DIR="$ROOT_DIR/protocol/proto"
 OUTPUT_DIR="$ROOT_DIR/protocol/generated/go"

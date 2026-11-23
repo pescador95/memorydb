@@ -12,11 +12,13 @@ Os estados utilizados são:
 
 | Estado | Significado |
 |---|---|
-| Implementado e testado | Comportamento presente no código e coberto por testes identificados |
+| Implementado e testado | Comportamento presente no código e coberto por testes identificados para os cenários descritos |
 | Implementado, cobertura parcial | Comportamento presente no código, mas sem cobertura de teste suficiente para todos os cenários descritos |
-| Implementado, validação histórica | Há registro de execução bem-sucedida, mas não necessariamente uma validação completa do estado atual |
+| Implementado, validação histórica | Há registro de execução bem-sucedida em uma versão específica, mas não necessariamente uma validação completa do estado atual |
+| Implementado | Comportamento presente no código, sem declaração específica sobre cobertura de testes |
 | Parcial | Parte do comportamento está implementada, mas há limitações conhecidas |
 | Não implementado | Não há implementação funcional identificada |
+| Não identificado | Não foi identificada especificação, meta ou evidência suficiente para afirmar sua existência |
 
 ## 2. Escopo atual
 
@@ -35,6 +37,10 @@ O escopo funcional atual contempla:
 - Driver cliente em Go.
 - Operações context-aware no driver Go.
 - Sinalização de resultados indeterminados por `OperationOutcomeUnknownError`.
+- Idempotência server-side para as operações `SET` e `DELETE`, baseada em `OperationID`.
+- Deduplicação de operações enquanto seus registros permanecem retidos na instância do servidor.
+- Reprodução de respostas de operações anteriormente concluídas.
+- Controle de concorrência, retenção e capacidade dos registros de idempotência.
 - Encerramento gracioso do servidor.
 - Workspace Go composto por módulos independentes.
 
@@ -42,16 +48,16 @@ O escopo funcional atual contempla:
 
 A implementação atual não oferece:
 
-- Persistência em disco.
-- Recuperação de dados após reinicialização.
-- TTL funcional.
+- Persistência dos dados em disco.
+- Recuperação dos dados após reinicialização.
+- Persistência dos registros de idempotência.
+- TTL funcional para as chaves armazenadas.
 - Autenticação ou autorização.
 - TLS.
 - Isolamento por tenant.
 - Replicação ou distribuição entre instâncias.
 - Multiplexação de requisições na mesma conexão.
-- Idempotência ou deduplicação server-side.
-- Recuperação de resultados indeterminados.
+- Garantia de idempotência após reinicialização, perda do processo ou expiração do registro.
 - Retry automático no driver.
 - Driver Java implementado e validado.
 
@@ -59,11 +65,12 @@ A implementação atual não oferece:
 
 ### FR-001 — Responder ao comando PING
 
-**Descrição:** Para uma solicitação PING válida, o servidor deve retornar sucesso com resultado PONG e preservar o `request_id`.
+**Descrição:** Para uma solicitação PING válida, o engine deve retornar sucesso com resultado PONG e preservar o `request_id`.
 
-**Componentes:** `Engine`, modelo interno e codec.
+**Componentes:** `Engine` e modelo interno de protocolo.
 
 **Evidências:**
+
 - `server/internal/engine/engine.go` — `Engine.Execute`.
 - `server/internal/engine/engine_test.go` — `TestPing`.
 
@@ -86,9 +93,13 @@ Cenário: Verificar disponibilidade
 
 Uma nova gravação para a mesma chave deve substituir o valor anterior.
 
-**Componentes:** `Engine` e `Storage`.
+O fluxo de processamento de SET exige um `OperationID` válido. Essa validação é realizada pelo Handler/Executor antes da execução do comando pelo Engine.
+
+**Componentes:** `Handler`, `idempotency.Executor`, `Engine` e `Storage`.
 
 **Evidências:**
+
+- `server/internal/transport/tcp/handler.go` — encaminhamento de SET pelo fluxo de idempotência.
 - `server/internal/engine/engine.go` — `Engine.Execute`.
 - `server/internal/storage/storage.go` — `Storage.Set`.
 - `server/internal/engine/engine_test.go` — `TestSetAndGet`.
@@ -100,12 +111,15 @@ Uma nova gravação para a mesma chave deve substituir o valor anterior.
 Cenário: Gravar um valor
   Dado que a chave "name" não está vazia
   E que ttl_ms é zero
-  Quando SET for executado com o valor "memorydb"
-  Então o engine deve responder com sucesso
+  E que a solicitação contém um OperationID válido
+  Quando SET for executado pelo handler
+  Então o engine deve armazenar o valor
+  E a resposta deve indicar sucesso
   E um GET posterior deve encontrar os mesmos bytes
 
 Cenário: Substituir valor existente
   Dado que a chave "name" contém "old"
+  E que SET utiliza um OperationID válido
   Quando SET gravar "new" para a mesma chave
   Então GET deve retornar "new"
 ```
@@ -118,12 +132,17 @@ Cenário: Substituir valor existente
 
 O campo existe no contrato externo, mas a expiração automática de entradas não está implementada.
 
-**Componentes:** Contrato Protobuf e `Engine`.
+A solicitação deve possuir um OperationID válido, cuja validação ocorre no fluxo do Handler/Executor antes da execução do comando. Após essa validação, o Handler encaminha a operação ao Engine, que deve rejeitar o TTL positivo com o erro `UNSUPPORTED_FEATURE`, sem alterar o estado do armazenamento.
+
+**Componentes:** Contrato Protobuf, `Handler`, `idempotency.Executor` e `Engine`.
 
 **Evidências:**
+
 - `protocol/proto/memorydb/v1/memorydb.proto` — campo `ttl_ms`.
 - `server/internal/engine/engine.go` — validação de `TTLMillis`.
 - `server/internal/engine/engine_test.go` — `TestRejectsUnsupportedTTL`.
+- `server/internal/idempotency/fingerprint.go` — inclusão de TTL no fingerprint de SET.
+- `server/internal/idempotency/fingerprint_test.go` — testes do cálculo de fingerprint.
 
 **Critérios de aceite**
 
@@ -131,15 +150,16 @@ O campo existe no contrato externo, mas a expiração automática de entradas n�
 Cenário: Rejeitar SET com TTL positivo
   Dado que SET recebe uma chave não vazia
   E que ttl_ms é maior que zero
-  Quando o engine executar a solicitação
-  Então deve responder com success=false
+  E que a solicitação contém um OperationID válido
+  Quando o handler validar o OperationID e encaminhar a operação
+  Então o engine deve responder com success=false
   E o código do erro deve ser UNSUPPORTED_FEATURE
   E a entrada não deve ser gravada
 ```
 
 **Estado:** Implementado e testado quanto à rejeição.
 
-**Limitação:** A funcionalidade de expiração continua não implementada.
+**Limitação:** A funcionalidade de expiração continua não implementada. O valor de TTL também integra o fingerprint da operação, evitando que o mesmo `OperationID` seja reutilizado com parâmetros semanticamente diferentes.
 
 ### FR-004 — Consultar chave existente ou ausente
 
@@ -150,6 +170,7 @@ Para uma chave inexistente, deve retornar `found=false`, sem confundir ausência
 **Componentes:** `Engine` e `Storage`.
 
 **Evidências:**
+
 - `server/internal/engine/engine.go` — `Engine.Execute`.
 - `server/internal/storage/storage.go` — `Storage.Get`.
 - `server/internal/engine/engine_test.go` — `TestSetAndGet` e `TestGetMissingKey`.
@@ -185,13 +206,17 @@ Cenário: Consultar valor vazio
 
 Se a chave não existir, a operação deve continuar sendo uma resposta de sucesso e informar `deleted=false`.
 
-**Componentes:** `Engine` e `Storage`.
+DELETE exige um `OperationID` válido. Repetições da mesma operação lógica devem reproduzir o resultado original enquanto o registro de idempotência estiver retido.
+
+**Componentes:** `Handler`, `idempotency.Executor`, `Engine` e `Storage`.
 
 **Evidências:**
+
 - `server/internal/engine/engine.go` — `Engine.Execute`.
 - `server/internal/storage/storage.go` — `Storage.Delete`.
 - `server/internal/engine/engine_test.go` — `TestDelete`.
 - `server/internal/storage/storage_test.go` — `TestDelete`.
+- `server/internal/transport/tcp/handler_test.go` — testes de DELETE e idempotência.
 - `server/internal/integration/server_test.go` — `TestServerSetGetDelete`.
 
 **Critérios de aceite**
@@ -199,12 +224,14 @@ Se a chave não existir, a operação deve continuar sendo uma resposta de suces
 ```gherkin
 Cenário: Remover chave existente
   Dado que a chave "name" foi gravada
+  E que DELETE utiliza um OperationID válido
   Quando DELETE remover "name"
   Então a resposta deve indicar deleted=true
   E um GET posterior deve indicar found=false
 
 Cenário: Remover chave ausente
   Dado que a chave "missing" não existe
+  E que DELETE utiliza um OperationID válido
   Quando DELETE remover "missing"
   Então a resposta deve ser bem-sucedida
   E deve indicar deleted=false
@@ -222,19 +249,30 @@ Cenário: Remover chave ausente
 - comando representado por ponteiro tipado nulo;
 - chave vazia em SET, GET ou DELETE.
 
-Os erros devem ser representados por:
+O fluxo de processamento também deve rejeitar `OperationID` ausente ou com tamanho diferente de 16 bytes nas operações SET e DELETE.
+
+As validações são distribuídas entre os componentes: o Engine valida a estrutura da solicitação e os argumentos dos comandos; o Handler/Executor valida o identificador de idempotência antes de encaminhar as operações mutáveis.
+
+Os erros de validação devem ser representados por:
 
 | Condição | Código |
 |---|---|
 | Solicitação ou comando inválido | `INVALID_REQUEST` |
 | Chave vazia | `INVALID_ARGUMENT` |
+| `OperationID` ausente ou inválido | `INVALID_OPERATION_ID` |
 
-**Componentes:** `Engine` e `errorResponse`.
+Os erros de conflito, capacidade e resultado indeterminado relacionados à execução idempotente são especificados no FR-012.
+
+**Componentes:** `Engine`, `Handler`, `idempotency.Executor` e funções de construção de respostas de erro.
 
 **Evidências:**
+
 - `server/internal/engine/engine.go` — `Engine.Execute`.
 - `server/internal/engine/command.go` — `errorResponse`.
 - `server/internal/engine/engine_test.go` — `TestRejectsNilRequest`, `TestRejectsMissingCommand` e `TestRejectsEmptyKey`.
+- `server/internal/transport/tcp/handler.go` — validação de OperationID e conversão de erros de idempotência.
+- `server/internal/transport/tcp/handler_test.go` — testes de identificadores inválidos.
+- `server/internal/idempotency/executor_test.go` — testes do executor.
 
 **Critérios de aceite**
 
@@ -253,11 +291,17 @@ Cenário: Rejeitar chave vazia
   Dado que SET, GET ou DELETE foi recebido sem chave
   Quando o engine executar a solicitação
   Então deve responder com INVALID_ARGUMENT
+
+Cenário: Rejeitar OperationID inválido
+  Dado que SET ou DELETE recebeu um OperationID ausente ou com tamanho incorreto
+  Quando o handler processar a solicitação
+  Então deve responder com INVALID_OPERATION_ID
+  E não deve executar a mutação
 ```
 
 **Estado:** Implementado, cobertura parcial.
 
-**Lacuna de testes:** O teste identificado para chave vazia cobre SET. GET e DELETE possuem validação no código, mas não foram identificados testes específicos equivalentes para essas operações.
+**Lacunas de testes:** Foram identificados testes para solicitação nula, comando ausente e chave vazia em SET. Não foram identificados testes específicos para comando desconhecido, comando tipado nulo e chave vazia em GET e DELETE. A validação desses cenários deve ser confirmada no código e complementada na suíte de testes.
 
 ### FR-007 — Correlacionar respostas com solicitações
 
@@ -265,15 +309,20 @@ Cenário: Rejeitar chave vazia
 
 O codec deve preservar o identificador durante a serialização e desserialização.
 
-O identificador permite correlacionar uma resposta com sua solicitação correspondente. Não representa uma chave de idempotência e não impede a execução repetida de uma operação.
+O identificador permite correlacionar uma resposta com sua solicitação correspondente. Não representa uma chave de idempotência e não impede, por si só, a execução repetida de uma operação.
 
-**Componentes:** `Engine`, modelo interno e codec Protobuf.
+Nas respostas reproduzidas pelo mecanismo de idempotência, o `RequestID` deve ser atualizado para o identificador da tentativa atual, mantendo a correlação entre a requisição recebida e a resposta enviada.
+
+**Componentes:** `Engine`, modelo interno, codec Protobuf, `Handler` e `idempotency.Executor`.
 
 **Evidências:**
+
 - `protocol/proto/memorydb/v1/memorydb.proto` — envelopes `Request` e `Response`.
 - `server/internal/engine/engine.go` — `Engine.Execute`.
 - `server/internal/engine/engine_test.go` — `TestPing`.
 - `server/internal/codec/protobuf/codec_test.go` — `TestRequestRoundTrip` e `TestResponseRoundTrip`.
+- `server/internal/idempotency/executor_test.go` — testes de reprodução de resposta.
+- `server/internal/transport/tcp/handler_test.go` — teste de replay com atualização do RequestID.
 
 **Critérios de aceite**
 
@@ -287,11 +336,16 @@ Cenário: Preservar identificador na serialização
   Dado que uma requisição possui request_id 42
   Quando for serializada e desserializada
   Então o identificador deve permanecer 42
+
+Cenário: Atualizar RequestID em resposta reproduzida
+  Dado que uma operação já foi executada com determinado OperationID
+  Quando uma nova tentativa utilizar o mesmo OperationID e fingerprint
+  E possuir outro RequestID
+  Então a resposta reproduzida deve utilizar o RequestID da tentativa atual
+  E deve preservar o resultado semântico da operação original
 ```
 
 **Estado:** Implementado e testado.
-
-**Limitação:** Não existe deduplicação baseada nesse identificador.
 
 ### FR-008 — Delimitar mensagens TCP
 
@@ -310,6 +364,7 @@ Cabeçalhos ou payloads truncados, tamanho zero e tamanho acima do limite devem 
 **Componente:** Módulo `transport/tcp/go`.
 
 **Evidências:**
+
 - `transport/tcp/go/framing.go` — `ReadFrame` e `WriteFrame`.
 - `transport/tcp/go/framing_test.go` — testes de Big Endian, fragmentação, limites, truncamento e escrita parcial.
 
@@ -339,13 +394,14 @@ Cenário: Tratar escrita parcial
 
 **Descrição:** O handler deve processar várias requisições sequenciais em uma mesma conexão TCP.
 
-O servidor deve aceitar conexões de múltiplos clientes simultaneamente. As conexões de uma mesma instância devem compartilhar o mesmo armazenamento.
+O servidor deve aceitar conexões de múltiplos clientes simultaneamente. As conexões de uma mesma instância devem compartilhar o mesmo armazenamento e o mesmo executor de idempotência.
 
 O driver Go deve serializar o ciclo de requisição e resposta por conexão, garantindo a correspondência entre cada solicitação e sua resposta.
 
-**Componentes:** `Handler`, `Server`, transporte TCP, `Engine`, `Storage` e driver Go.
+**Componentes:** `Handler`, `Server`, transporte TCP, `Engine`, `Storage`, `idempotency.Executor` e driver Go.
 
 **Evidências:**
+
 - `server/internal/transport/tcp/handler.go` — `Handler.Handle`.
 - `server/internal/transport/tcp/server.go` — `Server.Serve`.
 - `transport/tcp/go/connection.go` — `Connection`.
@@ -353,6 +409,7 @@ O driver Go deve serializar o ciclo de requisição e resposta por conexão, gar
 - `server/internal/transport/tcp/handler_test.go` — `TestHandlerProcessesMultipleRequests`.
 - `server/internal/transport/tcp/server_test.go` — `TestServerAcceptsMultipleClients`.
 - `server/internal/integration/server_test.go` — testes de compartilhamento de storage e clientes concorrentes.
+- `server/internal/idempotency/executor_test.go` — testes de concorrência para identificadores repetidos.
 
 **Critérios de aceite**
 
@@ -371,6 +428,13 @@ Cenário: Atender clientes simultaneamente
   Dado que múltiplos clientes estão conectados
   Quando executarem operações simultaneamente
   Então o servidor deve processar as conexões sem interromper o atendimento
+
+Cenário: Compartilhar registros de idempotência
+  Dado que dois clientes estão conectados à mesma instância
+  Quando um deles executar uma operação mutável
+  E o outro repetir a mesma operação lógica com o mesmo OperationID
+  Então o servidor deve reconhecer o registro compartilhado
+  E não deve executar novamente a mutação
 ```
 
 **Estado:** Implementado e testado.
@@ -386,6 +450,7 @@ O executável deve solicitar encerramento ao receber SIGINT ou SIGTERM, utilizan
 **Componentes:** `Server` e executável do servidor.
 
 **Evidências:**
+
 - `server/internal/transport/tcp/server.go` — `Server.Shutdown`.
 - `server/cmd/memorydb/main.go` — inicialização e tratamento de sinais.
 - `server/internal/transport/tcp/server_test.go` — `TestServerShutdownWaitsForActiveConnections`.
@@ -411,6 +476,7 @@ Cenário: Encerrar após sinal do sistema operacional
 **Estado:** Implementado, cobertura parcial.
 
 **Limitações:**
+
 - O servidor não força o fechamento das conexões ativas quando o contexto expira.
 - O fluxo de sinais do executável não possui teste automatizado específico identificado.
 
@@ -428,11 +494,19 @@ O comportamento do cancelamento depende da fase da operação:
 
 O erro `OperationOutcomeUnknownError` deve preservar o identificador da solicitação e a causa original, permitindo inspeção por `errors.As` e `errors.Is`.
 
-**Componente:** Driver Go.
+Esse erro do driver representa uma incerteza causada pela interrupção da comunicação. É distinto do código estruturado `OPERATION_OUTCOME_UNKNOWN`, que pode ser retornado pelo servidor quando o Executor não consegue determinar com segurança o resultado da operação.
+
+Quando o resultado for indeterminado em uma operação SET ou DELETE, a aplicação poderá repetir a mesma operação lógica utilizando o mesmo `OperationID`, desde que os parâmetros semânticos permaneçam iguais e o registro ainda esteja retido na instância do servidor.
+
+**Componente:** Driver Go, com suporte do mecanismo de idempotência no servidor para recuperação por repetição.
 
 **Evidências:**
+
 - `drivers/go/client.go` — `DialContext`, métodos context-aware e `Client.execute`.
 - `drivers/go/client_test.go` — testes de escrita parcial, execução no servidor seguida de perda da resposta e cancelamento durante a leitura da resposta.
+- `drivers/go/client_test.go` — `TestClientSetReturnsUnknownOutcomeAfterServerExecution`, que comprova a sinalização de resultado indeterminado após a execução no servidor.
+- `server/internal/idempotency/executor_test.go` — testes de reprodução do resultado original para operações repetidas com o mesmo identificador e fingerprint.
+- `server/internal/transport/tcp/handler_test.go` — testes de integração do replay e atualização do RequestID.
 
 **Critérios de aceite**
 
@@ -457,72 +531,124 @@ Cenário: Preservar a causa original
   Quando a aplicação inspecionar o erro
   Então deve conseguir identificar seu tipo com errors.As
   E deve conseguir verificar sua causa com errors.Is
+
+Cenário: Repetir operação indeterminada com o mesmo OperationID
+  Dado que uma operação SET ou DELETE retornou resultado indeterminado
+  E que a aplicação preservou o OperationID original
+  Quando a aplicação repetir a mesma operação lógica com o mesmo OperationID
+  E os parâmetros semânticos forem idênticos
+  E o registro ainda estiver retido no servidor
+  Então o servidor deverá reproduzir o resultado original
+  E não deverá executar novamente a mutação
 ```
 
-**Estado:** Implementado e testado no driver Go.
+**Estado:** Implementado, cobertura parcial.
 
-**Limitação:** O controle por contexto não garante que uma operação cancelada durante I/O deixou de ser executada no servidor. Não existe mecanismo server-side para consultar ou recuperar seu resultado. O driver não realiza retry automático.
+**Limitações:**
+
+- O controle por contexto não garante que uma operação cancelada durante I/O deixou de ser executada no servidor.
+- A recuperação por repetição depende de a operação ser SET ou DELETE, de o cliente reutilizar o mesmo `OperationID` e de o registro permanecer disponível na mesma instância do servidor.
+- O driver não realiza retry automático.
+- Não há garantia de recuperação após reinicialização, perda do processo ou expiração do registro.
+- A recuperação por repetição está implementada no servidor e possui cobertura nos testes do Executor e do Handler. Não foi identificado teste ponta a ponta que comprove a sequência completa de resultado indeterminado no driver seguida de repetição e recuperação do resultado original.
 
 ### FR-012 — Executar operações mutáveis com idempotência
 
-**Descrição:** O servidor deverá oferecer deduplicação para as operações `SET` e `DELETE`, utilizando um identificador estável de operação (`OperationID`) independente do identificador de requisição (`RequestID`).
+**Descrição:** O servidor deve oferecer deduplicação para as operações `SET` e `DELETE`, utilizando um identificador estável de operação (`OperationID`) independente do identificador de requisição (`RequestID`).
 
-O contrato está especificado, mas a funcionalidade ainda não está implementada.
+O `OperationID` identifica uma operação lógica. O `RequestID` identifica uma tentativa de requisição e correlaciona sua resposta.
 
-**Contrato aprovado:**
+O servidor calcula um fingerprint dos parâmetros semanticamente relevantes da operação e associa o resultado terminal ao `OperationID`.
+
+**Contrato implementado:**
 
 | Propriedade | Definição |
 |---|---|
 | Identificador | `OperationID` de 128 bits |
+| Representação interna | `[16]byte` no driver e `[]byte` no modelo de protocolo |
 | Representação externa | Campo Protobuf `bytes`, com exatamente 16 bytes |
 | Escopo | Global na instância do servidor |
 | Operações protegidas | `SET` e `DELETE` |
-| Retenção | 24 horas após o resultado terminal |
+| Retenção | 24 horas após a conclusão da operação |
 | Capacidade padrão | 100.000 registros |
-| Capacidade configurável | Sim |
+| Capacidade configurável | Não identificada como configuração externa na implementação atual |
 | Armazenamento | Memória |
-| Evicção antecipada | Proibida para registros ainda válidos |
+| Evicção antecipada | Não ocorre para registros ainda válidos |
+| Fingerprint | SHA-256 com esquema versionado |
+| Persistência | Não implementada |
 
-`SET` e `DELETE` deverão rejeitar solicitações sem `OperationID` ou com identificador de tamanho inválido.
+`SET` e `DELETE` rejeitam solicitações sem `OperationID` ou com identificador de tamanho inválido.
 
-O `RequestID` continuará identificando cada tentativa de requisição. O `OperationID` deverá ser reutilizado quando a aplicação repetir a mesma operação lógica.
+O `RequestID` continua identificando cada tentativa de requisição. O `OperationID` deve ser reutilizado quando a aplicação repetir a mesma operação lógica.
 
-O fingerprint deverá considerar o comando e todos os parâmetros semanticamente relevantes, incluindo chave, valor e TTL quando aplicável.
+O fingerprint considera:
 
-**Comportamentos exigidos:**
+- o tipo da operação;
+- a chave;
+- o valor, no caso de SET;
+- o TTL, no caso de SET.
 
-| Situação | Resultado esperado |
+O próprio `OperationID` não integra o fingerprint.
+
+**Comportamentos implementados:**
+
+| Situação | Resultado |
 |---|---|
 | Primeiro uso de um `OperationID` válido | Reservar o identificador e executar a operação |
 | Mesmo identificador e mesmo fingerprint, após conclusão | Reproduzir o resultado armazenado sem executar novamente |
 | Mesmo identificador e fingerprint diferente | Rejeitar por conflito |
 | Requisições concorrentes com mesmo identificador e fingerprint | Aguardar a execução original e receber resultado semanticamente equivalente |
 | Capacidade esgotada para identificador inédito | Rejeitar antes da execução, com erro específico |
-| Identificador já expirado | Não há mais garantia de deduplicação para esse registro |
+| Identificador expirado | Não há mais garantia de deduplicação para esse registro |
+| Requisição repetida com outro `RequestID` | Reproduzir o resultado com o `RequestID` da tentativa atual |
 
-A resposta reproduzida deverá conter o `RequestID` da tentativa atual, preservando a correlação entre a requisição recebida e a resposta enviada. O resultado semântico deverá corresponder ao resultado armazenado da operação original.
+A resposta reproduzida contém o `RequestID` da tentativa atual, preservando a correlação entre a requisição recebida e a resposta enviada. O resultado semântico corresponde ao resultado armazenado da operação original.
 
-A capacidade máxima deverá contar registros em andamento e concluídos. A rejeição por capacidade não deverá reservar o identificador nem executar a mutação. O identificador poderá ser tentado novamente quando houver capacidade disponível.
+A capacidade máxima conta registros em andamento e concluídos. A rejeição por capacidade não reserva o identificador nem executa a mutação. O identificador poderá ser tentado novamente quando houver capacidade disponível.
 
-O prazo de retenção começará após a conclusão da operação. Registros em andamento não expiram por essa janela. Respostas estruturadas e reproduzíveis, inclusive erros determinísticos de aplicação, deverão ser armazenadas.
+O prazo de retenção começa após a conclusão da operação. Registros em andamento não expiram por essa janela.
 
-Uma reserva somente poderá ser liberada após falha quando houver comprovação de que a mutação não foi executada. Um resultado indeterminado não poderá ser tratado como uma falha comprovadamente anterior à execução.
+Respostas terminais estruturadas e reproduzíveis, inclusive erros determinísticos de aplicação, são armazenadas.
+
+Uma reserva somente pode ser liberada após falha quando houver comprovação de que a mutação não foi executada. Um resultado indeterminado não pode ser tratado como uma falha comprovadamente anterior à execução.
+
+O executor realiza a execução da operação fora de sua seção crítica, evitando manter o mutex durante a execução do Engine. Requisições concorrentes para o mesmo identificador aguardam o resultado da execução original.
 
 **Limites da garantia:**
 
-A garantia inicial será de no máximo uma execução por `OperationID` enquanto o registro estiver retido na mesma instância do servidor.
+A garantia é de no máximo uma execução por `OperationID` enquanto o registro estiver retido na mesma instância do servidor.
 
 Os registros são exclusivamente em memória. Portanto, a deduplicação não sobrevive à reinicialização ou perda do processo.
 
 Essa garantia não representa *exactly-once*. A durabilidade exigiria persistência atômica da mutação e do registro de deduplicação.
 
-**Componentes previstos:**
+A expiração do registro após 24 horas também encerra a garantia de deduplicação para aquele identificador. Uma repetição posterior poderá ser tratada como uma nova operação.
+
+**Componentes:**
+
 - Schema Protobuf e tipos gerados.
 - Modelo interno de protocolo.
 - Handler e fluxo de processamento do servidor.
-- Gerenciador de idempotência.
+- Pacote `server/internal/idempotency`.
 - Engine.
 - Driver Go.
+
+**Evidências:**
+
+- `protocol/proto/memorydb/v1/memorydb.proto` — campos `operation_id`.
+- `protocol/generated/go/memorydb/v1/memorydb.pb.go` — tipos Protobuf gerados.
+- `server/internal/protocol/message.go` — `SetCommand` e `DeleteCommand`.
+- `server/internal/codec/protobuf/codec.go` — conversão dos identificadores.
+- `server/internal/idempotency/executor.go` — execução, reserva, replay, concorrência, retenção e capacidade.
+- `server/internal/idempotency/fingerprint.go` — cálculo do fingerprint.
+- `server/internal/idempotency/executor_test.go` — testes do executor.
+- `server/internal/idempotency/fingerprint_test.go` — testes de fingerprint.
+- `server/internal/transport/tcp/handler.go` — integração do executor ao fluxo de requisições.
+- `server/internal/transport/tcp/handler_test.go` — testes de integração do handler com idempotência.
+- `server/internal/integration/server_test.go` — testes de integração do servidor.
+- `drivers/go/operation_id.go` — tipo `OperationID` e geração de identificadores.
+- `drivers/go/client.go` — envio do identificador nas operações mutáveis.
+- `drivers/go/client_test.go` — testes do driver.
 
 **Critérios de aceite**
 
@@ -564,11 +690,20 @@ Cenário: Rejeitar operação mutável sem identificador
   Dado que uma solicitação SET ou DELETE não contém OperationID válido
   Quando o servidor validar a solicitação
   Então deverá rejeitá-la antes da execução
+
+Cenário: Reutilizar identificador após rejeição por capacidade
+  Dado que uma operação foi rejeitada porque a capacidade estava esgotada
+  E que seu identificador não foi reservado
+  Quando houver capacidade disponível
+  E a aplicação reenviar a operação com o mesmo OperationID e fingerprint
+  Então o servidor deverá poder processar a operação normalmente
 ```
 
-**Estado:** Especificado e aprovado em 22/11/2026; não implementado.
+**Estado:** Implementado, cobertura parcial.
 
-**Observação de compatibilidade:** tornar `OperationID` obrigatório para `SET` e `DELETE` altera o comportamento esperado dos clientes existentes. Os drivers deverão ser atualizados de forma coordenada com o servidor.
+**Observação sobre cobertura:** Os cenários de idempotência descritos possuem cobertura nos testes identificados do servidor e do driver. A sequência ponta a ponta de resultado indeterminado no driver seguida de repetição e recuperação do resultado original não possui teste específico identificado.
+
+**Observação de compatibilidade:** Tornar `OperationID` obrigatório para `SET` e `DELETE` altera o comportamento esperado dos clientes existentes. Os drivers devem ser atualizados de forma coordenada com o servidor.
 
 ## 4. Requisitos não funcionais e características verificáveis
 
@@ -584,13 +719,16 @@ Esta seção registra características observáveis da implementação atual. It
 | NFR-006 | Comunicação deve oferecer criptografia TLS. | Não implementado | `server/cmd/memorydb/main.go` |
 | NFR-007 | O servidor deve impor timeouts de I/O e limites operacionais de conexões. | Não implementado | `server/internal/transport/tcp/server.go`, `transport/tcp/go/connection.go` |
 | NFR-008 | O projeto deve possuir metas mensuráveis de latência e throughput. | Não identificado | Não foram identificadas metas ou benchmarks de performance |
-| NFR-009 | Falhas de processamento de conexões devem ser observáveis em logs. | Não implementado no fluxo atual | `server/internal/transport/tcp/server.go` |
+| NFR-009 | Falhas de processamento de conexões devem ser observáveis em logs. | Não implementado | `server/internal/transport/tcp/server.go` |
 | NFR-010 | Execução de comandos, storage, protocolo, codec e transporte devem possuir responsabilidades separadas. | Implementado | Pacotes internos do módulo `server` |
 | NFR-011 | O transporte TCP deve ser reutilizável sem dependência direta do Protobuf. | Implementado | `transport/tcp/go`, `drivers/go`, handler do servidor |
 | NFR-012 | Aplicações Go devem consumir o serviço por meio de uma API cliente. | Implementado e testado | `drivers/go/client.go`, `drivers/go/client_test.go` |
 | NFR-013 | Os módulos Go devem permitir desenvolvimento e testes independentes no workspace. | Implementado | `go.work` e arquivos `go.mod` |
-| NFR-014 | O código deve passar pelos testes com detector de condições de corrida e análise estática. | Validação histórica | Registros de validação por módulo descritos na seção 8 |
-| NFR-015 | O registro de idempotência deve respeitar capacidade configurada, retenção de 24 horas e ausência de evicção antecipada de registros válidos. | Especificado, não implementado | Contrato FR-012; implementação futura no gerenciador de idempotência |
+| NFR-014 | O código deve passar pelos testes com detector de condições de corrida e análise estática. | Implementado, validação histórica | Registros de validação por módulo descritos na seção 8 |
+| NFR-015 | O registro de idempotência deve respeitar capacidade padrão de 100.000 registros, retenção de 24 horas e ausência de evicção antecipada de registros válidos. | Implementado e testado | `server/internal/idempotency/executor.go`, `executor_test.go` |
+| NFR-016 | A execução de operações com o mesmo `OperationID` deve ser sincronizada, evitando execuções concorrentes duplicadas. | Implementado e testado | `server/internal/idempotency/executor.go`, `executor_test.go` |
+| NFR-017 | O executor de idempotência deve calcular fingerprints determinísticos para operações mutáveis. | Implementado e testado | `server/internal/idempotency/fingerprint.go`, `fingerprint_test.go` |
+
 ### 4.1 Observações sobre os requisitos não funcionais
 
 **NFR-004 — Shutdown**
@@ -611,13 +749,21 @@ A goroutine criada por `Server.Serve()` descarta o erro retornado por `Handler.H
 
 A aprovação em testes é uma evidência associada a uma versão do código e a uma execução específica. Não representa garantia permanente para alterações futuras.
 
+**NFR-015 a NFR-017 — Idempotência**
+
+A capacidade de 100.000 registros corresponde ao valor padrão implementado. Não deve ser interpretada como uma configuração externa disponível ao operador.
+
+A retenção de 24 horas começa após a conclusão da operação. Registros em andamento não expiram por essa janela.
+
+Os registros de idempotência são mantidos em memória e não oferecem durabilidade após reinicialização.
+
 ## 5. Casos de borda e comportamento observado
 
 | Caso | Comportamento atual | Evidência |
 |---|---|---|
 | Solicitação nula | Retorna `INVALID_REQUEST` no engine | `engine.go`, `engine_test.go` |
 | Comando ausente | Retorna `INVALID_REQUEST` | `engine.go`, `engine_test.go` |
-| Comando tipado nulo | Rejeitado como requisição inválida | `engine.go`, `engine_test.go` |
+| Comando tipado nulo | Rejeitado como requisição inválida | `engine.go`; teste específico não identificado |
 | Chave vazia | SET, GET e DELETE rejeitam com `INVALID_ARGUMENT` | `engine.go`, `engine_test.go` |
 | TTL maior que zero | SET retorna `UNSUPPORTED_FEATURE` | `engine.go`, `engine_test.go` |
 | Valor vazio | Pode ser armazenado; GET informa `found=true` | `storage.go`, `storage_test.go` |
@@ -637,24 +783,34 @@ A aprovação em testes é uma evidência associada a uma versão do código e a
 | Cancelamento antes do I/O | Retorna erro de contexto sem invalidar a conexão | `client.go`, `client_test.go` |
 | Cancelamento durante o I/O | Interrompe conexão e sinaliza resultado indeterminado | `client.go`, `client_test.go` |
 | Escrita parcial seguida de falha | Driver não presume que a operação deixou de ser executada | `client_test.go` |
-| Servidor executa SET, mas resposta não chega | Driver pode retornar resultado indeterminado | `TestClientSetReturnsUnknownOutcomeAfterServerExecution` |
+| Servidor executa SET, mas resposta não chega | Driver pode retornar resultado indeterminado. Uma repetição com o mesmo OperationID e fingerprint pode recuperar o resultado original enquanto o registro estiver retido; essa sequência completa não possui teste ponta a ponta identificado | `TestClientSetReturnsUnknownOutcomeAfterServerExecution`, testes de idempotência do Executor e Handler |
 | Identificador da solicitação | `request_id` correlaciona solicitação e resposta; não deduplica | `memorydb.proto`, `client.go` |
+| OperationID ausente ou inválido | SET e DELETE são rejeitados antes da mutação | `handler.go`, `handler_test.go` |
+| Mesmo OperationID e mesmo fingerprint | Resultado original é reproduzido sem nova execução | `executor_test.go`, `handler_test.go` |
+| Mesmo OperationID e fingerprint diferente | Requisição é rejeitada por conflito | `executor_test.go`, `handler_test.go` |
+| Requisições concorrentes com mesmo OperationID | Requisição duplicada aguarda a execução original | `executor_test.go` |
+| Capacidade de idempotência esgotada | Novas operações com identificador inédito são rejeitadas antes da execução | `executor_test.go`, `handler_test.go` |
+| Registro de idempotência expirado | Identificador deixa de possuir garantia de deduplicação | `executor_test.go` |
+| Registro em andamento | Não expira pela janela de retenção de operações concluídas | `executor_test.go` |
+| Resposta reproduzida | Mantém o resultado semântico e atualiza o RequestID para a tentativa atual | `executor_test.go`, `handler_test.go` |
+| Reinicialização do servidor | Dados e registros de idempotência são perdidos | `storage.go`, `idempotency/executor.go` |
 
 ## 6. Rastreabilidade requisito–componente–teste
 
 | Requisito | Componente principal | Testes identificados | Cobertura |
 |---|---|---|---|
 | FR-001 | Engine | `TestPing` | Coberto |
-| FR-002 | Engine / Storage | `TestSetAndGet`, `TestSetOverwritesExistingValue` | Coberto |
-| FR-003 | Engine | `TestRejectsUnsupportedTTL` | Coberto para rejeição |
+| FR-002 | Handler / Executor / Engine / Storage | `TestSetAndGet`, `TestSetOverwritesExistingValue` | Coberto para gravação e substituição; validação de OperationID coberta no FR-006 |
+| FR-003 | Handler / Executor / Engine | TestRejectsUnsupportedTTL, testes de fingerprint | Coberto para rejeição; ausência de gravação não verificada especificamente |
 | FR-004 | Engine / Storage | `TestGetMissingKey`, `TestEmptyValue`, `TestServerEmptyValueAndMissingKey` | Coberto |
-| FR-005 | Engine / Storage | `TestDelete`, `TestServerSetGetDelete` | Coberto |
-| FR-006 | Engine | `TestRejectsEmptyKey`, `TestRejectsNilRequest`, `TestRejectsMissingCommand` | Parcial: faltam testes específicos de chave vazia em GET e DELETE |
-| FR-007 | Engine / Codec | `TestPing`, `TestRequestRoundTrip`, `TestResponseRoundTrip` | Coberto |
+| FR-005 | Handler / Engine / Storage | `TestDelete`, `TestServerSetGetDelete`, testes de idempotência | Coberto |
+| FR-006 | Engine / Handler / Executor | `TestRejectsEmptyKey`, `TestRejectsNilRequest`, `TestRejectsMissingCommand`, testes de identificador inválido | Parcial: faltam testes específicos de chave vazia em GET e DELETE |
+| FR-007 | Engine / Codec / Executor | `TestPing`, `TestRequestRoundTrip`, `TestResponseRoundTrip`, testes de replay | Coberto |
 | FR-008 | Framing TCP | Testes de endian, fragmentação, limites, truncamento e escrita parcial | Coberto |
-| FR-009 | Handler / Server / Driver | `TestHandlerProcessesMultipleRequests`, `TestServerAcceptsMultipleClients`, testes de integração | Coberto para conexões distintas e requisições sequenciais |
+| FR-009 | Handler / Server / Driver / Executor | `TestHandlerProcessesMultipleRequests`, `TestServerAcceptsMultipleClients`, testes de integração e concorrência do executor | Coberto para conexões distintas e requisições sequenciais |
 | FR-010 | Server / Executável | `TestServerShutdownWaitsForActiveConnections` | Parcial: fluxo de sinais sem teste específico identificado |
-| FR-011 | Driver Go | Testes de escrita parcial, execução no servidor com perda da resposta e cancelamento durante leitura | Coberto para os cenários identificados |
+| FR-011 | Driver Go / Executor / Handler | Testes de escrita parcial, execução no servidor com perda da resposta, cancelamento durante leitura e replay no servidor | Parcial: cancelamento e sinalização de resultado indeterminado cobertos; recuperação por repetição validada no servidor, sem teste ponta a ponta com o driver |
+| FR-012 | Protobuf / Handler / Executor / Driver Go | `executor_test.go`, `fingerprint_test.go`, `handler_test.go`, `server_test.go`, `client_test.go` e testes de integração | Parcial: cenários de idempotência cobertos; recuperação ponta a ponta após resultado indeterminado sem teste específico identificado |
 
 ## 7. Lacunas de especificação e comportamento
 
@@ -728,27 +884,28 @@ O driver Go utiliza sincronização para garantir que uma solicitação seja env
 
 **Referência:** `drivers/go/client.go`.
 
-### GAP-009 — Resultado indeterminado sem recuperação server-side
+### GAP-009 — Durabilidade e recuperação da idempotência não implementadas
 
-O driver Go identifica situações nas quais o resultado de uma operação não pode ser confirmado pelo cliente.
+A implementação atual oferece idempotência para SET e DELETE por meio de registros mantidos em memória.
 
-Quando o cancelamento acontece antes do início do I/O, o driver retorna o erro de contexto sem invalidar a conexão.
+Enquanto o registro estiver retido na mesma instância do servidor, uma repetição com o mesmo `OperationID` e fingerprint reproduz o resultado original sem executar novamente a mutação.
 
-Quando o cancelamento ou uma falha de comunicação acontece durante o I/O, o servidor pode já ter executado o comando, mesmo que o cliente não tenha recebido a resposta.
+Entretanto, os registros de idempotência não são persistidos.
 
-Nesse cenário, o driver interrompe a conexão e retorna `OperationOutcomeUnknownError`, preservando o `RequestID` e a causa original.
+O servidor ainda não oferece:
 
-Entretanto, o servidor ainda não oferece:
+- persistência dos registros de idempotência;
+- recuperação desses registros após reinicialização;
+- garantia de deduplicação entre instâncias distintas;
+- consulta independente do resultado por `OperationID`;
+- garantia de deduplicação após a expiração do registro;
+- persistência atômica da mutação e do respectivo registro de idempotência.
 
-- identificador estável de operação para deduplicação;
-- registro de operações executadas e seus resultados;
-- consulta posterior do resultado de uma operação;
-- reenvio seguro com garantia de não duplicação;
-- recuperação de resultados após desconexão.
+**Impacto:** a recuperação de resultados indeterminados depende de a aplicação repetir a operação com o mesmo `OperationID`, parâmetros semânticos idênticos e registro ainda disponível na mesma instância. Após reinicialização ou expiração, não existe garantia de que a operação não será executada novamente.
 
-**Impacto:** aplicações precisam tratar explicitamente resultados indeterminados. Repetir automaticamente uma operação após esse erro pode executar o comando novamente. O driver não realiza retry automático.
+Uma evolução com persistência deverá tratar atomicamente a mutação e o registro de idempotência para evitar divergências entre o estado dos dados e o estado de deduplicação.
 
-**Referência:** `drivers/go/client.go`.
+**Referências:** `server/internal/idempotency/executor.go`, `server/internal/storage/storage.go`.
 
 ### GAP-010 — Driver Java não implementado e validado
 
@@ -756,58 +913,72 @@ A arquitetura permite evolução para outros drivers, mas não há implementaç�
 
 **Impacto:** a integração por Java não deve ser considerada requisito implementado.
 
-### GAP-011 — Idempotência e deduplicação não implementadas
+### GAP-011 — Configuração operacional da idempotência não exposta
 
-O protocolo possui `request_id`, utilizado para correlacionar requisições e respostas. Entretanto, esse identificador não constitui uma chave de idempotência.
+A implementação utiliza capacidade padrão de 100.000 registros e retenção padrão de 24 horas.
 
-O servidor não mantém registro de operações executadas, não identifica reenvios de uma mesma operação lógica e não reproduz resultados anteriores.
+Não foi identificada configuração externa para ajustar esses parâmetros no executável do servidor.
 
-**Impacto:** em caso de perda de resposta ou resultado indeterminado, o cliente não consegue reenviar uma operação com garantia de que ela será executada no máximo uma vez.
+**Impacto:** operadores não podem ajustar esses limites por configuração de inicialização. Alterações nos valores padrão exigem mudança na implementação.
 
-A implementação futura deverá definir:
-
-- identificador estável da operação, independente do identificador de transporte;
-- escopo e período de retenção dos identificadores;
-- armazenamento do resultado associado à operação;
-- comportamento para identificadores repetidos com conteúdo divergente;
-- política de concorrência para requisições com o mesmo identificador;
-- relação entre deduplicação, persistência e recuperação após reinicialização.
-
-**Referências:** `protocol/proto/memorydb/v1/memorydb.proto`, `drivers/go/client.go`.
+**Referências:** `server/internal/idempotency/executor.go`, `server/cmd/memorydb/main.go`.
 
 ## 8. Histórico de validação técnica
 
-Os registros disponíveis indicam uma validação integral dos módulos em 15/11/2026, com os seguintes resultados:
+Em 22/11/2026, foram executados testes, análise estática e testes com detector de condições de corrida nos cinco módulos do workspace.
 
-| Módulo | `go test -race -count=1 ./...` | `go vet ./...` |
-|---|---|---|
-| `protocol/generated/go` | Aprovado — sem testes próprios | Aprovado |
-| `transport/tcp/go` | Aprovado | Aprovado |
-| `drivers/go` | Aprovado | Aprovado |
-| `server` | Aprovado | Aprovado |
-| `api` | Aprovado — sem testes próprios | Aprovado |
-
-Após essa validação, o driver Go recebeu testes adicionais relacionados a resultados indeterminados, cancelamento durante I/O e falhas de comunicação.
-
-Na validação posterior do driver, foram executados com sucesso:
+A validação de testes e análise estática utilizou:
 
 ```bash
-go test -v -count=1 ./drivers/go
-go test -race -count=1 ./drivers/go
-go test -race -count=20 ./drivers/go
-go vet ./drivers/go
+for module in server transport/tcp/go protocol/generated/go drivers/go api; do
+    (
+        cd "$module" &&
+        go test ./... &&
+        go vet ./...
+    ) || exit 1
+done
 ```
 
-Os cenários adicionais contemplaram:
+Os resultados foram aprovados em todos os módulos.
 
-- falha durante escrita parcial;
-- servidor executando SET antes de a resposta ser perdida;
-- cancelamento durante a leitura da resposta final;
-- preservação do identificador e da causa do resultado indeterminado.
+A validação com detector de condições de corrida utilizou:
 
-**Observação:** a validação integral de 15/11 comprova o estado dos módulos naquela execução. As validações posteriores comprovam cenários adicionais do driver Go, mas não substituem uma nova execução completa de todos os módulos após as alterações.
+```bash
+for module in server transport/tcp/go protocol/generated/go drivers/go api; do
+    (
+        cd "$module" &&
+        go test -race -count=20 ./...
+    ) || exit 1
+done
+```
 
-Para atualizar a evidência do estado atual, executar novamente os testes e a análise estática em cada módulo do workspace.
+Os resultados também foram aprovados em todos os módulos.
+
+| Módulo | `go test ./...` | `go vet ./...` | `go test -race -count=20 ./...` |
+|---|---|---|---|
+| `server` | Aprovado | Aprovado | Aprovado |
+| `transport/tcp/go` | Aprovado | Aprovado | Aprovado |
+| `protocol/generated/go` | Aprovado — sem testes próprios | Aprovado | Aprovado — sem testes próprios |
+| `drivers/go` | Aprovado | Aprovado | Aprovado |
+| `api` | Aprovado | Aprovado | Aprovado — sem testes próprios |
+
+A validação também contemplou:
+
+- testes de concorrência, replay, conflito, capacidade e expiração do executor de idempotência;
+- testes de cálculo de fingerprint;
+- testes de validação de `OperationID` no handler;
+- testes de reprodução de resposta com atualização do `RequestID`;
+- testes de integração das operações mutáveis;
+- testes do driver para resultados indeterminados;
+- testes de cancelamento durante I/O;
+- testes de preservação da causa original do erro.
+
+A formatação foi verificada com `gofmt -l`, sem arquivos pendentes de formatação. `git diff --check` também foi executado sem apontar erros.
+
+
+**Observação:** os resultados registrados comprovam o estado dos módulos naquela execução, em 22/11/2026. Não representam garantia permanente para alterações futuras.
+
+Como o repositório utiliza um workspace com módulos independentes e não possui um módulo Go na raiz, os comandos de teste devem ser executados nos diretórios de cada módulo. A execução de `go test ./...` diretamente na raiz do workspace não é a forma de validação adotada.
 
 ## 9. Critério geral de conclusão do escopo atual
 
@@ -822,7 +993,9 @@ O escopo funcional inicial do MemoryDB é considerado implementado quando:
 7. O driver Go permite consumir as operações sem implementar manualmente o protocolo.
 8. O driver Go oferece operações context-aware e sinaliza resultados indeterminados quando não é possível confirmar o desfecho de uma operação.
 9. O servidor oferece encerramento gracioso dentro das limitações documentadas.
-10. Os testes automatizados e a análise estática passam nos módulos do workspace.
+10. SET e DELETE exigem `OperationID` e possuem deduplicação server-side com fingerprint, replay de respostas, controle de concorrência, retenção e capacidade.
+11. O driver Go permite gerar e fornecer `OperationID`, sem realizar retries automáticos.
+12. A validação automatizada registrada para a versão documentada inclui testes, análise estática e testes com detector de condições de corrida nos módulos do workspace.
 
 Os GAPs documentados neste arquivo não impedem a conclusão do escopo inicial, pois representam evoluções planejadas e limitações conhecidas da implementação atual.
 
