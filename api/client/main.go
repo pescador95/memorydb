@@ -8,18 +8,39 @@ import (
 	memorydb "github.com/pescador95/memorydb/drivers/go"
 )
 
+type memoryDBClient interface {
+	Ping() error
+	Set(operationID memorydb.OperationID, key string, value []byte) error
+	Get(key string) ([]byte, bool, error)
+	Delete(operationID memorydb.OperationID, key string) (bool, error)
+	Close() error
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
 }
+
 func run() error {
-	config, err := clientconfig.Load()
+	return runWith(
+		clientconfig.Load,
+		dialClient,
+		memorydb.NewOperationID,
+	)
+}
+
+func runWith(
+	loadConfig func() (clientconfig.Config, error),
+	dial func(memorydb.DialConfig) (memoryDBClient, error),
+	newOperationID func() (memorydb.OperationID, error),
+) error {
+	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("carregar configuração do cliente: %w", err)
 	}
 
-	client, err := memorydb.DialWithConfig(memorydb.DialConfig{
+	client, err := dial(memorydb.DialConfig{
 		Address: config.Address,
 		Timeout: config.DialTimeout,
 	})
@@ -28,14 +49,21 @@ func run() error {
 	}
 	defer client.Close()
 
-	if err := executeExample(client); err != nil {
+	if err := executeExample(client, newOperationID); err != nil {
 		return fmt.Errorf("executar demonstração: %w", err)
 	}
 
 	return nil
 }
 
-func executeExample(client *memorydb.Client) error {
+func dialClient(config memorydb.DialConfig) (memoryDBClient, error) {
+	return memorydb.DialWithConfig(config)
+}
+
+func executeExample(
+	client memoryDBClient,
+	newOperationID func() (memorydb.OperationID, error),
+) error {
 	if err := client.Ping(); err != nil {
 		return fmt.Errorf("executar PING: %w", err)
 	}
@@ -45,8 +73,7 @@ func executeExample(client *memorydb.Client) error {
 	key := "user:1"
 	value := []byte("memorydb")
 
-	operationID, err := memorydb.NewOperationID()
-
+	operationID, err := newOperationID()
 	if err != nil {
 		return fmt.Errorf("gerar OperationID para SET: %w", err)
 	}
@@ -68,8 +95,7 @@ func executeExample(client *memorydb.Client) error {
 
 	fmt.Printf("GET: %s\n", string(result))
 
-	operationID, err = memorydb.NewOperationID()
-
+	operationID, err = newOperationID()
 	if err != nil {
 		return fmt.Errorf("gerar OperationID para DELETE: %w", err)
 	}
@@ -91,5 +117,6 @@ func executeExample(client *memorydb.Client) error {
 	}
 
 	fmt.Printf("GET após DELETE: chave encontrada = %t\n", foundAfterDelete)
+
 	return nil
 }
