@@ -612,3 +612,48 @@ func TestCloneResponseRejectsNil(t *testing.T) {
 		t.Fatalf("cloneResponse(nil) = %v, want nil", cloned)
 	}
 }
+
+func TestExecuteRetainsUnknownOutcomeForNilResult(t *testing.T) {
+	executor := newTestExecutor(t, time.Hour, 10)
+
+	callbackCalls := 0
+
+	execute := func() *protocol.Response {
+		callbackCalls++
+
+		return &protocol.Response{
+			Success: true,
+			Result:  nil,
+		}
+	}
+
+	_, err := executor.Execute(
+		testOperationID(1),
+		10,
+		testFingerprint(1),
+		execute,
+	)
+
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
+	}
+
+	if callbackCalls != 1 {
+		t.Fatalf("callback calls = %d, want 1", callbackCalls)
+	}
+
+	_, err = executor.Execute(
+		testOperationID(1),
+		20,
+		testFingerprint(1),
+		execute,
+	)
+
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("replay error = %v, want ErrOutcomeUnknown", err)
+	}
+
+	if callbackCalls != 1 {
+		t.Fatalf("callback calls after replay = %d, want 1", callbackCalls)
+	}
+}
