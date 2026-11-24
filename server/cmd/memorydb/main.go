@@ -25,12 +25,28 @@ func main() {
 
 // run configura as dependências e inicia o servidor.
 func run() error {
-	config, err := serverconfig.Load()
+	return runWith(
+		serverconfig.Load,
+		net.Listen,
+		signal.NotifyContext,
+	)
+}
+
+// runWith inicializa o servidor usando dependências externas injetáveis.
+func runWith(
+	loadConfig func() (serverconfig.Config, error),
+	listen func(network, address string) (net.Listener, error),
+	notifyContext func(
+		parent context.Context,
+		signals ...os.Signal,
+	) (context.Context, context.CancelFunc),
+) error {
+	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load server configuration: %w", err)
 	}
 
-	listener, err := net.Listen("tcp", config.Address)
+	listener, err := listen("tcp", config.Address)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", config.Address, err)
 	}
@@ -54,7 +70,7 @@ func run() error {
 		return fmt.Errorf("create server: %w", err)
 	}
 
-	ctx, stop := signal.NotifyContext(
+	ctx, stop := notifyContext(
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGTERM,
