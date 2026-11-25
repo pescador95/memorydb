@@ -14,6 +14,8 @@ const (
 	envShutdownTimeout      = "MEMORYDB_SHUTDOWN_TIMEOUT"
 	envIdempotencyRetention = "MEMORYDB_IDEMPOTENCY_RETENTION"
 	envIdempotencyCapacity  = "MEMORYDB_IDEMPOTENCY_CAPACITY"
+	envReadTimeout          = "MEMORYDB_READ_TIMEOUT"
+	envWriteTimeout         = "MEMORYDB_WRITE_TIMEOUT"
 
 	defaultShutdownTimeout = 10 * time.Second
 )
@@ -23,6 +25,9 @@ type Config struct {
 	Address         string
 	ShutdownTimeout time.Duration
 	Idempotency     idempotency.Config
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	MaxConnections  int
 }
 
 // Load carrega as configurações do servidor a partir do ambiente.
@@ -59,9 +64,36 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	readTimeout, err := loadDuration(
+		envReadTimeout,
+		sharedconfig.DefaultServerReadTimeout,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+
+	writeTimeout, err := loadDuration(
+		envWriteTimeout,
+		sharedconfig.DefaultServerWriteTimeout,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+
+	maxConnections, err := loadPositiveInt(
+		sharedconfig.EnvServerMaxConnections,
+		sharedconfig.DefaultServerMaxConnections,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
 		Address:         address,
 		ShutdownTimeout: shutdownTimeout,
+		ReadTimeout:     readTimeout,
+		WriteTimeout:    writeTimeout,
+		MaxConnections:  maxConnections,
 		Idempotency: idempotency.Config{
 			Retention: retention,
 			Capacity:  capacity,

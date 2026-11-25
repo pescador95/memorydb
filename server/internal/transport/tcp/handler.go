@@ -5,19 +5,29 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/pescador95/memorydb/server/internal/codec"
 	"github.com/pescador95/memorydb/server/internal/engine"
 	"github.com/pescador95/memorydb/server/internal/idempotency"
 	"github.com/pescador95/memorydb/server/internal/protocol"
+	sharedconfig "github.com/pescador95/memorydb/shared/config"
 	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
 
 // Handler coordena o transporte TCP, a decodificação e a execução dos comandos.
 type Handler struct {
-	engine      *engine.Engine
-	codec       codec.Codec
-	idempotency *idempotency.Executor
+	engine       *engine.Engine
+	codec        codec.Codec
+	idempotency  *idempotency.Executor
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+}
+
+// HandlerConfig representa os limites temporais das operações TCP.
+type HandlerConfig struct {
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 }
 
 // NewHandler cria um Handler com suas dependências.
@@ -26,6 +36,25 @@ func NewHandler(
 	messageCodec codec.Codec,
 	executor *idempotency.Executor,
 ) (*Handler, error) {
+	return NewHandlerWithConfig(
+		commandEngine,
+		messageCodec,
+		executor,
+		HandlerConfig{
+			ReadTimeout:  sharedconfig.DefaultServerReadTimeout,
+			WriteTimeout: sharedconfig.DefaultServerWriteTimeout,
+		},
+	)
+}
+
+// NewHandlerWithConfig cria um Handler com limites temporais configuráveis.
+func NewHandlerWithConfig(
+	commandEngine *engine.Engine,
+	messageCodec codec.Codec,
+	executor *idempotency.Executor,
+	config HandlerConfig,
+) (*Handler, error) {
+
 	if commandEngine == nil {
 		return nil, fmt.Errorf("engine cannot be nil")
 	}
@@ -38,10 +67,20 @@ func NewHandler(
 		return nil, fmt.Errorf("idempotency executor cannot be nil")
 	}
 
+	if config.ReadTimeout <= 0 {
+		return nil, fmt.Errorf("read timeout must be positive")
+	}
+
+	if config.WriteTimeout <= 0 {
+		return nil, fmt.Errorf("write timeout must be positive")
+	}
+
 	return &Handler{
-		engine:      commandEngine,
-		codec:       messageCodec,
-		idempotency: executor,
+		engine:       commandEngine,
+		codec:        messageCodec,
+		idempotency:  executor,
+		readTimeout:  config.ReadTimeout,
+		writeTimeout: config.WriteTimeout,
 	}, nil
 }
 
@@ -58,6 +97,14 @@ func (h *Handler) Handle(conn net.Conn) error {
 	defer connection.Close()
 
 	for {
+		if err := conn.SetReadDeadline(time.Now().Add(h.readTimeout)); err != nil {
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+				return nil
+			}
+
+			return fmt.Errorf("set read deadline: %w", err)
+		}
+
 		payload, err := connection.ReadFrame()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -79,6 +126,10 @@ func (h *Handler) Handle(conn net.Conn) error {
 			return fmt.Errorf("encode response: %w", err)
 		}
 
+		if err := conn.SetWriteDeadline(time.Now().Add(h.writeTimeout)); err != nil {
+			return fmt.Errorf("set write deadline: %w", err)
+		}
+
 		if err := connection.WriteFrame(responsePayload); err != nil {
 			return fmt.Errorf("write response frame: %w", err)
 		}
@@ -86,7 +137,6 @@ func (h *Handler) Handle(conn net.Conn) error {
 }
 
 // executeRequest encaminha operações mutáveis pelo executor de idempotência.
-
 func (h *Handler) executeRequest(request *protocol.Request) *protocol.Response {
 	if request == nil {
 		return idempotencyErrorResponse(

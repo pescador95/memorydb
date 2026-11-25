@@ -1,12 +1,16 @@
 package config
 
-import "os"
+import (
+	"os"
+	"time"
+)
 
 // Nomes das variáveis de ambiente utilizadas pelos componentes do MemoryDB.
 const (
-	EnvServerAddress = "MEMORYDB_ADDR"
-	EnvClientAddress = "MEMORYDB_CLIENT_ADDR"
-	EnvDialTimeout   = "MEMORYDB_DIAL_TIMEOUT"
+	EnvServerAddress        = "MEMORYDB_ADDR"
+	EnvClientAddress        = "MEMORYDB_CLIENT_ADDR"
+	EnvDialTimeout          = "MEMORYDB_DIAL_TIMEOUT"
+	EnvServerMaxConnections = "MEMORYDB_MAX_CONNECTIONS"
 )
 
 // Valores padrão compartilhados entre os componentes do MemoryDB.
@@ -15,6 +19,11 @@ const (
 
 	DefaultServerAddress = ":" + DefaultTCPPort
 	DefaultClientAddress = "127.0.0.1:" + DefaultTCPPort
+
+	DefaultServerReadTimeout  = 30 * time.Second
+	DefaultServerWriteTimeout = 10 * time.Second
+
+	DefaultServerMaxConnections = 1024
 )
 
 // EnvOrDefault retorna o valor da variável de ambiente ou o valor padrão

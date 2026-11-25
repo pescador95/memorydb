@@ -60,12 +60,26 @@ func runWith(
 		return fmt.Errorf("create idempotency executor: %w", err)
 	}
 
-	handler, err := tcp.NewHandler(commandEngine, messageCodec, executor)
+	handler, err := tcp.NewHandlerWithConfig(
+		commandEngine,
+		messageCodec,
+		executor,
+		tcp.HandlerConfig{
+			ReadTimeout:  config.ReadTimeout,
+			WriteTimeout: config.WriteTimeout,
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("create handler: %w", err)
 	}
 
-	server, err := tcp.NewServer(listener, handler)
+	server, err := tcp.NewServerWithConfig(
+		listener,
+		handler,
+		tcp.ServerConfig{
+			MaxConnections: config.MaxConnections,
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}

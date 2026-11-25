@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/pescador95/memorydb/server/internal/codec"
 	"github.com/pescador95/memorydb/server/internal/codec/protobuf"
@@ -887,5 +888,144 @@ func TestHandlerReturnsWriteFrameError(t *testing.T) {
 
 	if err := <-handlerDone; err == nil {
 		t.Fatal("expected write frame error")
+	}
+}
+
+func TestHandlerReadTimeout(t *testing.T) {
+	handler, err := NewHandlerWithConfig(
+		engine.New(),
+		protobuf.New(),
+		newTestIdempotencyExecutor(t),
+		HandlerConfig{
+			ReadTimeout:  50 * time.Millisecond,
+			WriteTimeout: time.Second,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewHandlerWithConfig() error = %v", err)
+	}
+
+	serverSocket, clientSocket := net.Pipe()
+	defer clientSocket.Close()
+
+	handlerDone := make(chan error, 1)
+
+	go func() {
+		handlerDone <- handler.Handle(serverSocket)
+	}()
+
+	select {
+	case err := <-handlerDone:
+		if err == nil {
+			t.Fatal("Handle() error = nil, want read timeout")
+		}
+
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("Handle() error = %v, want timeout error", err)
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handler did not stop after read timeout")
+	}
+}
+
+func TestHandlerWriteTimeout(t *testing.T) {
+	handler, err := NewHandlerWithConfig(
+		engine.New(),
+		&handlerTestCodec{
+			request: &protocol.Request{
+				RequestID: 1,
+				Command:   &protocol.PingCommand{},
+			},
+		},
+		newTestIdempotencyExecutor(t),
+		HandlerConfig{
+			ReadTimeout:  time.Second,
+			WriteTimeout: 50 * time.Millisecond,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewHandlerWithConfig() error = %v", err)
+	}
+
+	serverSocket, clientSocket := net.Pipe()
+	defer clientSocket.Close()
+
+	handlerDone := make(chan error, 1)
+
+	go func() {
+		handlerDone <- handler.Handle(serverSocket)
+	}()
+
+	if err := transporttcp.WriteFrame(clientSocket, []byte{1}); err != nil {
+		t.Fatalf("WriteFrame() error = %v", err)
+	}
+
+	// Não lemos a resposta: a escrita do servidor deve expirar.
+	select {
+	case err := <-handlerDone:
+		if err == nil {
+			t.Fatal("Handle() error = nil, want write timeout")
+		}
+
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("Handle() error = %v, want timeout error", err)
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handler did not stop after write timeout")
+	}
+}
+
+func TestNewHandlerWithConfigRejectsInvalidTimeouts(t *testing.T) {
+	tests := []struct {
+		name   string
+		config HandlerConfig
+	}{
+		{
+			name: "zero read timeout",
+			config: HandlerConfig{
+				ReadTimeout:  0,
+				WriteTimeout: time.Second,
+			},
+		},
+		{
+			name: "negative read timeout",
+			config: HandlerConfig{
+				ReadTimeout:  -time.Second,
+				WriteTimeout: time.Second,
+			},
+		},
+		{
+			name: "zero write timeout",
+			config: HandlerConfig{
+				ReadTimeout:  time.Second,
+				WriteTimeout: 0,
+			},
+		},
+		{
+			name: "negative write timeout",
+			config: HandlerConfig{
+				ReadTimeout:  time.Second,
+				WriteTimeout: -time.Second,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewHandlerWithConfig(
+				engine.New(),
+				protobuf.New(),
+				newTestIdempotencyExecutor(t),
+				tt.config,
+			)
+
+			if err == nil {
+				t.Fatal("NewHandlerWithConfig() error = nil, want validation error")
+			}
+		})
 	}
 }

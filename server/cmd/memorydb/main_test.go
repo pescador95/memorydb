@@ -11,6 +11,7 @@ import (
 
 	serverconfig "github.com/pescador95/memorydb/server/internal/config"
 	"github.com/pescador95/memorydb/server/internal/idempotency"
+	sharedconfig "github.com/pescador95/memorydb/shared/config"
 )
 
 type failingListener struct {
@@ -173,6 +174,9 @@ func TestRunWithGracefulShutdown(t *testing.T) {
 	config := serverconfig.Config{
 		Address:         "127.0.0.1:0",
 		ShutdownTimeout: 2 * time.Second,
+		ReadTimeout:     sharedconfig.DefaultServerReadTimeout,
+		WriteTimeout:    sharedconfig.DefaultServerWriteTimeout,
+		MaxConnections:  sharedconfig.DefaultServerMaxConnections,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -251,6 +255,9 @@ func TestRunWithServeFailure(t *testing.T) {
 			return serverconfig.Config{
 				Address:         ":6380",
 				ShutdownTimeout: time.Second,
+				ReadTimeout:     sharedconfig.DefaultServerReadTimeout,
+				WriteTimeout:    sharedconfig.DefaultServerWriteTimeout,
+				MaxConnections:  sharedconfig.DefaultServerMaxConnections,
 			}, nil
 		},
 		func(network, address string) (net.Listener, error) {
@@ -292,7 +299,10 @@ func TestRunWithInvalidIdempotencyConfiguration(t *testing.T) {
 	err := runWith(
 		func() (serverconfig.Config, error) {
 			return serverconfig.Config{
-				Address: ":6380",
+				Address:        ":6380",
+				ReadTimeout:    sharedconfig.DefaultServerReadTimeout,
+				WriteTimeout:   sharedconfig.DefaultServerWriteTimeout,
+				MaxConnections: sharedconfig.DefaultServerMaxConnections,
 				Idempotency: idempotency.Config{
 					Retention: -time.Second,
 					Capacity:  100,
@@ -346,6 +356,9 @@ func TestRunWithShutdownFailure(t *testing.T) {
 				return serverconfig.Config{
 					Address:         ":6380",
 					ShutdownTimeout: time.Second,
+					ReadTimeout:     sharedconfig.DefaultServerReadTimeout,
+					WriteTimeout:    sharedconfig.DefaultServerWriteTimeout,
+					MaxConnections:  sharedconfig.DefaultServerMaxConnections,
 				}, nil
 			},
 			func(network, address string) (net.Listener, error) {

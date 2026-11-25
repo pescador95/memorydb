@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"sync"
+
+	sharedconfig "github.com/pescador95/memorydb/shared/config"
 )
 
 var (
@@ -18,24 +20,47 @@ type Server struct {
 	listener net.Listener
 	handler  *Handler
 
-	mu           sync.Mutex
-	serving      bool
-	shuttingDown bool
-	connections  sync.WaitGroup
+	mu             sync.Mutex
+	serving        bool
+	shuttingDown   bool
+	activeConns    map[net.Conn]struct{}
+	connections    sync.WaitGroup
+	maxConnections int
 }
 
-// NewServer cria um servidor TCP com as dependências fornecidas.
+// ServerConfig define os limites operacionais do servidor TCP.
+type ServerConfig struct {
+	MaxConnections int
+}
+
 func NewServer(listener net.Listener, handler *Handler) (*Server, error) {
+	return NewServerWithConfig(listener, handler, ServerConfig{
+		MaxConnections: sharedconfig.DefaultServerMaxConnections,
+	})
+}
+
+func NewServerWithConfig(
+	listener net.Listener,
+	handler *Handler,
+	config ServerConfig,
+) (*Server, error) {
 	if listener == nil {
 		return nil, fmt.Errorf("listener cannot be nil")
 	}
+
 	if handler == nil {
 		return nil, fmt.Errorf("handler cannot be nil")
 	}
 
+	if config.MaxConnections < 1 {
+		return nil, fmt.Errorf("max connections must be positive")
+	}
+
 	return &Server{
-		listener: listener,
-		handler:  handler,
+		listener:       listener,
+		handler:        handler,
+		maxConnections: config.MaxConnections,
+		activeConns:    make(map[net.Conn]struct{}),
 	}, nil
 }
 
@@ -80,28 +105,51 @@ func (s *Server) Serve() error {
 			return nil
 		}
 
+		if len(s.activeConns) >= s.maxConnections {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+
+		s.activeConns[conn] = struct{}{}
 		s.connections.Add(1)
+
 		s.mu.Unlock()
 
-		go func() {
-			defer s.connections.Done()
+		go func(conn net.Conn) {
+			defer func() {
+				s.mu.Lock()
+				delete(s.activeConns, conn)
+				s.mu.Unlock()
+
+				s.connections.Done()
+			}()
+
 			_ = s.handler.Handle(conn)
-		}()
+		}(conn)
 	}
 }
 
 // Shutdown interrompe a aceitação de conexões e aguarda as ativas terminarem.
+// Se o contexto expirar, fecha as conexões restantes e aguarda suas goroutines.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("shutdown context cannot be nil")
+	}
+
 	s.mu.Lock()
 	s.shuttingDown = true
-	err := s.listener.Close()
 	s.mu.Unlock()
 
-	if err != nil && !errors.Is(err, net.ErrClosed) {
-		return fmt.Errorf("close listener: %w", err)
+	closeErr := s.listener.Close()
+	if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		closeErr = fmt.Errorf("close listener: %w", closeErr)
+	} else {
+		closeErr = nil
 	}
 
 	done := make(chan struct{})
+
 	go func() {
 		s.connections.Wait()
 		close(done)
@@ -109,8 +157,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
-		return nil
+		return closeErr
+
 	case <-ctx.Done():
-		return ctx.Err()
+		s.mu.Lock()
+		connections := make([]net.Conn, 0, len(s.activeConns))
+		for conn := range s.activeConns {
+			connections = append(connections, conn)
+		}
+		s.mu.Unlock()
+
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+
+		// O fechamento das conexões deve desbloquear as operações de I/O.
+		// Aguardamos as goroutines para não retornar com processamento pendente.
+		<-done
+
+		return errors.Join(closeErr, ctx.Err())
 	}
 }
