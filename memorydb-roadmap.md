@@ -49,7 +49,11 @@ O projeto tem como objetivo principal aprender e implementar os fundamentos de u
 
 O servidor pode atender múltiplas conexões simultaneamente. Dentro de cada conexão, entretanto, o processamento das requisições é sequencial.
 
+As operações concorrentes recebidas por uma mesma instância do driver Go são serializadas. O protocolo e o servidor não implementam multiplexação de requisições em uma única conexão.
+
 Os dados são perdidos quando o processo do servidor é encerrado.
+
+Os registros de idempotência também são mantidos exclusivamente em memória e não sobrevivem à reinicialização ou à perda do processo.
 
 ## 4. Arquitetura implementada
 
@@ -99,6 +103,7 @@ O driver Java permanece como uma implementação futura, devendo consumir o mesm
 | Protocol | Representar requisições e respostas no modelo interno. |
 | Engine | Validar e executar comandos. |
 | Storage | Armazenar, consultar e remover dados. |
+| Idempotency Executor | Controlar a execução de operações mutáveis e reproduzir resultados registrados. |
 | Server | Inicializar os componentes e gerenciar o ciclo de vida do servidor. |
 | API / CLI | Disponibilizar uma interface de utilização do banco. |
 
@@ -110,8 +115,12 @@ O driver Java permanece como uma implementação futura, devendo consumir o mesm
 - O Codec é responsável por converter entre o contrato externo e o modelo interno.
 - O transporte TCP trabalha com mensagens em bytes, sem conhecer o significado dos comandos.
 - Os drivers implementam o contrato de comunicação sem depender da implementação interna do servidor.
+- O mecanismo de idempotência fica no servidor e não deve introduzir dependência de transporte ou serialização no Storage.
+- O Executor de idempotência utiliza a Engine para executar as operações protegidas.
 
 ## 5. Estrutura atual do repositório
+
+A estrutura abaixo representa a organização dos principais componentes do projeto. Novos arquivos de implementação, testes e documentação podem ser adicionados sem alterar essa organização conceitual.
 
 ```text
 memorydb/
@@ -130,7 +139,8 @@ memorydb/
 │   │   └── REQUISITOS.md
 │   ├── tecnica/
 │   │   ├── ARQUITETURA.md
-│   │   └── COMPONENTES.md
+│   │   ├── COMPONENTES.md
+│   │   └── TESTES.md
 │   └── usuario/
 │       └── MANUAL.md
 │
@@ -138,9 +148,9 @@ memorydb/
 │   ├── go/
 │   │   ├── client.go
 │   │   ├── client_test.go
+│   │   ├── operation_id.go
 │   │   ├── go.mod
-│   │   ├── go.sum
-|   |   └── operation_id.go   
+│   │   └── go.sum
 │   └── java/
 │
 ├── protocol/
@@ -157,7 +167,16 @@ memorydb/
 │
 ├── scripts/
 │   ├── go.sh
-│   └── java.sh
+│   ├── java.sh
+│   └── test/
+│       ├── common.sh
+│       ├── format.sh
+│       ├── vet.sh
+│       ├── unit.sh
+│       ├── race.sh
+│       ├── build.sh
+│       ├── coverage.sh
+│       └── uncovered.sh
 │
 ├── server/
 │   ├── go.mod
@@ -171,12 +190,15 @@ memorydb/
 │       │   └── protobuf/
 │       │       ├── codec.go
 │       │       └── codec_test.go
+│       ├── config/
+│       │   ├── config.go
+│       │   └── config_test.go
 │       ├── engine/
 │       │   ├── command.go
 │       │   ├── engine.go
 │       │   └── engine_test.go
-|       ├── idempotency/
-│       │   └── executor.go
+│       ├── idempotency/
+│       │   ├── executor.go
 │       │   ├── executor_test.go
 │       │   ├── fingerprint.go
 │       │   └── fingerprint_test.go
@@ -195,6 +217,10 @@ memorydb/
 │               ├── handler_test.go
 │               ├── server.go
 │               └── server_test.go
+│
+├── shared/
+│   └── config/
+│       └── defaults.go
 │
 ├── transport/
 │   └── tcp/
@@ -218,8 +244,10 @@ O projeto utiliza Go Workspace para desenvolvimento local com múltiplos módulo
 | Protocolo gerado | `protocol/generated/go` | Tipos Go gerados a partir do contrato Protobuf. |
 | Transporte TCP | `transport/tcp/go` | Conexão TCP e framing. |
 | Driver Go | `drivers/go` | Cliente Go para comunicação com o servidor. |
-| Servidor | `server` | Engine, Storage, Codec, protocolo interno e inicialização. |
+| Servidor | `server` | Engine, Storage, Codec, protocolo interno, idempotência e inicialização. |
 | API | `api` | Aplicação cliente de demonstração. |
+
+O pacote `shared/config` mantém configurações e valores padrão compartilhados pelo projeto, evitando duplicação de definições comuns.
 
 O arquivo `go.work` reúne os módulos para facilitar o desenvolvimento dentro do repositório.
 
@@ -243,6 +271,8 @@ Para delimitar as mensagens, o MemoryDB utiliza framing com prefixo de tamanho f
 - A conexão permite leitura e escrita simultâneas, com sincronização independente para cada direção.
 - O fechamento da conexão interrompe operações de I/O bloqueadas.
 
+O servidor aplica deadlines de leitura e escrita às operações de I/O TCP. Esses limites são configuráveis e não representam um timeout global de execução de comandos.
+
 ### Protocol Buffers
 
 O contrato está definido em:
@@ -263,19 +293,15 @@ O contrato contempla:
 - `DeleteResult`
 - `ErrorResult`
 
-O campo request_id permite correlacionar requisições e respostas,
-mas não representa uma chave de idempotência.
+O campo `request_id` permite correlacionar requisições e respostas, mas não representa uma chave de idempotência.
 
-As operações SET e DELETE utilizam o campo operation_id,
-representado por bytes e validado para conter exatamente 16 bytes.
+As operações SET e DELETE utilizam o campo `operation_id`, representado por bytes e validado para conter exatamente 16 bytes.
 
-O OperationID identifica uma operação lógica e permite ao servidor
-reconhecer tentativas repetidas enquanto o registro correspondente
-permanecer retido na mesma instância.
+O `OperationID` identifica uma operação lógica e permite ao servidor reconhecer tentativas repetidas enquanto o registro correspondente permanecer retido na mesma instância.
 
 O mecanismo não se aplica a PING e GET.
 
-O campo `ttl_ms` já está definido em `SetCommand`, mas sua funcionalidade ainda não foi implementada.
+O campo `ttl_ms` já está definido em `SetCommand`, mas sua funcionalidade ainda não foi implementada. Valores positivos são rejeitados pela Engine enquanto o suporte a TTL não estiver disponível.
 
 Os arquivos gerados não devem ser editados manualmente. Alterações devem ser realizadas no arquivo `.proto` e posteriormente regeneradas.
 
@@ -315,6 +341,7 @@ Os arquivos gerados não devem ser editados manualmente. Alterações devem ser 
 - [x] Definição dos comandos e resultados.
 - [x] Inclusão de `request_id`.
 - [x] Inclusão de tratamento de erros.
+- [x] Inclusão de `operation_id` nas operações SET e DELETE.
 - [x] Geração dos tipos Go.
 - [x] Separação dos arquivos gerados em módulo próprio.
 
@@ -358,11 +385,25 @@ Os arquivos gerados não devem ser editados manualmente. Alterações devem ser 
 - [x] Execução concorrente de conexões.
 - [x] Proteção contra inicialização duplicada.
 - [x] Encerramento gracioso com fechamento do listener.
-- [x] Espera pelo encerramento das conexões ativas, respeitando o contexto de shutdown.
+- [x] Espera pelo encerramento dos handlers associados às conexões ativas.
 - [x] Tratamento de sinais do sistema operacional no executável.
 - [x] Configuração do endereço por variável de ambiente (`MEMORYDB_ADDR`).
+- [x] Configuração de timeout de leitura TCP.
+- [x] Configuração de timeout de escrita TCP.
+- [x] Limite configurável de conexões TCP simultâneas.
+- [x] Registro e acompanhamento das conexões ativas.
+- [x] Fechamento forçado das conexões ativas quando o contexto de shutdown expira.
+- [x] Espera pelo encerramento dos handlers após o fechamento das conexões.
+- [x] Testes de limites de conexões e encerramento do servidor.
+- [x] Testes de timeout de leitura e escrita.
 
-O encerramento gracioso não representa o fechamento forçado de todas as conexões ativas quando o prazo do contexto expira. Essa política permanece como possível evolução operacional.
+O servidor implementa encerramento gracioso e forçado. Durante o shutdown, novas conexões deixam de ser aceitas, o listener é fechado e o servidor aguarda o encerramento dos handlers ativos.
+
+Caso o contexto expire, as conexões TCP ativas são fechadas para interromper operações de I/O bloqueadas, e o servidor aguarda o encerramento das respectivas goroutines.
+
+O fechamento forçado interrompe operações de I/O TCP, mas não representa um mecanismo genérico de cancelamento de qualquer operação interna que possa ser executada futuramente pelo Handler.
+
+O limite de conexões representa a quantidade máxima de conexões TCP simultâneas admitidas pelo servidor. Não representa um limite de operações por conexão nem implementa multiplexação.
 
 ### Fase 7 — Driver Go
 
@@ -391,9 +432,9 @@ O encerramento gracioso não representa o fechamento forçado de todas as conex�
 - [x] Disponibilização do `RequestID` associado à operação de resultado desconhecido.
 - [x] Testes de escrita parcial, perda de resposta, cancelamento e concorrência.
 - [x] Testes de corrida e análise estática do módulo.
-- [x] Implementação do tipo OperationID.
-- [x] Geração de identificadores por NewOperationID().
-- [x] Atualização de SET e DELETE para receberem OperationID.
+- [x] Implementação do tipo `OperationID`.
+- [x] Geração de identificadores por `NewOperationID()`.
+- [x] Atualização de SET e DELETE para receberem `OperationID`.
 - [x] Suporte à reutilização do identificador em novas tentativas.
 - [x] Compatibilidade com o mecanismo de idempotência do servidor.
 
@@ -413,7 +454,7 @@ O resultado indeterminado é importante porque o servidor pode executar uma oper
 
 O `request_id` permite identificar e correlacionar a operação, mas não permite recuperá-la nem impedir sua execução duplicada.
 
-O driver não implementa retries automáticos. Repetir uma operação após um resultado indeterminado pode executar o comando novamente.
+O driver não implementa retries automáticos. Repetir uma operação após um resultado indeterminado pode executar o comando novamente caso a aplicação não reutilize o mesmo `OperationID`.
 
 ### Fase 8 — API cliente e validação integrada
 
@@ -473,11 +514,38 @@ Os testes e a análise estática do módulo `drivers/go` concluíram sem falhas.
 
 Essa validação posterior está restrita ao driver Go. Ela não representa uma nova execução integral dos testes de todos os módulos.
 
+**Validação de robustez do servidor — 25/11/2026**
+
+Após a implementação de limites de conexões, timeouts de leitura e escrita e encerramento forçado, foram realizadas validações direcionadas:
+
+- Execução do script completo `./scripts/test.sh`, incluindo formatação, análise estática, testes unitários, detector de condições de corrida, build e cobertura.
+- Testes repetidos de encerramento de conexões ativas.
+- Execução repetida dos testes do pacote TCP.
+- Testes do pacote TCP com detector de condições de corrida.
+
+Os comandos direcionados executados incluíram:
+
+```bash
+gofmt -w server/internal/transport/tcp/server_test.go
+
+cd server
+
+go test -count=20 ./internal/transport/tcp -run '^TestServerClosesAcceptedConnectionDuringShutdown$'
+go test -count=20 ./internal/transport/tcp
+go test -race -count=1 ./internal/transport/tcp
+```
+
+As validações reportadas concluíram sem falhas.
+
+A validação completa e as validações direcionadas devem ser interpretadas conforme seus respectivos escopos. Os testes direcionados não substituem uma nova execução integral de todos os módulos.
+
 ## 9. Próximas fases
 
 ### Fase 9 — Consolidação da arquitetura e documentação
 
 **Status: em andamento**
+
+**Concluído**
 
 - [x] Revisar a documentação de arquitetura em relação à implementação atual.
 - [x] Revisar a documentação dos componentes.
@@ -485,11 +553,21 @@ Essa validação posterior está restrita ao driver Go. Ela não representa uma 
 - [x] Documentar o contrato de framing TCP.
 - [x] Documentar o fluxo de comunicação entre driver e servidor.
 - [x] Documentar a utilização do Go Workspace.
-- [x] Documentar como executar testes nos módulos.
 - [x] Revisar as decisões arquiteturais e registrar as justificativas relevantes.
 - [x] Atualizar o manual de utilização com o contrato de idempotência.
 - [x] Atualizar o README do driver Go.
 - [x] Atualizar o roadmap com o estado da implementação de idempotência.
+
+Os documentos `REQUISITOS.md`, `ARQUITETURA.md` e `COMPONENTES.md` foram revisados e atualizados para refletir as funcionalidades recentes do servidor.
+
+**Pendências de consolidação e validação**
+
+- [ ] Incorporar e validar a versão revisada de `docs/tecnica/TESTES.md`.
+- [ ] Incorporar e validar a versão revisada de `docs/README.md`.
+- [ ] Concluir os pequenos ajustes identificados na revisão de `docs/usuario/MANUAL.md`.
+- [ ] Verificar a consistência entre os documentos após as atualizações.
+- [ ] Executar `git diff --check` nas alterações documentais.
+- [ ] Conferir se todos os documentos descrevem os mesmos valores padrão, contratos e limitações da implementação.
 
 A documentação deve refletir o comportamento efetivamente implementado, incluindo as limitações atuais do servidor, do transporte e dos drivers.
 
@@ -517,6 +595,8 @@ O driver Java deverá implementar o mesmo contrato de comunicação, sem depende
 
 O tratamento de resultados indeterminados deverá preservar a mesma semântica do driver Go: quando não for possível confirmar a execução de uma operação, o consumidor deverá receber uma indicação explícita, sem retry automático implícito.
 
+O driver deverá permitir que a aplicação consumidora forneça e reutilize o mesmo `OperationID` nas tentativas de uma mesma operação lógica.
+
 ### Fase 11 — TTL (Time To Live)
 
 **Status: planejada**
@@ -533,33 +613,79 @@ O tratamento de resultados indeterminados deverá preservar a mesma semântica d
 
 A implementação deverá considerar precisão, custo de limpeza e impacto sobre a concorrência do Storage.
 
+A semântica do TTL deverá ser compatível com o contrato Protobuf existente, evitando alterações desnecessárias no formato de comunicação.
+
+A integração do TTL com idempotência também deverá preservar o fingerprint semântico das operações SET, considerando o valor de `ttl_ms`.
+
 ### Fase 12 — Robustez, confiabilidade e experiência de utilização
 
-**Status: planejada**
+**Status: parcialmente concluída**
+
+A fase reúne evoluções operacionais e melhorias de confiabilidade que vão além dos critérios básicos do MVP.
+
+A implementação inicial de idempotência foi concluída. Parte da robustez operacional do servidor também foi implementada, incluindo timeouts de I/O, limites de conexões e encerramento forçado.
+
+Permanecem pendentes observabilidade, melhorias operacionais adicionais, experiência de utilização e evoluções de confiabilidade que dependem de decisões futuras.
 
 #### 12.1. Robustez operacional
 
-- [ ] Definir e documentar configurações operacionais adicionais.
+**Status: parcialmente concluída**
+
+**Implementado**
+
+- [x] Definir configurações operacionais de leitura e escrita TCP.
+- [x] Implementar timeout configurável de leitura.
+- [x] Implementar timeout configurável de escrita.
+- [x] Implementar limite configurável de conexões simultâneas.
+- [x] Implementar encerramento gracioso do servidor.
+- [x] Implementar fechamento forçado das conexões ativas quando o contexto de shutdown expira.
+- [x] Aguardar o encerramento dos handlers após o fechamento das conexões.
+- [x] Implementar testes de limites de conexões e encerramento do servidor.
+- [x] Implementar testes de timeout de leitura e escrita.
+
+**Pendências**
+
 - [ ] Padronizar logs estruturados.
-- [ ] Melhorar observabilidade de erros de processamento no servidor.
-- [ ] Revisar e evoluir mensagens e códigos de erro.
-- [ ] Avaliar timeouts de conexão e operações no lado do servidor.
-- [ ] Avaliar limites de conexões simultâneas.
+- [ ] Melhorar a observabilidade de erros de processamento no servidor.
+- [ ] Revisar e evoluir mensagens e códigos de erro conforme novos requisitos.
+- [ ] Avaliar a necessidade de timeout global para operações no servidor.
 - [ ] Avaliar limites de tamanho de chave e valor.
-- [ ] Definir política para encerramento forçado de conexões durante shutdown.
-- [ ] Avaliar proteção contra clientes que mantêm conexões abertas sem enviar requisições completas.
-- [ ] Avaliar limites de recursos por conexão.
-- [ ] Criar testes de falhas de rede e encerramento inesperado.
+- [ ] Avaliar limites adicionais de recursos por conexão.
+- [ ] Avaliar proteção contra clientes que mantêm conexões abertas sem enviar requisições completas, considerando os limites já impostos pelo timeout de leitura.
+- [ ] Criar testes adicionais de falhas de rede e encerramento inesperado.
 
-**#### 12.2. Confiabilidade e idempotência**
+**Configurações operacionais implementadas**
 
-**Status: implementação concluída em 22/11/2026.**
+| Configuração | Variável de ambiente | Valor padrão |
+|---|---|---|
+| Endereço de escuta | `MEMORYDB_ADDR` | Conforme configuração padrão do servidor |
+| Timeout de conexão do cliente | `MEMORYDB_DIAL_TIMEOUT` | 5 segundos |
+| Timeout de leitura TCP | `MEMORYDB_READ_TIMEOUT` | 30 segundos |
+| Timeout de escrita TCP | `MEMORYDB_WRITE_TIMEOUT` | 10 segundos |
+| Limite de conexões simultâneas | `MEMORYDB_MAX_CONNECTIONS` | 1024 |
+| Timeout de shutdown | `MEMORYDB_SHUTDOWN_TIMEOUT` | 10 segundos |
+
+O timeout de conexão (`MEMORYDB_DIAL_TIMEOUT`) pertence à configuração do cliente. Os demais parâmetros da tabela são configurações operacionais do servidor, com exceção do endereço de escuta, que determina onde o servidor aceita conexões.
+
+A implementação atual oferece controle básico de recursos e tempo de I/O no servidor. Os timeouts de leitura e escrita são aplicados individualmente às operações de I/O TCP, não representando um prazo global de execução de uma operação de negócio.
+
+O timeout de leitura também limita a espera pelo próximo frame. Portanto, conexões sem novas solicitações podem ser encerradas quando esse prazo expira.
+
+O limite de conexões representa o número máximo de conexões TCP simultâneas admitidas. Não representa um limite de operações por conexão, não implementa multiplexação e não substitui limites adicionais de consumo de recursos.
+
+O fechamento forçado durante o shutdown interrompe operações de I/O TCP por meio do fechamento das conexões. Não representa cancelamento genérico de qualquer operação interna que possa ser executada futuramente pelo Handler.
+
+A evolução operacional deverá priorizar previsibilidade, controle de recursos e capacidade de diagnosticar falhas sem introduzir complexidade desnecessária no núcleo do banco.
+
+#### 12.2. Confiabilidade e idempotência
+
+**Status: implementação inicial concluída em 22/11/2026.**
 
 A implementação inicial de idempotência foi concluída no servidor e no driver Go, conforme o contrato aprovado em 22/11/2026.
 
 O mecanismo protege as operações mutáveis `SET` e `DELETE`, permitindo que uma aplicação repita uma tentativa utilizando o mesmo identificador lógico sem executar novamente uma mutação já registrada.
 
-**Contrato implementado**
+##### Contrato implementado
 
 | Decisão | Implementação |
 |---|---|
@@ -576,7 +702,7 @@ O mecanismo protege as operações mutáveis `SET` e `DELETE`, permitindo que um
 
 A capacidade é definida na configuração do Executor de idempotência. A exposição dessa configuração como parâmetro operacional do servidor deverá ser tratada separadamente, caso seja necessária.
 
-**Identificação e fingerprint**
+##### Identificação e fingerprint
 
 O `OperationID` identifica uma operação lógica e deve ser reutilizado em todas as tentativas de execução dessa mesma operação.
 
@@ -589,7 +715,7 @@ O fingerprint é calculado por SHA-256, considerando a versão do formato e os p
 
 O `OperationID` e o `RequestID` não participam do fingerprint.
 
-**Comportamento implementado**
+##### Comportamento implementado
 
 1. Mesmo `OperationID` e mesmo fingerprint: a operação não é executada novamente; o resultado armazenado é reproduzido.
 2. Mesmo `OperationID` e fingerprint diferente: a requisição é rejeitada com erro de conflito.
@@ -600,7 +726,7 @@ O `OperationID` e o `RequestID` não participam do fingerprint.
 7. Resultados terminais reproduzíveis, incluindo erros determinísticos, são armazenados para replay.
 8. Uma reserva somente pode ser liberada quando houver comprovação de que a mutação não foi executada. Resultados indeterminados não podem liberar o identificador para uma nova execução desprotegida.
 
-**Arquitetura da implementação**
+##### Arquitetura da implementação
 
 O mecanismo foi implementado no servidor, por meio do pacote `server/internal/idempotency`, utilizando um Executor compartilhado entre os handlers da instância.
 
@@ -608,7 +734,7 @@ O Handler direciona `SET` e `DELETE` ao mecanismo de idempotência antes de exec
 
 O driver Go disponibiliza o tipo `OperationID` e a função `NewOperationID()`, permitindo que a aplicação consumidora gere e forneça o identificador. O driver não gera identificadores automaticamente para cada tentativa e não implementa retries automáticos.
 
-**Garantias e limitações**
+##### Garantias e limitações
 
 A garantia é limitada a, no máximo, uma execução por `OperationID` enquanto o registro correspondente permanecer retido na mesma instância do MemoryDB.
 
@@ -618,95 +744,11 @@ A implementação não oferece garantia de `exactly-once`. Para proteção após
 
 O mecanismo também não oferece recuperação de resultados por consulta independente: a recuperação ocorre por meio da repetição da operação com o mesmo `OperationID` e os mesmos parâmetros.
 
-**#### 12.2.1. Etapas de implementação**
-
-**Especificação**
-
-- [x] Definir a diferença entre `RequestID` e `OperationID`.
-- [x] Definir os comandos inicialmente protegidos.
-- [x] Definir o escopo e a representação do identificador.
-- [x] Definir o comportamento para identificadores repetidos com o mesmo conteúdo.
-- [x] Definir o comportamento para identificadores repetidos com conteúdo diferente.
-- [x] Definir o tratamento de requisições concorrentes.
-- [x] Definir retenção, capacidade e política de não evicção antecipada.
-- [x] Definir o comportamento quando a capacidade estiver esgotada.
-- [x] Definir a limitação de durabilidade dos registros em memória.
-
-**Protocolo e servidor**
-
-- [x] Atualizar o schema Protobuf com `operation_id` em `SetCommand` e `DeleteCommand`.
-- [x] Regenerar os tipos Go.
-- [x] Atualizar o modelo interno de protocolo.
-- [x] Implementar o cálculo de fingerprints.
-- [x] Implementar o Executor de idempotência.
-- [x] Implementar reserva atômica de identificadores.
-- [x] Implementar espera de operações concorrentes com o mesmo identificador.
-- [x] Implementar replay de resultados.
-- [x] Implementar detecção de conflitos de fingerprint.
-- [x] Implementar controle de retenção e capacidade.
-- [x] Integrar o Executor ao Handler TCP.
-- [x] Compartilhar o Executor entre os handlers da instância do servidor.
-- [x] Implementar códigos de erro para identificador inválido, conflito, capacidade esgotada e resultado indeterminado.
-
-**Driver Go e integração**
-
-- [x] Implementar o tipo `OperationID`.
-- [x] Implementar `NewOperationID()`.
-- [x] Atualizar `Set` e `Delete` para receberem `OperationID`.
-- [x] Atualizar as variantes com `context.Context`.
-- [x] Preservar o comportamento de resultados indeterminados.
-- [x] Permitir a reutilização do mesmo identificador em novas tentativas.
-- [x] Manter a ausência de retries automáticos implícitos.
-- [x] Atualizar a aplicação cliente de demonstração.
-- [x] Atualizar os testes do driver e da integração.
-
-**Testes e validação**
-
-- [x] Testar replay de resultados.
-- [x] Testar conflito de fingerprint.
-- [x] Testar concorrência para identificadores iguais.
-- [x] Testar retenção e capacidade.
-- [x] Testar identificadores ausentes ou inválidos.
-- [x] Testar integração entre Handler, Executor e Engine.
-- [x] Executar testes com detector de race.
-- [x] Executar `go vet` nos módulos.
-- [x] Atualizar o manual de utilização e o README do driver Go.
-
-**Resultado**
-
-A implementação inicial de idempotência para `SET` e `DELETE` está concluída. A evolução para persistência dos registros, recuperação após reinicializações, métricas operacionais e suporte equivalente no driver Java permanece fora do escopo desta entrega.
-
-#### 12.2.1. Etapas de implementação
-
-- [x] Definir a diferença entre `request_id` e `operation_id`.
-- [x] Definir os comandos inicialmente protegidos.
-- [x] Definir o escopo e a representação do identificador.
-- [x] Definir o comportamento para identificadores repetidos com o mesmo conteúdo.
-- [x] Definir o comportamento para identificadores repetidos com conteúdo diferente.
-- [x] Definir o tratamento de requisições concorrentes.
-- [x] Definir retenção, capacidade e política de não evicção antecipada.
-- [x] Definir o comportamento quando a capacidade estiver esgotada.
-- [x] Definir a limitação de durabilidade dos registros em memória.
-- [ ] Atualizar o schema Protobuf e os tipos gerados.
-- [ ] Atualizar o modelo interno de protocolo.
-- [X] Implementar o gerenciador de idempotência.
-- [ ] Integrar o gerenciador ao fluxo de execução do servidor.
-- [ ] Implementar códigos de erro para identificador inválido, conflito e capacidade esgotada.
-- [ ] Implementar testes de replay de resultados.
-- [ ] Implementar testes de conflito de fingerprint.
-- [ ] Implementar testes de concorrência para identificadores iguais.
-- [ ] Implementar testes de expiração e capacidade.
-- [ ] Atualizar o driver Go para receber e reutilizar `OperationID`.
-- [ ] Testar a recuperação de uma operação após perda de resposta, reutilizando o mesmo `OperationID`.
-- [ ] Documentar a semântica pública e os limites da garantia.
-
-O driver não deverá gerar um novo `OperationID` automaticamente a cada tentativa de recuperação. A aplicação consumidora deverá poder fornecer e reutilizar o identificador associado à mesma operação lógica.
-
-O driver continuará sem retry automático implícito. A evolução permitirá que a aplicação decida repetir uma operação utilizando o mesmo `OperationID`.
-
-A implementação deverá preservar a distinção entre operação não iniciada, operação rejeitada e resultado indeterminado. Não liberar reservas quando não houver comprovação de que a mutação deixou de ocorrer.
+A implementação inicial de idempotência está concluída para o servidor e o driver Go. A persistência dos registros, a recuperação após reinicializações e o suporte equivalente no driver Java permanecem fora do escopo desta entrega.
 
 #### 12.3. Observabilidade
+
+**Status: planejada**
 
 - [ ] Definir métricas de conexões ativas.
 - [ ] Medir quantidade de operações por comando.
@@ -719,7 +761,11 @@ A implementação deverá preservar a distinção entre operação não iniciada
 
 A observabilidade deverá permitir identificar gargalos, falhas de comunicação, saturação de recursos e comportamento anormal do servidor.
 
+A instrumentação deverá respeitar o desacoplamento arquitetural. O núcleo da Engine e o Storage não deverão depender diretamente de ferramentas específicas de monitoramento.
+
 #### 12.4. Experiência de utilização
+
+**Status: planejada**
 
 - [ ] Melhorar a API pública dos drivers conforme novos requisitos.
 - [ ] Avaliar estratégia de reconexão do cliente.
@@ -727,7 +773,11 @@ A observabilidade deverá permitir identificar gargalos, falhas de comunicação
 - [ ] Criar ferramenta CLI para interação com o servidor.
 - [ ] Documentar configurações e cenários operacionais.
 
-A fase deverá priorizar robustez operacional e previsibilidade. O suporte a contextos, deadlines, serialização de operações concorrentes, gerenciamento de estados e identificação de resultados indeterminados já faz parte do driver Go atual e não constitui uma pendência de implementação básica.
+A fase deverá priorizar robustez operacional e previsibilidade.
+
+O suporte a contextos, deadlines, serialização de operações concorrentes, gerenciamento de estados e identificação de resultados indeterminados já faz parte do driver Go e não constitui uma pendência de implementação básica.
+
+A reconexão automática, caso seja considerada futuramente, deverá respeitar os estados internos do cliente, os resultados indeterminados e o contrato de idempotência. Não deverá introduzir retries automáticos sem garantias explícitas.
 
 ### Fase 13 — Segurança
 
@@ -756,6 +806,8 @@ TLS deverá ser a camada responsável pela proteção criptográfica da comunica
 
 Um adaptador RESP deverá converter os comandos Redis para operações da Engine, sem introduzir dependência do RESP no núcleo do banco.
 
+A implementação de novos protocolos ou transportes deverá preservar as regras de desacoplamento e reutilizar os componentes internos sempre que possível.
+
 ### Fase 15 — Persistência
 
 **Status: futura**
@@ -775,6 +827,10 @@ A persistência deverá ser projetada considerando a relação entre execução 
 
 A semântica de confirmação deverá deixar explícito se uma operação foi apenas aplicada em memória ou se também foi registrada de forma durável.
 
+A persistência dos dados e dos registros de idempotência deverá ser tratada de maneira consistente. Para garantir recuperação segura de operações após falhas, será necessário definir como a mutação e seu registro de idempotência serão gravados e recuperados.
+
+A implementação deverá evitar situações em que o banco recupere uma mutação sem seu registro correspondente, ou recupere um registro de idempotência sem a mutação associada.
+
 ### Fase 16 — Distribuição e escalabilidade
 
 **Status: futura**
@@ -789,6 +845,8 @@ A semântica de confirmação deverá deixar explícito se uma operação foi ap
 - [ ] Criar testes distribuídos.
 
 Essa fase depende de decisões específicas de consistência, disponibilidade e particionamento. Não faz parte do MVP.
+
+A evolução distribuída também exigirá revisar o escopo da idempotência, que atualmente é limitado a uma única instância do servidor.
 
 ## 10. Diretrizes de desenvolvimento
 
@@ -809,6 +867,10 @@ Essa fase depende de decisões específicas de consistência, disponibilidade e 
 - Não tratar `request_id` como identificador de deduplicação.
 - Diferenciar erros de aplicação, falhas de transporte, falhas de protocolo e resultados indeterminados.
 - Preservar a rastreabilidade entre requisitos, implementação, testes e documentação.
+- Avaliar impactos sobre o contrato de comunicação antes de alterar o schema Protobuf.
+- Preservar a distinção entre execução em memória e confirmação durável.
+- Não introduzir multiplexação sem definir previamente seu impacto sobre o protocolo, o transporte e os drivers.
+- Evitar que mecanismos de observabilidade criem dependências desnecessárias no núcleo do banco.
 
 ## 11. Critérios de conclusão do MVP
 
@@ -826,9 +888,11 @@ O MVP será considerado concluído quando:
 - [x] Os módulos passarem pelo `go test -race`.
 - [x] Os módulos passarem pelo `go vet`.
 
-**Situação atual:** os critérios técnicos do MVP estão atendidos pela implementação e pelas validações realizadas. A validação integrada dos módulos foi registrada em 15/11/2026, e a evolução posterior do driver Go foi validada separadamente em 22/11/2026.
+**Situação atual:** os critérios técnicos do MVP estão atendidos pela implementação e pelas validações realizadas.
 
-A consolidação documental permanece em andamento até a conclusão da revisão do manual e das instruções de desenvolvimento.
+A validação integrada dos módulos foi registrada em 15/11/2026, e a evolução posterior do driver Go foi validada separadamente em 22/11/2026. Em 25/11/2026, foram implementadas e validadas evoluções de robustez operacional do servidor, incluindo timeouts, limite de conexões e encerramento forçado.
+
+A consolidação documental permanece em andamento até a conclusão da revisão e incorporação de todos os documentos pendentes.
 
 O projeto pode avançar para as próximas evoluções sem depender de novas funcionalidades para considerar o MVP atual concluído.
 
@@ -847,7 +911,7 @@ O projeto pode avançar para as próximas evoluções sem depender de novas func
 | 9 | Consolidação e documentação | Em andamento |
 | 10 | Driver Java | Planejada |
 | 11 | TTL | Planejada |
-| 12 | Robustez, confiabilidade e utilização | Planejada |
+| 12 | Robustez, confiabilidade e utilização | Parcialmente concluída |
 | 13 | Segurança | Planejada |
 | 14 | Protocolos alternativos | Planejada |
 | 15 | Persistência | Futura |

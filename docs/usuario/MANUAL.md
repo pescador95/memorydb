@@ -12,6 +12,9 @@ A implementação atual oferece:
 - Chaves do tipo `string` e valores do tipo `[]byte`.
 - Armazenamento compartilhado entre conexões da mesma instância.
 - Atendimento concorrente de múltiplas conexões.
+- Limite configurável de conexões TCP simultâneas.
+- Timeouts configuráveis de leitura e escrita.
+- Encerramento gracioso e forçado do servidor.
 - Driver cliente para aplicações Go.
 - Operações do driver com suporte a `context.Context`.
 - Configuração operacional por variáveis de ambiente nos executáveis do servidor e do cliente de demonstração.
@@ -62,20 +65,30 @@ Linux:
 MEMORYDB_ADDR=127.0.0.1:6380 go run ./cmd/memorydb
 ```
 
-Também é possível configurar o encerramento gracioso e o Executor de idempotência.
+O servidor disponibiliza configurações para endereço, encerramento, timeouts de I/O, limite de conexões e Executor de idempotência.
 
 | Variável | Padrão | Descrição |
 |---|---:|---|
 | `MEMORYDB_ADDR` | `:6380` | Endereço TCP no qual o servidor escuta |
-| `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Tempo máximo aguardado pelo encerramento gracioso |
-| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência |
+| `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Prazo para encerramento do servidor |
+| `MEMORYDB_READ_TIMEOUT` | `30s` | Timeout de cada operação de leitura TCP |
+| `MEMORYDB_WRITE_TIMEOUT` | `10s` | Timeout de cada operação de escrita TCP |
+| `MEMORYDB_MAX_CONNECTIONS` | `1024` | Número máximo de conexões TCP simultâneas admitidas |
+| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência concluídos |
 | `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros de idempotência |
+
+Os timeouts de leitura e escrita são aplicados individualmente às operações de I/O. Eles não representam um prazo global para toda a conexão.
+
+O limite de conexões considera conexões TCP simultâneas admitidas pelo servidor. Não representa quantidade de requisições por conexão. Quando o limite é atingido, novas conexões são fechadas sem serem admitidas para processamento.
 
 Exemplo PowerShell:
 
 ```powershell
 $env:MEMORYDB_ADDR = "127.0.0.1:6381"
 $env:MEMORYDB_SHUTDOWN_TIMEOUT = "15s"
+$env:MEMORYDB_READ_TIMEOUT = "45s"
+$env:MEMORYDB_WRITE_TIMEOUT = "15s"
+$env:MEMORYDB_MAX_CONNECTIONS = "2048"
 $env:MEMORYDB_IDEMPOTENCY_RETENTION = "48h"
 $env:MEMORYDB_IDEMPOTENCY_CAPACITY = "200000"
 
@@ -87,6 +100,9 @@ Exemplo Linux:
 ```bash
 MEMORYDB_ADDR=127.0.0.1:6381 \
 MEMORYDB_SHUTDOWN_TIMEOUT=15s \
+MEMORYDB_READ_TIMEOUT=45s \
+MEMORYDB_WRITE_TIMEOUT=15s \
+MEMORYDB_MAX_CONNECTIONS=2048 \
 MEMORYDB_IDEMPOTENCY_RETENTION=48h \
 MEMORYDB_IDEMPOTENCY_CAPACITY=200000 \
 go run ./cmd/memorydb
@@ -122,7 +138,16 @@ No terminal em que o servidor está em execução, pressione `Ctrl+C`.
 
 O executável trata SIGINT e SIGTERM e solicita o encerramento do servidor com o timeout configurado em `MEMORYDB_SHUTDOWN_TIMEOUT`. O padrão é 10 segundos.
 
-O shutdown fecha o listener e aguarda as conexões ativas terminarem. Se o prazo expirar, o servidor retorna erro; a implementação não força diretamente o fechamento das conexões ativas. O executável trata esse erro como falha e encerra pelo caminho de erro.
+O processo de shutdown possui duas etapas:
+
+1. O servidor interrompe a aceitação de novas conexões, fecha o listener e aguarda a conclusão das conexões ativas.
+2. Se o contexto expirar antes da conclusão, o servidor fecha as conexões ainda ativas e aguarda a conclusão das goroutines dos handlers.
+
+Quando o contexto expira, `Shutdown` retorna o erro do contexto, associado a eventual erro no fechamento do listener.
+
+O fechamento forçado interrompe operações de I/O TCP bloqueadas. Não representa cancelamento genérico de qualquer operação que um handler possa executar fora dessas operações de rede.
+
+O executável trata um erro de shutdown como falha de encerramento e retorna pelo caminho de erro da aplicação.
 
 Os dados em memória e os registros de idempotência são perdidos quando o processo termina.
 
@@ -245,6 +270,8 @@ Os métodos sem contexto utilizam `context.Background()` internamente.
 Para configurar o estabelecimento da conexão, o driver disponibiliza o tipo `DialConfig`:
 
 ```go
+import "time"
+
 type DialConfig struct {
     Address string
     Timeout time.Duration
@@ -258,6 +285,8 @@ Um timeout igual a zero não estabelece um timeout próprio para a conexão. Val
 Exemplo:
 
 ```go
+import "time"
+
 config := memorydb.DialConfig{
     Address: "127.0.0.1:6380",
     Timeout: 5 * time.Second,
@@ -729,6 +758,7 @@ Entretanto, as operações são serializadas por conexão. Uma operação precis
 Características:
 
 - O servidor atende múltiplas conexões simultaneamente.
+- O servidor limita a quantidade de conexões TCP simultâneas admitidas.
 - O driver permite chamadas concorrentes sobre o mesmo client.
 - As operações em uma mesma conexão são executadas sequencialmente.
 - Não há multiplexação de múltiplas solicitações simultâneas na mesma conexão.
@@ -797,7 +827,6 @@ Exemplo:
 
 ```go
 var outcomeErr *memorydb.OperationOutcomeUnknownError
-
 if errors.As(err, &outcomeErr) {
     log.Printf(
         "Resultado desconhecido para request %d: %v",
@@ -854,6 +883,11 @@ Depois de uma falha de comunicação ou cancelamento durante I/O, não reutilize
 | Configuração de endereço inválida | Endereço informado incorretamente | Confira `MEMORYDB_ADDR` ou `MEMORYDB_CLIENT_ADDR` |
 | Timeout de conexão inválido | Valor inválido ou não positivo | Confira `MEMORYDB_DIAL_TIMEOUT` |
 | Timeout de shutdown inválido | Duração inválida ou não positiva | Confira `MEMORYDB_SHUTDOWN_TIMEOUT` |
+| Timeout de leitura inválido | Duração inválida ou não positiva | Confira `MEMORYDB_READ_TIMEOUT` |
+| Timeout de escrita inválido | Duração inválida ou não positiva | Confira `MEMORYDB_WRITE_TIMEOUT` |
+| Limite de conexões inválido | Valor não inteiro ou não positivo | Confira `MEMORYDB_MAX_CONNECTIONS` |
+| Conexão fechada ao atingir limite | Número máximo de conexões simultâneas atingido | Verifique a utilização de conexões e ajuste o limite, se necessário |
+| Timeout de leitura ou escrita | Operação de I/O excedeu seu prazo | Verifique a comunicação e os tempos de resposta do cliente |
 | Configuração de retenção inválida | Duração inválida ou não positiva | Confira `MEMORYDB_IDEMPOTENCY_RETENTION` |
 | Capacidade de idempotência inválida | Valor não inteiro ou não positivo | Confira `MEMORYDB_IDEMPOTENCY_CAPACITY` |
 | Chave vazia | SET, GET ou DELETE recebeu uma chave vazia | Envie uma chave não vazia |
@@ -887,10 +921,9 @@ A implementação atual possui as seguintes limitações:
 - **Sem TLS:** a comunicação não é criptografada.
 - **Sem isolamento por tenant:** clientes da mesma instância compartilham o armazenamento.
 - **Limite de frame:** payload máximo de 1 MiB.
-- **Sem timeout configurável por operação no servidor:** não há política configurável de timeout de leitura e escrita.
-- **Sem cota de conexões:** não há limite configurável de conexões concorrentes.
-- **Sem proteção específica contra clientes lentos:** não há política específica de timeout de inatividade ou envio lento de dados.
-- **Shutdown sem fechamento forçado:** conexões ativas não são fechadas diretamente quando o contexto de shutdown expira.
+- **Sem timeout de inatividade independente:** não existe uma configuração específica para inatividade. Entretanto, o timeout de leitura também limita o tempo de espera pelo próximo frame; uma conexão sem novas solicitações poderá ser encerrada quando esse prazo expira
+- **Sem limite de requisições por conexão:** o limite de conexões TCP não representa uma cota de operações.
+- **Sem controle de taxa:** não existe limitação de requisições por cliente.
 - **Sem multiplexação:** o driver Go executa uma operação por vez em cada conexão.
 - **Sem pool de conexões integrado:** o driver não gerencia um conjunto de conexões.
 - **Sem reconexão automática:** conexões interrompidas não são restabelecidas automaticamente.
@@ -906,6 +939,10 @@ A implementação atual possui as seguintes limitações:
 - **Sem configuração automática por ambiente no driver:** a biblioteca recebe endereço e timeout explicitamente. A aplicação consumidora é responsável por obter e fornecer esses valores.
 - **Sem interface HTTP ou REST:** o protocolo disponível é TCP com framing e Protobuf.
 - **Sem driver Java implementado e validado nesta etapa:** a integração Java não faz parte do escopo funcional atual.
+
+Os timeouts de leitura e escrita e o limite de conexões TCP são mecanismos implementados. Eles reduzem alguns riscos operacionais, mas não substituem controles de inatividade, taxa de requisições ou isolamento por cliente.
+
+O encerramento forçado fecha as conexões TCP ainda ativas quando o contexto expira e aguarda a conclusão dos handlers. Esse mecanismo não representa cancelamento genérico de operações que eventualmente venham a ser executadas fora do I/O TCP.
 
 Não utilize o MemoryDB como armazenamento durável nem exponha o serviço a redes não confiáveis enquanto os mecanismos de segurança necessários não estiverem implementados.
 
@@ -961,7 +998,7 @@ Não. Após falha de comunicação ou cancelamento durante I/O, é necessário c
 
 ### Posso executar várias operações simultaneamente no mesmo client?
 
-As chamadas podem partir de goroutines diferentes, mas o driver serializa as operações na mesma conexão. O servidor atende múltiplas conexões simultaneamente.
+As chamadas podem partir de goroutines diferentes, mas o driver serializa as operações na mesma conexão. O servidor atende múltiplas conexões simultaneamente, respeitando o limite configurado de conexões admitidas.
 
 ### O que é OperationID?
 
@@ -1015,9 +1052,38 @@ Não gere um novo `OperationID` para repetir a mesma operação lógica. Para PI
 
 O servidor fecha o listener e aguarda as conexões ativas, respeitando o timeout configurado por `MEMORYDB_SHUTDOWN_TIMEOUT`, cujo padrão é 10 segundos.
 
-Se o contexto expirar, o executável trata o erro e encerra pelo caminho de falha. O shutdown não força diretamente o fechamento das conexões ativas.
+Se todas as conexões terminarem dentro do prazo, o shutdown é concluído normalmente.
+
+Se o contexto expirar antes da conclusão, o servidor fecha as conexões ainda ativas e aguarda a conclusão das goroutines dos handlers. Depois disso, `Shutdown` retorna o erro do contexto, associado a eventual erro no fechamento do listener.
+
+O executável trata esse retorno como falha de shutdown e encerra pelo caminho de erro.
 
 Os dados em memória e os registros de idempotência são perdidos quando o processo termina.
+
+### O que acontece quando o limite de conexões é atingido?
+
+O servidor fecha novas conexões que excederem `MEMORYDB_MAX_CONNECTIONS`.
+
+O valor padrão é 1.024 conexões simultâneas. O limite pode ser alterado por variável de ambiente, desde que seja um inteiro positivo.
+
+Esse limite não representa uma quantidade máxima de requisições por conexão.
+
+### Como funcionam os timeouts de leitura e escrita?
+
+O servidor aplica um deadline antes de cada operação de leitura e de escrita TCP.
+
+Os padrões são:
+
+- Leitura: 30 segundos.
+- Escrita: 10 segundos.
+
+Os valores podem ser alterados por `MEMORYDB_READ_TIMEOUT` e `MEMORYDB_WRITE_TIMEOUT`.
+
+Esses prazos são individuais para cada operação de I/O. Não representam um timeout global para toda a conexão.
+
+O timeout de leitura também limita o tempo de espera pelo próximo frame. Portanto, uma conexão que permaneça aberta sem enviar novas solicitações poderá ser encerrada quando esse prazo expirar.
+
+Não existe, nesta etapa, uma configuração independente de timeout de inatividade.
 
 ### Como configurar o endereço do servidor e do cliente?
 
@@ -1035,6 +1101,9 @@ As variáveis são independentes. Quando o servidor utilizar um endereço difere
 | Endereço do cliente de demonstração | `MEMORYDB_CLIENT_ADDR` | `127.0.0.1:6380` |
 | Timeout de conexão do cliente | `MEMORYDB_DIAL_TIMEOUT` | `5s` |
 | Timeout de shutdown | `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` |
+| Timeout de leitura do servidor | `MEMORYDB_READ_TIMEOUT` | `30s` |
+| Timeout de escrita do servidor | `MEMORYDB_WRITE_TIMEOUT` | `10s` |
+| Máximo de conexões simultâneas | `MEMORYDB_MAX_CONNECTIONS` | `1024` |
 | Retenção de idempotência | `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` |
 | Capacidade de idempotência | `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` |
 

@@ -21,6 +21,9 @@ A implementação atual contempla:
 - Operações do driver com suporte a `context.Context`.
 - Tratamento de erros de comunicação e resultados indeterminados.
 - Atendimento concorrente de múltiplos clientes.
+- Limite configurável de conexões TCP simultâneas.
+- Timeouts configuráveis de leitura e escrita no transporte TCP.
+- Encerramento gracioso do servidor, com fechamento forçado de conexões quando o prazo de shutdown expira.
 - Workspace Go composto por módulos independentes.
 - Idempotência server-side para operações SET e DELETE.
 - Identificação de operações por `OperationID` de 16 bytes.
@@ -43,6 +46,7 @@ A implementação atual não possui:
 - Persistência dos registros de idempotência.
 - Replicação ou compartilhamento de registros de idempotência entre instâncias.
 - Garantia de execução exatamente uma vez.
+- Observabilidade integrada por métricas, tracing ou monitoramento.
 
 O campo `ttl_ms` existe no contrato Protobuf, mas valores positivos são rejeitados como funcionalidade não suportada.
 
@@ -53,6 +57,12 @@ Os registros de idempotência são mantidos em memória, na instância do servid
 A recuperação de uma resposta indeterminada depende de uma nova tentativa com o mesmo `OperationID` e os mesmos parâmetros, enquanto o registro correspondente ainda estiver retido na mesma instância. Reinicializações ou encerramentos do processo eliminam os registros.
 
 O `request_id` permite correlacionar solicitações e respostas, mas não substitui o `OperationID`. O primeiro identifica uma tentativa de comunicação; o segundo identifica uma operação lógica de mutação.
+
+O limite de conexões controla quantas conexões TCP simultâneas o servidor admite. Ele não limita diretamente a quantidade de operações por conexão e não representa suporte a multiplexação.
+
+Os timeouts de leitura e escrita são aplicados às respectivas operações de I/O TCP. Eles não representam um prazo global de execução de uma operação de negócio.
+
+O encerramento forçado fecha as conexões TCP ativas para interromper operações de I/O pendentes. Isso não constitui um mecanismo genérico de cancelamento de qualquer operação interna do servidor.
 
 **Segurança:** o servidor não deve ser exposto a redes não confiáveis sem mecanismos adicionais de proteção.
 
@@ -65,7 +75,7 @@ O `request_id` permite correlacionar solicitações e respostas, mas não substi
 | [Requisitos e critérios de aceite](./requisitos/REQUISITOS.md) | Requisitos funcionais e não funcionais, cenários, casos de borda, lacunas e rastreabilidade | Desenvolvimento e QA |
 | [Manual do usuário](./usuario/MANUAL.md) | Pré-requisitos, inicialização, demonstração, comandos, driver Go, erros e limitações | Desenvolvedores consumidores, QA e suporte |
 | [Guia do driver Go](../drivers/go/README.md) | Instalação e integração do driver Go em aplicações independentes | Desenvolvedores consumidores |
-| [Guia de testes](./tecnica/TESTES.md) | Execução dos testes, verificações técnicas e análise de cobertura. |
+| [Guia de testes](./tecnica/TESTES.md) | Execução dos testes, verificações técnicas e análise de cobertura | Desenvolvimento e QA |
 
 ## 3. Por onde começar
 
@@ -76,7 +86,7 @@ Consulte o [Manual do usuário](./usuario/MANUAL.md).
 O documento apresenta os pré-requisitos, a inicialização do servidor, a configuração do endereço TCP e a execução do cliente de demonstração.
 
 ### Quero executar os testes e validar o projeto
- 
+
 Consulte o [Guia de testes](./tecnica/TESTES.md).
 
 ### Quero integrar uma aplicação Go
@@ -204,7 +214,9 @@ O projeto possui testes automatizados para os principais componentes e fluxos:
 - Operações e concorrência no driver Go.
 - Cancelamento, deadlines e falhas de comunicação.
 - Resultados indeterminados.
-- Encerramento do servidor.
+- Limites de conexões simultâneas.
+- Timeouts de leitura e escrita.
+- Encerramento gracioso e forçado do servidor.
 
 Os procedimentos reproduzíveis de validação estão centralizados nos scripts de `scripts/test/` e documentados no [Guia de testes](./tecnica/TESTES.md). Os resultados históricos abaixo registram execuções realizadas naquele momento e não substituem uma nova execução após alterações no código.
 

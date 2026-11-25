@@ -1,20 +1,29 @@
 # Requisitos e Critérios de Aceite — MemoryDB
 
-## 1. Objetivo
-
 Este documento registra os requisitos funcionais e as características não funcionais verificáveis na implementação atual do MemoryDB.
 
 A documentação é retrospectiva: os requisitos são descritos a partir do comportamento implementado no código e dos testes identificados no repositório.
 
-O documento também registra limitações e lacunas que devem ser consideradas em evoluções futuras.
+O documento também registra limitações e lacunas que devem ser consideradas em evoluções futuras. Funcionalidades planejadas, mas ainda não implementadas, não são apresentadas como capacidades disponíveis.
 
-Os estados utilizados são:
+## 1. Objetivo
+
+O objetivo deste documento é:
+
+- Identificar os comportamentos funcionais disponíveis.
+- Registrar os requisitos não funcionais e as características técnicas verificáveis.
+- Relacionar requisitos aos componentes responsáveis.
+- Identificar os testes que dão evidência aos comportamentos descritos.
+- Registrar limitações de implementação e cobertura de testes.
+- Diferenciar funcionalidades implementadas de evoluções futuras.
+
+Os estados utilizados possuem os seguintes significados:
 
 | Estado | Significado |
 |---|---|
 | Implementado e testado | Comportamento presente no código e coberto por testes identificados para os cenários descritos |
 | Implementado, cobertura parcial | Comportamento presente no código, mas sem cobertura de teste suficiente para todos os cenários descritos |
-| Implementado, validação histórica | Há registro de execução bem-sucedida em uma versão específica, mas não necessariamente uma validação completa do estado atual |
+| Implementado, validação histórica | Há registro de execução bem-sucedida em uma versão específica, sem representar necessariamente uma validação completa do estado atual |
 | Implementado | Comportamento presente no código, sem declaração específica sobre cobertura de testes |
 | Parcial | Parte do comportamento está implementada, mas há limitações conhecidas |
 | Não implementado | Não há implementação funcional identificada |
@@ -41,10 +50,12 @@ O escopo funcional atual contempla:
 - Deduplicação de operações enquanto seus registros permanecem retidos na instância do servidor.
 - Reprodução de respostas de operações anteriormente concluídas.
 - Controle de concorrência, retenção e capacidade dos registros de idempotência.
-- Encerramento gracioso do servidor.
+- Encerramento gracioso e forçado do servidor.
+- Controle do número máximo de conexões TCP simultâneas.
+- Timeouts de leitura e escrita no processamento das conexões TCP.
 - Workspace Go composto por módulos independentes.
 
-### 2.1 Limitações do escopo
+### 2.1. Limitações do escopo
 
 A implementação atual não oferece:
 
@@ -57,9 +68,12 @@ A implementação atual não oferece:
 - Isolamento por tenant.
 - Replicação ou distribuição entre instâncias.
 - Multiplexação de requisições na mesma conexão.
+- Timeout específico de inatividade de uma conexão.
 - Garantia de idempotência após reinicialização, perda do processo ou expiração do registro.
 - Retry automático no driver.
 - Driver Java implementado e validado.
+
+Os limites de leitura, escrita e quantidade de conexões TCP são implementados. Eles não devem ser confundidos com limites de inatividade, controle de taxa de requisições ou políticas completas de isolamento entre clientes.
 
 ## 3. Requisitos funcionais
 
@@ -132,7 +146,7 @@ Cenário: Substituir valor existente
 
 O campo existe no contrato externo, mas a expiração automática de entradas não está implementada.
 
-A solicitação deve possuir um OperationID válido, cuja validação ocorre no fluxo do Handler/Executor antes da execução do comando. Após essa validação, o Handler encaminha a operação ao Engine, que deve rejeitar o TTL positivo com o erro `UNSUPPORTED_FEATURE`, sem alterar o estado do armazenamento.
+A solicitação deve possuir um `OperationID` válido, cuja validação ocorre no fluxo do Handler/Executor antes da execução do comando. Após essa validação, o Handler encaminha a operação ao Engine, que deve rejeitar o TTL positivo com o erro `UNSUPPORTED_FEATURE`, sem alterar o estado do armazenamento.
 
 **Componentes:** Contrato Protobuf, `Handler`, `idempotency.Executor` e `Engine`.
 
@@ -243,11 +257,11 @@ Cenário: Remover chave ausente
 
 **Descrição:** O engine deve rejeitar:
 
-- solicitação nula;
-- comando ausente;
-- comando desconhecido;
-- comando representado por ponteiro tipado nulo;
-- chave vazia em SET, GET ou DELETE.
+- Solicitação nula.
+- Comando ausente.
+- Comando desconhecido.
+- Comando representado por ponteiro tipado nulo.
+- Chave vazia em SET, GET ou DELETE.
 
 O fluxo de processamento também deve rejeitar `OperationID` ausente ou com tamanho diferente de 16 bytes nas operações SET e DELETE.
 
@@ -301,7 +315,7 @@ Cenário: Rejeitar OperationID inválido
 
 **Estado:** Implementado, cobertura parcial.
 
-**Lacunas de testes:** Foram identificados testes para solicitação nula, comando ausente e chave vazia em SET. Não foram identificados testes específicos para comando desconhecido, comando tipado nulo e chave vazia em GET e DELETE. A validação desses cenários deve ser confirmada no código e complementada na suíte de testes.
+**Lacunas de testes:** O teste identificado para chave vazia cobre SET. GET e DELETE possuem validação no código, mas não foram identificados testes específicos equivalentes para essas operações.
 
 ### FR-007 — Correlacionar respostas com solicitações
 
@@ -351,11 +365,11 @@ Cenário: Atualizar RequestID em resposta reproduzida
 
 **Descrição:** Cada frame deve utilizar:
 
-- cabeçalho de 4 bytes;
-- tamanho `uint32`;
-- ordem de bytes Big Endian;
-- payload mínimo de 1 byte;
-- payload máximo de 1 MiB.
+- Cabeçalho de 4 bytes.
+- Tamanho `uint32`.
+- Ordem de bytes Big Endian.
+- Payload mínimo de 1 byte.
+- Payload máximo de 1 MiB.
 
 A leitura deve reconstruir mensagens mesmo quando os bytes chegam fragmentados. A escrita deve tratar escritas parciais.
 
@@ -441,11 +455,15 @@ Cenário: Compartilhar registros de idempotência
 
 **Limitação:** Não existe multiplexação de requisições simultâneas na mesma conexão. O driver Go executa um ciclo de requisição e resposta por vez.
 
-### FR-010 — Encerrar servidor graciosamente
+### FR-010 — Encerrar servidor graciosamente e forçadamente
 
-**Descrição:** `Shutdown` deve fechar o listener e aguardar as conexões ativas terminarem ou o contexto ser cancelado.
+**Descrição:** `Shutdown` deve impedir novas conexões, fechar o listener e aguardar a conclusão das conexões ativas.
 
-O executável deve solicitar encerramento ao receber SIGINT ou SIGTERM, utilizando timeout de 10 segundos.
+Se o contexto expirar antes da conclusão, o servidor deve fechar as conexões ainda ativas, aguardar a conclusão das goroutines dos handlers e retornar o erro do contexto, associado a eventual erro no fechamento do listener.
+
+O executável deve solicitar encerramento ao receber SIGINT ou SIGTERM, utilizando o timeout configurado para o shutdown.
+
+O fechamento das conexões ativas interrompe operações de I/O TCP bloqueadas. Isso não representa cancelamento genérico de qualquer operação que um handler possa executar fora dessas operações de rede.
 
 **Componentes:** `Server` e executável do servidor.
 
@@ -454,7 +472,8 @@ O executável deve solicitar encerramento ao receber SIGINT ou SIGTERM, utilizan
 - `server/internal/transport/tcp/server.go` — `Server.Shutdown`.
 - `server/cmd/memorydb/main.go` — inicialização e tratamento de sinais.
 - `server/internal/transport/tcp/server_test.go` — `TestServerShutdownWaitsForActiveConnections`.
-- `server/internal/integration/server_test.go` — teste de shutdown com conexões ativas.
+- `server/internal/transport/tcp/server_test.go` — `TestServerClosesAcceptedConnectionDuringShutdown`.
+- `server/internal/integration/server_test.go` — testes de shutdown com conexões ativas.
 
 **Critérios de aceite**
 
@@ -464,7 +483,14 @@ Cenário: Aguardar conexão ativa durante shutdown
   Quando Shutdown for chamado
   Então o listener deve parar de aceitar conexões
   E Shutdown deve aguardar a conexão terminar
-  Ou retornar erro quando o contexto expirar
+
+Cenário: Fechar conexões quando o contexto expirar
+  Dado que o servidor tem uma conexão ativa
+  E que o contexto de shutdown expira antes da conclusão
+  Quando Shutdown atingir o prazo do contexto
+  Então deve fechar as conexões ainda ativas
+  E aguardar a conclusão das goroutines dos handlers
+  E retornar o erro do contexto
 
 Cenário: Encerrar após sinal do sistema operacional
   Dado que o executável do servidor está em execução
@@ -477,8 +503,9 @@ Cenário: Encerrar após sinal do sistema operacional
 
 **Limitações:**
 
-- O servidor não força o fechamento das conexões ativas quando o contexto expira.
+- O fechamento forçado interrompe operações de I/O TCP nas conexões ativas, mas não representa cancelamento genérico de qualquer operação que um handler possa executar.
 - O fluxo de sinais do executável não possui teste automatizado específico identificado.
+- Após fechar as conexões, o servidor ainda aguarda a conclusão das goroutines dos handlers antes de retornar.
 
 ### FR-011 — Controlar operações do driver por contexto
 
@@ -583,10 +610,10 @@ O `RequestID` continua identificando cada tentativa de requisição. O `Operatio
 
 O fingerprint considera:
 
-- o tipo da operação;
-- a chave;
-- o valor, no caso de SET;
-- o TTL, no caso de SET.
+- O tipo da operação.
+- A chave.
+- O valor, no caso de SET.
+- O TTL, no caso de SET.
 
 O próprio `OperationID` não integra o fingerprint.
 
@@ -714,10 +741,10 @@ Esta seção registra características observáveis da implementação atual. It
 | NFR-001 | Operações concorrentes de armazenamento devem ser sincronizadas. | Implementado e testado | `server/internal/storage/storage.go`, `storage_test.go` |
 | NFR-002 | Valores devem ser tratados como bytes, inclusive dados binários. | Implementado | `memorydb.proto`, modelo interno e codec |
 | NFR-003 | Frames devem respeitar limite de 1 MiB e codificação Big Endian. | Implementado e testado | `transport/tcp/go/framing.go`, `framing_test.go` |
-| NFR-004 | O servidor deve interromper a aceitação e aguardar conexões durante shutdown. | Parcial | `server/internal/transport/tcp/server.go` |
+| NFR-004 | O servidor deve interromper a aceitação, aguardar conexões ativas e fechá-las quando o contexto de shutdown expirar. | Implementado e testado | `server/internal/transport/tcp/server.go`, `server_test.go` |
 | NFR-005 | Dados devem sobreviver à reinicialização do processo. | Não implementado | `server/internal/storage/storage.go` |
 | NFR-006 | Comunicação deve oferecer criptografia TLS. | Não implementado | `server/cmd/memorydb/main.go` |
-| NFR-007 | O servidor deve impor timeouts de I/O e limites operacionais de conexões. | Não implementado | `server/internal/transport/tcp/server.go`, `transport/tcp/go/connection.go` |
+| NFR-007 | O servidor deve impor timeouts de leitura e escrita e limitar o número de conexões TCP simultâneas. | Implementado e testado | `server/internal/transport/tcp/handler.go`, `handler_test.go`, `server.go`, `server_test.go` |
 | NFR-008 | O projeto deve possuir metas mensuráveis de latência e throughput. | Não identificado | Não foram identificadas metas ou benchmarks de performance |
 | NFR-009 | Falhas de processamento de conexões devem ser observáveis em logs. | Não implementado | `server/internal/transport/tcp/server.go` |
 | NFR-010 | Execução de comandos, storage, protocolo, codec e transporte devem possuir responsabilidades separadas. | Implementado | Pacotes internos do módulo `server` |
@@ -729,25 +756,50 @@ Esta seção registra características observáveis da implementação atual. It
 | NFR-016 | A execução de operações com o mesmo `OperationID` deve ser sincronizada, evitando execuções concorrentes duplicadas. | Implementado e testado | `server/internal/idempotency/executor.go`, `executor_test.go` |
 | NFR-017 | O executor de idempotência deve calcular fingerprints determinísticos para operações mutáveis. | Implementado e testado | `server/internal/idempotency/fingerprint.go`, `fingerprint_test.go` |
 
-### 4.1 Observações sobre os requisitos não funcionais
+### 4.1. Observações sobre os requisitos não funcionais
 
 **NFR-004 — Shutdown**
 
-O servidor fecha o listener e aguarda as conexões ativas. O executável utiliza timeout de 10 segundos. A expiração do contexto não implica fechamento forçado das conexões.
+O servidor fecha o listener e aguarda as conexões ativas. Se o contexto expirar, fecha as conexões restantes e aguarda a conclusão das goroutines dos handlers.
+
+O executável utiliza timeout configurável, com padrão de 10 segundos.
+
+O fechamento das conexões interrompe operações de I/O TCP, mas não equivale ao cancelamento genérico de qualquer operação executada pelo handler.
 
 **NFR-007 — Limites operacionais**
 
-O limite de tamanho dos frames não equivale a um limite de conexões, timeout de leitura, timeout de escrita ou proteção contra clientes lentos.
+O servidor implementa:
 
-Os contextos do driver controlam operações no lado cliente, mas não substituem políticas operacionais aplicadas pelo servidor.
+- Timeout de leitura TCP, com padrão de 30 segundos.
+- Timeout de escrita TCP, com padrão de 10 segundos.
+- Limite de 1.024 conexões simultâneas por padrão.
+
+Os valores podem ser ajustados por variáveis de ambiente:
+
+| Variável | Finalidade | Padrão |
+|---|---|---|
+| `MEMORYDB_READ_TIMEOUT` | Timeout de leitura TCP | 30 segundos |
+| `MEMORYDB_WRITE_TIMEOUT` | Timeout de escrita TCP | 10 segundos |
+| `MEMORYDB_MAX_CONNECTIONS` | Número máximo de conexões TCP simultâneas | 1.024 |
+| `MEMORYDB_SHUTDOWN_TIMEOUT` | Prazo para encerramento do servidor | 10 segundos |
+
+Os timeouts são aplicados individualmente às operações de leitura e escrita, não como um prazo global para toda a vida da conexão.
+
+O limite de conexões representa conexões TCP simultâneas admitidas, não quantidade de requisições ou operações por conexão. Conexões excedentes são fechadas sem serem admitidas para processamento.
+
+Essas proteções não substituem mecanismos ainda não implementados, como timeout de inatividade, autenticação, TLS e observabilidade estruturada de erros.
 
 **NFR-009 — Observabilidade**
 
 A goroutine criada por `Server.Serve()` descarta o erro retornado por `Handler.Handle`. Portanto, falhas individuais de conexão não são registradas de forma estruturada nesse ponto.
 
+O isolamento dessas falhas impede que um erro individual do handler seja propagado como falha do loop de aceitação, mas a ausência de registro dificulta diagnóstico e monitoramento.
+
 **NFR-014 — Validação**
 
 A aprovação em testes é uma evidência associada a uma versão do código e a uma execução específica. Não representa garantia permanente para alterações futuras.
+
+A validação histórica de 22/11/2026 e a validação direcionada de 25/11/2026 estão separadas na seção 8.
 
 **NFR-015 a NFR-017 — Idempotência**
 
@@ -763,7 +815,7 @@ Os registros de idempotência são mantidos em memória e não oferecem durabili
 |---|---|---|
 | Solicitação nula | Retorna `INVALID_REQUEST` no engine | `engine.go`, `engine_test.go` |
 | Comando ausente | Retorna `INVALID_REQUEST` | `engine.go`, `engine_test.go` |
-| Comando tipado nulo | Rejeitado como requisição inválida | `engine.go`; teste específico não identificado |
+| Comando tipado nulo | Rejeitado como requisição inválida | `engine.go`, `engine_test.go` |
 | Chave vazia | SET, GET e DELETE rejeitam com `INVALID_ARGUMENT` | `engine.go`, `engine_test.go` |
 | TTL maior que zero | SET retorna `UNSUPPORTED_FEATURE` | `engine.go`, `engine_test.go` |
 | Valor vazio | Pode ser armazenado; GET informa `found=true` | `storage.go`, `storage_test.go` |
@@ -794,6 +846,12 @@ Os registros de idempotência são mantidos em memória e não oferecem durabili
 | Registro em andamento | Não expira pela janela de retenção de operações concluídas | `executor_test.go` |
 | Resposta reproduzida | Mantém o resultado semântico e atualiza o RequestID para a tentativa atual | `executor_test.go`, `handler_test.go` |
 | Reinicialização do servidor | Dados e registros de idempotência são perdidos | `storage.go`, `idempotency/executor.go` |
+| Conexões simultâneas acima do limite | Conexões excedentes são fechadas sem serem admitidas para processamento | `server.go`, `server_test.go` |
+| Timeout de leitura | Handler aplica deadline antes de cada leitura de frame | `handler.go`, `handler_test.go` |
+| Timeout de escrita | Handler aplica deadline antes de cada escrita de resposta | `handler.go`, `handler_test.go` |
+| Shutdown com conexão ativa | Servidor aguarda a conclusão da conexão antes de retornar | `server.go`, `server_test.go` |
+| Shutdown com contexto expirado | Servidor fecha conexões ativas e aguarda a conclusão dos handlers | `server.go`, `server_test.go` |
+| Nova conexão durante shutdown | Conexão aceita durante a transição para shutdown é fechada, sem iniciar processamento | `server.go`, `server_test.go` |
 
 ## 6. Rastreabilidade requisito–componente–teste
 
@@ -801,14 +859,14 @@ Os registros de idempotência são mantidos em memória e não oferecem durabili
 |---|---|---|---|
 | FR-001 | Engine | `TestPing` | Coberto |
 | FR-002 | Handler / Executor / Engine / Storage | `TestSetAndGet`, `TestSetOverwritesExistingValue` | Coberto para gravação e substituição; validação de OperationID coberta no FR-006 |
-| FR-003 | Handler / Executor / Engine | TestRejectsUnsupportedTTL, testes de fingerprint | Coberto para rejeição; ausência de gravação não verificada especificamente |
+| FR-003 | Handler / Executor / Engine | `TestRejectsUnsupportedTTL`, testes de fingerprint | Coberto para rejeição |
 | FR-004 | Engine / Storage | `TestGetMissingKey`, `TestEmptyValue`, `TestServerEmptyValueAndMissingKey` | Coberto |
 | FR-005 | Handler / Engine / Storage | `TestDelete`, `TestServerSetGetDelete`, testes de idempotência | Coberto |
 | FR-006 | Engine / Handler / Executor | `TestRejectsEmptyKey`, `TestRejectsNilRequest`, `TestRejectsMissingCommand`, testes de identificador inválido | Parcial: faltam testes específicos de chave vazia em GET e DELETE |
 | FR-007 | Engine / Codec / Executor | `TestPing`, `TestRequestRoundTrip`, `TestResponseRoundTrip`, testes de replay | Coberto |
 | FR-008 | Framing TCP | Testes de endian, fragmentação, limites, truncamento e escrita parcial | Coberto |
 | FR-009 | Handler / Server / Driver / Executor | `TestHandlerProcessesMultipleRequests`, `TestServerAcceptsMultipleClients`, testes de integração e concorrência do executor | Coberto para conexões distintas e requisições sequenciais |
-| FR-010 | Server / Executável | `TestServerShutdownWaitsForActiveConnections` | Parcial: fluxo de sinais sem teste específico identificado |
+| FR-010 | Server / Executável | `TestServerShutdownWaitsForActiveConnections`, `TestServerClosesAcceptedConnectionDuringShutdown` e testes de integração | Coberto para espera graciosa e fechamento forçado; fluxo de sinais sem teste específico identificado |
 | FR-011 | Driver Go / Executor / Handler | Testes de escrita parcial, execução no servidor com perda da resposta, cancelamento durante leitura e replay no servidor | Parcial: cancelamento e sinalização de resultado indeterminado cobertos; recuperação por repetição validada no servidor, sem teste ponta a ponta com o driver |
 | FR-012 | Protobuf / Handler / Executor / Driver Go | `executor_test.go`, `fingerprint_test.go`, `handler_test.go`, `server_test.go`, `client_test.go` e testes de integração | Parcial: cenários de idempotência cobertos; recuperação ponta a ponta após resultado indeterminado sem teste específico identificado |
 
@@ -854,19 +912,21 @@ O armazenamento é compartilhado entre todos os clientes conectados à mesma ins
 
 **Impacto:** não existe separação lógica de dados por organização ou cliente.
 
-### GAP-006 — Limites operacionais incompletos
+### GAP-006 — Controles operacionais complementares ainda incompletos
 
-O tamanho dos frames é limitado a 1 MiB, mas não foram identificados limites específicos para:
+A implementação atual oferece controles básicos para limitar o consumo de recursos por conexões TCP:
 
-- quantidade de conexões simultâneas;
-- tempo máximo de leitura no servidor;
-- tempo máximo de escrita no servidor;
-- tempo máximo de inatividade de uma conexão;
-- proteção contra clientes que enviam dados lentamente.
+- Limite de conexões simultâneas, com padrão de 1.024.
+- Timeout de leitura, com padrão de 30 segundos.
+- Timeout de escrita, com padrão de 10 segundos.
 
-**Impacto:** conexões lentas ou excessivas podem consumir recursos do servidor.
+Esses valores são configuráveis por variáveis de ambiente.
 
-**Referências:** `transport/tcp/go/connection.go`, `transport/tcp/go/framing.go`, `server/internal/transport/tcp/server.go`.
+Entretanto, ainda não existe timeout específico de inatividade de uma conexão. Os timeouts de leitura e escrita limitam operações individuais de I/O, mas não estabelecem um prazo máximo para toda a permanência de uma conexão.
+
+**Impacto:** uma conexão pode permanecer aberta por tempo indeterminado se continuar realizando operações dentro dos prazos individuais. Os limites atuais não representam uma política completa de controle de utilização por cliente.
+
+**Referências:** `server/internal/config/config.go`, `server/internal/transport/tcp/handler.go`, `server/internal/transport/tcp/server.go`, `shared/config/defaults.go`.
 
 ### GAP-007 — Observabilidade de erros de conexão incompleta
 
@@ -894,12 +954,12 @@ Entretanto, os registros de idempotência não são persistidos.
 
 O servidor ainda não oferece:
 
-- persistência dos registros de idempotência;
-- recuperação desses registros após reinicialização;
-- garantia de deduplicação entre instâncias distintas;
-- consulta independente do resultado por `OperationID`;
-- garantia de deduplicação após a expiração do registro;
-- persistência atômica da mutação e do respectivo registro de idempotência.
+- Persistência dos registros de idempotência.
+- Recuperação desses registros após reinicialização.
+- Garantia de deduplicação entre instâncias distintas.
+- Consulta independente do resultado por `OperationID`.
+- Garantia de deduplicação após a expiração do registro.
+- Persistência atômica da mutação e do respectivo registro de idempotência.
 
 **Impacto:** a recuperação de resultados indeterminados depende de a aplicação repetir a operação com o mesmo `OperationID`, parâmetros semânticos idênticos e registro ainda disponível na mesma instância. Após reinicialização ou expiração, não existe garantia de que a operação não será executada novamente.
 
@@ -924,6 +984,8 @@ Não foi identificada configuração externa para ajustar esses parâmetros no e
 **Referências:** `server/internal/idempotency/executor.go`, `server/cmd/memorydb/main.go`.
 
 ## 8. Histórico de validação técnica
+
+### 8.1. Validação registrada em 22/11/2026
 
 Em 22/11/2026, foram executados testes, análise estática e testes com detector de condições de corrida nos cinco módulos do workspace.
 
@@ -964,21 +1026,47 @@ Os resultados também foram aprovados em todos os módulos.
 
 A validação também contemplou:
 
-- testes de concorrência, replay, conflito, capacidade e expiração do executor de idempotência;
-- testes de cálculo de fingerprint;
-- testes de validação de `OperationID` no handler;
-- testes de reprodução de resposta com atualização do `RequestID`;
-- testes de integração das operações mutáveis;
-- testes do driver para resultados indeterminados;
-- testes de cancelamento durante I/O;
-- testes de preservação da causa original do erro.
+- Testes de concorrência, replay, conflito, capacidade e expiração do executor de idempotência.
+- Testes de cálculo de fingerprint.
+- Testes de validação de `OperationID` no handler.
+- Testes de reprodução de resposta com atualização do `RequestID`.
+- Testes de integração das operações mutáveis.
+- Testes do driver para resultados indeterminados.
+- Testes de cancelamento durante I/O.
+- Testes de preservação da causa original do erro.
 
 A formatação foi verificada com `gofmt -l`, sem arquivos pendentes de formatação. `git diff --check` também foi executado sem apontar erros.
-
 
 **Observação:** os resultados registrados comprovam o estado dos módulos naquela execução, em 22/11/2026. Não representam garantia permanente para alterações futuras.
 
 Como o repositório utiliza um workspace com módulos independentes e não possui um módulo Go na raiz, os comandos de teste devem ser executados nos diretórios de cada módulo. A execução de `go test ./...` diretamente na raiz do workspace não é a forma de validação adotada.
+
+### 8.2. Validação das mudanças de ciclo de vida e timeouts — 25/11/2026
+
+Em 25/11/2026, após a implementação do controle de conexões, timeouts de leitura e escrita e fechamento forçado durante shutdown, foram executados testes direcionados no pacote TCP do servidor.
+
+Comandos executados:
+
+```bash
+gofmt -w server/internal/transport/tcp/server_test.go
+
+cd server
+
+go test -count=20 ./internal/transport/tcp \
+    -run '^TestServerClosesAcceptedConnectionDuringShutdown$'
+
+go test -count=20 ./internal/transport/tcp
+
+go test -race -count=1 ./internal/transport/tcp
+
+cd ..
+```
+
+**Resultado:** todos os comandos executados nessa validação foram aprovados.
+
+Essa validação confirma especificamente os testes repetidos do fechamento de conexões durante shutdown, os testes do pacote de transporte TCP do servidor e a execução desse pacote com detector de condições de corrida.
+
+**Limite da evidência:** essa execução direcionada não substitui uma nova execução integral de todos os módulos do workspace após as mudanças de 25/11/2026. A validação histórica de 22/11/2026 permanece registrada separadamente.
 
 ## 9. Critério geral de conclusão do escopo atual
 
@@ -992,10 +1080,11 @@ O escopo funcional inicial do MemoryDB é considerado implementado quando:
 6. O servidor atende múltiplos clientes e conexões persistentes.
 7. O driver Go permite consumir as operações sem implementar manualmente o protocolo.
 8. O driver Go oferece operações context-aware e sinaliza resultados indeterminados quando não é possível confirmar o desfecho de uma operação.
-9. O servidor oferece encerramento gracioso dentro das limitações documentadas.
-10. SET e DELETE exigem `OperationID` e possuem deduplicação server-side com fingerprint, replay de respostas, controle de concorrência, retenção e capacidade.
-11. O driver Go permite gerar e fornecer `OperationID`, sem realizar retries automáticos.
-12. A validação automatizada registrada para a versão documentada inclui testes, análise estática e testes com detector de condições de corrida nos módulos do workspace.
+9. O servidor oferece encerramento gracioso e forçado, com espera pelas conexões ativas e fechamento das conexões restantes quando o contexto expira.
+10. O servidor aplica timeouts de leitura e escrita e limita o número de conexões TCP simultâneas.
+11. SET e DELETE exigem `OperationID` e possuem deduplicação server-side com fingerprint, replay de respostas, controle de concorrência, retenção e capacidade.
+12. O driver Go permite gerar e fornecer `OperationID`, sem realizar retries automáticos.
+13. A validação automatizada registrada inclui testes, análise estática e testes com detector de condições de corrida nos módulos do workspace, respeitando as datas e os limites de cada execução documentada.
 
 Os GAPs documentados neste arquivo não impedem a conclusão do escopo inicial, pois representam evoluções planejadas e limitações conhecidas da implementação atual.
 

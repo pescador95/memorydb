@@ -65,7 +65,10 @@ As configurações específicas do servidor são carregadas por `server/internal
 | Variável | Padrão | Descrição |
 |---|---:|---|
 | `MEMORYDB_ADDR` | `:6380` | Endereço TCP no qual o servidor escuta |
-| `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Timeout do encerramento gracioso |
+| `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Prazo da tentativa de encerramento gracioso antes do fechamento forçado das conexões restantes |
+| `MEMORYDB_READ_TIMEOUT` | `30s` | Timeout de leitura de cada frame recebido pelo Handler |
+| `MEMORYDB_WRITE_TIMEOUT` | `10s` | Timeout de escrita de cada resposta enviada pelo Handler |
+| `MEMORYDB_MAX_CONNECTIONS` | `1024` | Limite de conexões TCP simultâneas admitidas pelo servidor |
 | `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência após a conclusão |
 | `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros de idempotência |
 
@@ -79,8 +82,10 @@ A configuração `MEMORYDB_ADDR` é utilizada pelo listener do servidor. Ela nã
 
 - Não há configuração de TLS.
 - Não há autenticação ou autorização.
-- O encerramento gracioso não força diretamente o fechamento das conexões ativas quando o timeout expira.
-- Não há configuração identificada para timeouts de leitura e escrita das conexões TCP.
+- O limite de conexões controla a quantidade de conexões TCP simultâneas admitidas, mas não representa um limite de requisições ou de operações simultâneas por conexão.
+- Conexões excedentes ao limite configurado são fechadas pelo servidor.
+- Os timeouts de leitura e escrita são aplicados pelo Handler às operações de I/O TCP.
+- O fechamento forçado durante o shutdown interrompe operações bloqueadas na conexão, mas não representa cancelamento genérico de qualquer operação executada pelo Handler.
 
 ## 4. Server TCP
 
@@ -92,12 +97,35 @@ A configuração `MEMORYDB_ADDR` é utilizada pelo listener do servidor. Ela nã
 
 ### 4.1 Construção
 
-`NewServer(listener, handler)` recebe:
+A construção padrão utiliza:
 
-- um `net.Listener`;
-- uma instância de `Handler`.
+`NewServer(listener, handler)`
 
-A função rejeita listener ou Handler nulos.
+A construção com configuração explícita utiliza:
+
+`NewServerWithConfig(listener, handler, config)`
+
+A configuração é representada por:
+
+```go
+type ServerConfig struct {
+    MaxConnections int
+}
+```
+
+Os construtores recebem:
+
+- `listener`: instância de `net.Listener` utilizada para aceitar conexões TCP;
+- `handler`: instância de `Handler` responsável pelo processamento das conexões;
+- `config`: configuração explícita do servidor, utilizada por `NewServerWithConfig`.
+
+`NewServer` utiliza o valor padrão de `DefaultServerMaxConnections`, definido em `shared/config`.
+
+`NewServerWithConfig` permite configurar explicitamente `MaxConnections`, que representa o limite de conexões TCP simultâneas admitidas.
+
+Os construtores verificam se o listener e o Handler recebidos são `nil`. Essa verificação não detecta uma implementação de `net.Listener` que contenha um ponteiro tipado nulo.
+
+`NewServerWithConfig` também rejeita valores de `MaxConnections` menores que 1.
 
 ### 4.2 Método `Serve`
 
@@ -106,9 +134,13 @@ A função rejeita listener ou Handler nulos.
 - impede que o mesmo servidor seja iniciado simultaneamente mais de uma vez;
 - não inicia a aceitação de conexões quando o servidor já está em encerramento;
 - aceita conexões pelo listener;
+- controla a quantidade de conexões simultâneas admitidas;
+- fecha conexões excedentes ao limite configurado;
+- registra as conexões aceitas na estrutura de conexões ativas;
 - cria uma goroutine para cada conexão aceita;
-- contabiliza as conexões ativas com `sync.WaitGroup`;
-- delega o processamento ao método `Handler.Handle`.
+- contabiliza as goroutines com `sync.WaitGroup`;
+- delega o processamento ao método `Handler.Handle`;
+- impede a admissão de novas conexões durante o encerramento.
 
 Se a aceitação falhar durante o encerramento, o método retorna normalmente. Se falhar fora do encerramento, retorna um erro contextualizado.
 
@@ -128,21 +160,29 @@ Consequentemente, falhas individuais de processamento não são propagadas pelo 
 `Shutdown(ctx)`:
 
 1. Marca o servidor como encerrando.
-2. Fecha o listener.
-3. Aguarda as conexões ativas terminarem.
-4. Retorna quando todas terminam ou quando o contexto é cancelado.
+2. Fecha o listener TCP, impedindo novas admissões.
+3. Aguarda as conexões ativas terminarem normalmente.
+4. Se o contexto expirar, fecha as conexões ainda ativas.
+5. Aguarda a conclusão das goroutines responsáveis pelas conexões.
+6. Retorna o erro do contexto, preservando eventual erro no fechamento do listener.
 
 O método trata `net.ErrClosed` como fechamento já realizado.
 
-**Limitação importante:** o shutdown não fecha diretamente as conexões ativas. Se uma conexão permanecer bloqueada, o método poderá retornar `ctx.Err()` ao expirar o prazo, sem interromper automaticamente aquela conexão.
+O encerramento possui duas etapas: tentativa graciosa e fechamento forçado das conexões restantes após a expiração do contexto.
 
-A implementação atual também não possui uma segunda etapa de encerramento forçado das conexões.
+O fechamento forçado interrompe operações de rede bloqueadas pela conexão TCP. Não representa cancelamento genérico de qualquer operação executada pelo Handler.
 
 ### 4.4 Concorrência
 
-O estado de execução e encerramento é protegido por mutex. O controle de conexões ativas utiliza `sync.WaitGroup`.
+O servidor utiliza:
 
-A aceitação de novas conexões e o início do encerramento são coordenados pelo mutex do servidor.
+- mutex para proteger o estado de execução e encerramento;
+- `sync.WaitGroup` para acompanhar as goroutines responsáveis pelas conexões;
+- mapa protegido por mutex para manter o conjunto de conexões ativas.
+
+A aceitação de novas conexões e o início do encerramento são coordenados para impedir novas admissões após o início do shutdown.
+
+O limite configurado em `MaxConnections` controla a quantidade de conexões TCP simultâneas admitidas. Conexões excedentes são fechadas, sem processamento pelo Handler.
 
 ## 5. Handler TCP
 
@@ -154,15 +194,42 @@ A aceitação de novas conexões e o início do encerramento são coordenados pe
 
 ### 5.1 Construção
 
-`NewHandler(commandEngine, messageCodec, executor)` recebe:
+A construção padrão utiliza:
 
-- `*engine.Engine`;
-- `codec.Codec`;
-- `*idempotency.Executor`.
+`NewHandler(commandEngine, messageCodec, executor)`
 
-A função rejeita dependências nulas.
+A construção com configuração explícita utiliza:
 
-O Executor é compartilhado entre os Handlers das conexões do mesmo servidor. Isso permite que operações com o mesmo `OperationID`, mesmo quando recebidas por conexões diferentes, sejam coordenadas pela mesma instância do mecanismo de idempotência.
+`NewHandlerWithConfig(commandEngine, messageCodec, executor, config)`
+
+A configuração é representada por:
+
+```go
+type HandlerConfig struct {
+    ReadTimeout  time.Duration
+    WriteTimeout time.Duration
+}
+```
+
+Os construtores recebem:
+
+- `commandEngine`: instância de `*engine.Engine`;
+- `messageCodec`: implementação da interface `codec.Codec`;
+- `executor`: instância de `*idempotency.Executor`;
+- `config`: configuração explícita dos timeouts, utilizada por `NewHandlerWithConfig`.
+
+`NewHandler` utiliza os valores padrão definidos em `shared/config`:
+
+- leitura: `DefaultServerReadTimeout` (30 segundos);
+- escrita: `DefaultServerWriteTimeout` (10 segundos).
+
+`NewHandlerWithConfig` permite configurar explicitamente os dois timeouts.
+
+Os construtores verificam se o Engine, o Codec e o Executor recebidos são `nil`. Como `messageCodec` é uma interface, a verificação não detecta uma interface que contenha um ponteiro tipado nulo.
+
+Os timeouts de leitura e escrita também precisam ser positivos.
+
+O Handler criado é compartilhado pelas conexões admitidas pelo mesmo Server. Consequentemente, as solicitações dessas conexões utilizam a mesma instância do Executor de idempotência.
 
 ### 5.2 Método `Handle`
 
@@ -188,6 +255,15 @@ Fluxo:
 10. Repete o fluxo.
 
 O fechamento da conexão é registrado com `defer`.
+
+O Handler aplica os seguintes controles de I/O:
+
+- antes de cada leitura de frame, configura o read deadline da conexão;
+- antes de cada escrita de resposta, configura o write deadline da conexão.
+
+Os prazos são configurados por `HandlerConfig.ReadTimeout` e `HandlerConfig.WriteTimeout`, respectivamente.
+
+Os deadlines limitam operações individuais de leitura e escrita. Não representam um timeout global para toda a duração da conexão ou para a execução completa de um comando.
 
 ### 5.3 Execução de operações mutáveis
 
@@ -1076,8 +1152,8 @@ Os testes estão distribuídos junto aos módulos e pacotes.
 | Storage | `server/internal/storage/storage_test.go` | Operações, cópia de bytes e concorrência |
 | Executor de idempotência | `server/internal/idempotency/executor_test.go` | Concorrência, replay, conflitos, capacidade, expiração e resultados indeterminados |
 | Fingerprint | `server/internal/idempotency/fingerprint_test.go` | Determinismo, diferenciação de operações e parâmetros semânticos |
-| Handler | `server/internal/transport/tcp/handler_test.go` | Processamento de solicitações, integração com idempotência, replay e erros |
-| Server TCP | `server/internal/transport/tcp/server_test.go` | Aceitação de clientes, concorrência e shutdown |
+| Handler | `server/internal/transport/tcp/handler_test.go` | Processamento de solicitações, integração com idempotência, replay, erros e timeouts de leitura e escrita |
+| Server TCP | `server/internal/transport/tcp/server_test.go` | Aceitação de clientes, limite de conexões, concorrência, encerramento gracioso e fechamento forçado |
 | Integração | `server/internal/integration/server_test.go` | Comunicação entre driver e servidor |
 
 ### 16.1 Testes do Executor de idempotência
@@ -1167,7 +1243,7 @@ Para reproduzir as verificações, deve-se utilizar o pipeline centralizado desc
 | Ponto | Situação observada | Consequência |
 |---|---|---|
 | Erros do Handler | Retorno de `Handler.Handle` descartado pelo servidor | Falhas individuais não são propagadas nem registradas nesse ponto |
-| Shutdown | Conexões ativas não são fechadas diretamente | O prazo pode expirar sem encerrar todas as conexões |
+| Shutdown | Fechamento forçado das conexões restantes quando o contexto expira | O método ainda aguarda a conclusão das goroutines dos handlers após fechar as conexões |
 | Storage | Engine depende de implementação concreta | Substituição do backend exige alteração do Engine |
 | TTL | Campo existe no schema, mas TTL positivo é rejeitado | Não há expiração de entradas |
 | Idempotência | Registros mantidos somente em memória | A garantia não sobrevive à reinicialização |
@@ -1175,8 +1251,9 @@ Para reproduzir as verificações, deve-se utilizar o pipeline centralizado desc
 | Retenção | Padrão de 24 horas após a conclusão, configurável | Após a expiração, o identificador pode deixar de ser reconhecido |
 | Multiplexação | Driver serializa operações por conexão | Uma operação por vez em cada conexão |
 | Observabilidade | Não há registro estruturado de falhas de conexão no servidor | Diagnóstico operacional limitado |
-| Timeouts de I/O | Não há configuração identificada para timeouts de leitura e escrita no servidor | Conexões podem permanecer bloqueadas |
+| Timeouts de I/O | Read e write deadlines configuráveis no Handler | Operações de leitura e escrita possuem prazos individuais; não há timeout global de execução do comando |
 | Distribuição | Executor e Storage são locais à instância | Não há coordenação entre processos ou instâncias |
+| Limite de conexões | Limite configurável de conexões TCP simultâneas | Conexões excedentes são fechadas; não há controle de admissão baseado em carga ou consumo de recursos |
 
 ## 18. Evoluções que envolvem múltiplos componentes
 
@@ -1184,9 +1261,7 @@ Para reproduzir as verificações, deve-se utilizar o pipeline centralizado desc
 |---|---|---|
 | Persistência | Storage e recuperação | Preservação de dados após reinicialização |
 | TTL | Schema, modelo interno, Engine e Storage | Expiração de entradas |
-| Shutdown forçado | Server e Connection | Fechamento das conexões após o prazo |
 | Observabilidade | Server, Handler e driver | Registro e diagnóstico de falhas |
-| Timeouts de I/O | Server, Handler e configuração | Controle de operações de rede bloqueadas |
 | Multiplexação | Protocolo, Handler e driver | Operações simultâneas na mesma conexão |
 | Segurança | Server, transporte e autenticação | Proteção da comunicação e do acesso |
 | Escalabilidade | Storage, protocolo e coordenação | Suporte a múltiplas instâncias e distribuição |

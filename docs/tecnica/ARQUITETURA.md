@@ -542,13 +542,20 @@ O Executor é criado uma única vez durante a composição do servidor e compart
 
 ### 8.1. Semântica do shutdown
 
-`Server.Shutdown(ctx)` marca o servidor como encerrando, fecha o listener e aguarda a conclusão das conexões ativas.
+`Server.Shutdown(ctx)` inicia o encerramento do servidor, impede a admissão de novas conexões, fecha o listener TCP e aguarda a conclusão das conexões ativas.
 
-O método não fecha diretamente as conexões ativas.
+Durante o encerramento gracioso, os handlers das conexões existentes podem concluir suas operações normalmente. O servidor aguarda que todas as goroutines responsáveis pelas conexões terminem.
 
-Se uma conexão não terminar, o método pode retornar o erro do contexto quando o prazo expirar, enquanto a conexão permanece aberta. Não há atualmente uma etapa de encerramento forçado das conexões ativas.
+Se o contexto expirar antes da conclusão do encerramento gracioso, o servidor inicia o encerramento forçado:
 
-O encerramento gracioso, portanto, depende de as conexões terminarem por conta própria dentro do prazo configurado.
+1. obtém uma cópia das conexões ainda ativas;
+2. fecha essas conexões para interromper operações de leitura e escrita bloqueadas;
+3. aguarda a conclusão das goroutines responsáveis pelo atendimento das conexões;
+4. retorna o erro do contexto, preservando também eventual erro no fechamento do listener.
+
+O encerramento forçado não representa cancelamento genérico de qualquer operação executada pelo Handler. Sua capacidade de interrupção depende de as operações bloqueadas responderem ao fechamento da conexão.
+
+O timeout de shutdown é configurado por `MEMORYDB_SHUTDOWN_TIMEOUT`, cujo valor padrão é `10s`.
 
 ## 9. Limites arquiteturais atuais
 
@@ -565,9 +572,10 @@ O encerramento gracioso, portanto, depende de as conexões terminarem por conta 
 | Retry automático | Não implementado |
 | Multiplexação | Não implementada |
 | Timeout de estabelecimento de conexão do cliente | Configurável por `DialConfig` |
-| Timeouts de leitura e escrita TCP configuráveis no servidor | Não identificados na implementação atual |
+| Limite de conexões TCP simultâneas | Implementado e configurável; padrão de 1024 conexões |
+| Timeouts de leitura e escrita TCP no servidor | Implementados e configuráveis; padrões de 30s e 10s, respectivamente |
+| Shutdown gracioso e forçado | Implementado; aguarda conexões ativas e força o fechamento quando o prazo expira |
 | Observabilidade estruturada por conexão | Não implementada no fluxo atual |
-| Shutdown forçado de conexões | Não implementado |
 
 ### 9.1 Idempotência e deduplicação
 
@@ -656,9 +664,7 @@ As evoluções abaixo exigem decisões de contrato e mudanças coordenadas entre
 |---|---|---|
 | Persistência | Storage e recuperação | Preservar dados após reinicialização |
 | TTL | Schema, modelo interno, Engine e Storage | Expirar entradas |
-| Shutdown forçado | Server e Connection | Encerrar conexões após o prazo |
 | Observabilidade | Server, Handler e driver | Diagnosticar falhas e acompanhar operação |
-| Timeouts de I/O | Server, Handler e configuração | Limitar operações de rede bloqueadas |
 | Multiplexação | Protocolo, Handler e driver | Permitir várias operações em andamento na mesma conexão |
 | Segurança | Server, transporte e autenticação | Proteger comunicação e acesso |
 | Escalabilidade | Storage, protocolo e coordenação | Suportar múltiplas instâncias e distribuição |

@@ -14,7 +14,7 @@ Para executar os procedimentos de teste, é necessário ter:
 
 - Go instalado e disponível no `PATH`;
 - Bash;
-- utilitários de linha de comando utilizados pelos scripts: `find`, `xargs`, `awk`, `sort`, `tail`, `mktemp`, `rm`, `mkdir` e `cat`;
+- utilitários de linha de comando utilizados pelos scripts: `find`, `xargs`, `dirname`, `awk`, `sort`, `tail`, `mktemp`, `rm`, `mkdir` e `cat`;
 - `gofmt` e `go tool cover`, disponibilizados pela instalação do Go.
 
 Em ambientes Windows, recomenda-se utilizar um ambiente Bash compatível, como Git Bash.
@@ -28,6 +28,8 @@ A partir da raiz do repositório, execute:
 O script identifica automaticamente a raiz do repositório com base na localização dos próprios arquivos, não dependendo do diretório de trabalho a partir do qual foi iniciado.
 
 As etapas que percorrem os módulos verificam a existência do respectivo `go.mod` antes de executar os comandos Go.
+
+A etapa `format` percorre os arquivos Go do repositório, enquanto as etapas que executam comandos Go nos módulos utilizam a lista centralizada em `scripts/test/common.sh`.
 
 ## 3. Organização dos módulos
 
@@ -49,6 +51,8 @@ protocol/proto/memorydb/v1/memorydb.proto
 ```
 
 Esse diretório contém a definição do protocolo, mas não constitui um módulo Go independente. A implementação gerada para Go é validada pelo módulo `protocol/generated/go/`.
+
+A lista dos módulos é mantida em `scripts/test/common.sh`, por meio da variável `MODULES`.
 
 ## 4. Execução dos testes
 
@@ -256,6 +260,10 @@ O resumo apresentado no terminal também classifica os arquivos conforme a cober
 - **PARTIAL:** existe cobertura, mas nem todas as instruções foram executadas;
 - **ZERO:** nenhuma instrução contabilizada possui cobertura.
 
+A classificação é calculada a partir dos contadores dos perfis de cobertura. Um bloco é considerado coberto quando seu contador de execução é maior que zero.
+
+A etapa também apresenta a cobertura total de cada módulo e o resumo por arquivo.
+
 ### 5.7. Análise de código não coberto
 
 Comando:
@@ -278,11 +286,15 @@ A análise utiliza `awk` para interpretar os perfis e `sort` para organizar os r
 
 Os resultados são apresentados no terminal, sem gerar um relatório adicional persistente.
 
+A análise considera como não cobertos os blocos cujo contador de execução é zero. Para arquivos parcialmente cobertos, são apresentados os intervalos de linhas correspondentes aos blocos não executados.
+
 **Dependência:** a etapa exige que os seis perfis de cobertura estejam presentes em `coverage/`. Caso o diretório ou algum perfil não exista, a execução é interrompida e o script orienta a executar:
 
 ```bash
 ./scripts/test.sh coverage
 ```
+
+A etapa `uncovered` não executa novamente os testes nem atualiza os perfis. Ela utiliza os arquivos gerados pela execução anterior de `coverage`.
 
 ## 6. Pipeline completo
 
@@ -306,7 +318,9 @@ O pipeline executa as etapas na seguinte ordem:
 
 Cada etapa é executada por meio de seu respectivo script em `scripts/test/`.
 
-Os scripts utilizam `set -euo pipefail`, interrompendo a execução diante de falhas. Consequentemente, se uma etapa falhar, as etapas seguintes não serão executadas.
+O script principal e os scripts individuais utilizam `set -euo pipefail`, interrompendo a execução diante de falhas.
+
+Consequentemente, se uma etapa falhar, as etapas seguintes não serão executadas.
 
 Ao concluir todas as etapas, o script apresenta a mensagem:
 
@@ -335,67 +349,14 @@ coverage/
 └── index.html
 ```
 
+Os arquivos `.out` são perfis de cobertura produzidos pelo `go test`.
+
+Os arquivos `.html` são relatórios individuais gerados pelo `go tool cover`.
+
+O arquivo `index.html` reúne os links para os relatórios individuais.
+
 O diretório `coverage/` é ignorado pelo Git por meio da regra:
 
 ```gitignore
 /coverage/
 ```
-
-Dessa forma, os perfis e relatórios gerados localmente não são incluídos no controle de versão.
-
-Os scripts responsáveis pela execução e análise dos testes permanecem versionados no repositório.
-
-## 8. Estrutura dos scripts
-
-Os procedimentos estão organizados da seguinte maneira:
-
-```text
-scripts/
-├── test.sh
-└── test/
-    ├── common.sh
-    ├── format.sh
-    ├── vet.sh
-    ├── unit.sh
-    ├── race.sh
-    ├── build.sh
-    ├── coverage.sh
-    └── uncovered.sh
-```
-
-Responsabilidades:
-
-| Arquivo | Responsabilidade |
-|---|---|
-| `test.sh` | Recebe os argumentos e orquestra as etapas. |
-| `common.sh` | Centraliza a descoberta da raiz, a lista de módulos e funções compartilhadas. |
-| `format.sh` | Verifica a formatação dos arquivos Go. |
-| `vet.sh` | Executa a análise estática. |
-| `unit.sh` | Executa os testes unitários. |
-| `race.sh` | Executa os testes com detector de condições de corrida. |
-| `build.sh` | Valida a compilação dos módulos. |
-| `coverage.sh` | Executa os testes com instrumentação de cobertura e gera os relatórios. |
-| `uncovered.sh` | Analisa os perfis e identifica arquivos e blocos sem cobertura completa. |
-
-A separação permite executar cada procedimento individualmente ou utilizar o script principal para executar o pipeline completo.
-
-## 9. Manutenção
-
-Ao adicionar um novo módulo Go ao workspace, atualize a lista `MODULES` em:
-
-```text
-scripts/test/common.sh
-```
-
-A inclusão nessa lista permite que as etapas que utilizam `run_in_modules` e os procedimentos de cobertura considerem automaticamente o novo módulo.
-
-Também é necessário manter este documento atualizado quando houver alterações:
-
-- na organização dos módulos;
-- nos comandos ou parâmetros de execução;
-- na sequência do pipeline;
-- nos artefatos gerados;
-- nos pré-requisitos dos scripts;
-- nos critérios utilizados para análise de cobertura.
-
-A documentação deve refletir o comportamento efetivo dos scripts versionados no repositório.
