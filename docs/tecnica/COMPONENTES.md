@@ -20,9 +20,10 @@ As descrições refletem a implementação conhecida do projeto. Funcionalidades
 | Codec | `server/internal/codec/codec.go` | Definir as operações de serialização e desserialização |
 | Codec Protobuf | `server/internal/codec/protobuf/codec.go` | Converter mensagens internas e mensagens Protobuf |
 | Modelo interno | `server/internal/protocol/message.go` | Representar comandos, solicitações, resultados e respostas |
-| Engine | `server/internal/engine` | Validar e executar comandos |
+| Engine | `server/internal/engine` | Validar e executar comandos utilizando a interface de Storage |
+| Interface de Storage | `server/internal/engine/storage.go` | Definir o contrato de armazenamento consumido pelo Engine |
 | Executor de idempotência | `server/internal/idempotency` | Controlar identificadores, fingerprints, concorrência, replay, capacidade e retenção |
-| Storage | `server/internal/storage` | Armazenar pares chave-valor em memória |
+| Storage | `storage/go` | Implementar o armazenamento de pares chave-valor em memória |
 | Transporte TCP reutilizável | `transport/tcp/go` | Implementar framing e abstração de conexão |
 | Driver Go | `drivers/go` | Expor uma API cliente para aplicações Go |
 | Tipos Protobuf gerados | `protocol/generated/go` | Disponibilizar os tipos Go gerados a partir do schema |
@@ -30,7 +31,19 @@ As descrições refletem a implementação conhecida do projeto. Funcionalidades
 | Cliente de demonstração | `api/client` | Demonstrar o consumo do driver Go |
 | Configuração do cliente de demonstração | `api/client/internal/config` | Carregar e validar as configurações utilizadas pelo executável cliente |
 
-O projeto possui múltiplos módulos Go coordenados pelo workspace da raiz. O diretório `protocol/proto` contém o schema de origem e não constitui um módulo Go independente.
+O workspace da raiz coordena sete módulos Go independentes:
+
+- `api`;
+- `drivers/go`;
+- `protocol/generated/go`;
+- `server`;
+- `shared`;
+- `storage/go`;
+- `transport/tcp/go`.
+
+O diretório `protocol/proto` contém o schema de origem e não constitui um módulo Go independente.
+
+O Storage possui seu próprio `go.mod` e pode ser reutilizado como biblioteca Go. Isso não significa que ele seja executado como um processo ou serviço separado: na composição atual, Engine e Storage são executados dentro do mesmo processo do servidor.
 
 ## 3. Executável do servidor
 
@@ -43,13 +56,14 @@ O ponto de entrada chama `run()`. A função `run`:
 1. Carrega e valida as configurações operacionais do servidor.
 2. Cria um listener TCP usando o endereço configurado.
 3. Instancia o codec Protobuf.
-4. Instancia o Engine.
-5. Cria uma instância compartilhada do Executor de idempotência com os parâmetros configurados.
-6. Cria o Handler, injetando Engine, Codec e Executor.
-7. Cria o servidor TCP.
-8. Inicia `Server.Serve()` em uma goroutine.
-9. Aguarda o encerramento do servidor ou um sinal do sistema operacional.
-10. Solicita o encerramento por meio de `Shutdown`, utilizando o timeout configurado.
+4. Instancia o Storage.
+5. Instancia o Engine, injetando a implementação de Storage.
+6. Cria uma instância compartilhada do Executor de idempotência com os parâmetros configurados.
+7. Cria o Handler, injetando Engine, Codec e Executor.
+8. Cria o servidor TCP.
+9. Inicia `Server.Serve()` em uma goroutine.
+10. Aguarda o encerramento do servidor ou um sinal do sistema operacional.
+11. Solicita o encerramento por meio de `Shutdown`, utilizando o timeout configurado.
 
 Sinais tratados:
 
@@ -86,6 +100,7 @@ A configuração `MEMORYDB_ADDR` é utilizada pelo listener do servidor. Ela nã
 - Conexões excedentes ao limite configurado são fechadas pelo servidor.
 - Os timeouts de leitura e escrita são aplicados pelo Handler às operações de I/O TCP.
 - O fechamento forçado durante o shutdown interrompe operações bloqueadas na conexão, mas não representa cancelamento genérico de qualquer operação executada pelo Handler.
+- Não existe um limite global de memória do processo configurado por esses controles.
 
 ## 4. Server TCP
 
@@ -483,13 +498,21 @@ O `OperationID` não é um campo do envelope `Request`. Ele pertence aos comando
 
 **Tipo principal:** `Engine`
 
-**Responsabilidade:** validar e executar comandos utilizando o Storage.
+**Responsabilidade:** validar e executar comandos utilizando a abstração de Storage.
 
 ### 9.1 Construção
 
-`engine.New()` cria uma instância de `Engine` e instancia internamente um `storage.Storage`.
+O Engine recebe uma implementação de Storage por injeção de dependência.
 
-O Engine não recebe uma interface de Storage nem uma instância externa pelo construtor atual.
+O contrato consumido pelo Engine está definido em:
+
+`server/internal/engine/storage.go`
+
+A interface é de propriedade do pacote consumidor, ou seja, do Engine. Ela descreve somente as operações de armazenamento necessárias à execução dos comandos.
+
+A implementação concreta utilizada atualmente é disponibilizada pelo módulo independente `github.com/pescador95/memorydb/storage/go`.
+
+O ponto de entrada do servidor instancia essa implementação e a fornece ao Engine durante a composição das dependências.
 
 ### 9.2 Método `Execute`
 
@@ -538,15 +561,33 @@ Para `PING` e `GET`, o Handler chama o Engine diretamente.
 
 Essa separação mantém o Engine responsável pela validação e execução dos comandos, sem incorporar o ciclo de vida dos registros de idempotência.
 
-### 9.5 Limitações
+### 9.5 Relação com Storage
 
-- O Engine depende concretamente de `*storage.Storage`.
-- Não há interface de repositório ou Storage.
+O Engine depende de uma interface definida no próprio pacote consumidor, em vez de depender diretamente do tipo concreto implementado pelo módulo Storage.
+
+Essa separação permite substituir a implementação de armazenamento sem alterar a lógica de execução dos comandos, desde que a nova implementação satisfaça o contrato definido pelo Engine.
+
+O módulo Storage não depende do Engine. A dependência ocorre no sentido do consumidor para a abstração de armazenamento.
+
+Na composição atual:
+
+- o módulo `storage/go` fornece a implementação concreta;
+- `server/internal/engine/storage.go` define a interface consumida;
+- `server/internal/engine/engine.go` utiliza essa interface;
+- `server/cmd/memorydb/main.go` instancia e injeta a implementação.
+
+Embora Storage seja um módulo Go independente, ele é utilizado como biblioteca dentro do processo do servidor. As chamadas entre Engine e Storage são chamadas locais de métodos Go, compartilhando o mesmo espaço de endereçamento e heap.
+
+Não existe RPC, IPC ou comunicação de rede entre esses dois componentes.
+
+### 9.6 Limitações
+
 - Não há transações.
 - Não há TTL funcional.
 - O Engine não valida `OperationID`.
 - O Engine não implementa deduplicação.
 - A execução de comandos mutáveis depende da coordenação externa realizada pelo Handler e pelo Executor.
+- A implementação atual de Storage é em memória e não oferece persistência.
 
 ## 10. Executor de idempotência
 
@@ -719,11 +760,17 @@ A aplicação consumidora é responsável por fornecer e reutilizar o mesmo `Ope
 
 ## 11. Storage
 
-**Localização:** `server/internal/storage`
+**Módulo:** `storage/go`
+
+**Módulo Go:** `github.com/pescador95/memorydb/storage/go`
 
 **Tipos principais:** `Storage` e `Entry`
 
 **Responsabilidade:** manter pares chave-valor em memória.
+
+O Storage é um módulo Go independente, com seu próprio `go.mod`, mas é utilizado atualmente como biblioteca incorporada ao processo do servidor.
+
+A implementação não é um serviço separado. O Engine acessa o Storage por chamadas locais de métodos Go, sem RPC, IPC ou comunicação de rede entre os componentes.
 
 ### 11.1 Estrutura
 
@@ -768,7 +815,17 @@ Essa estratégia evita que alterações posteriores nos slices do chamador modif
 
 O controle permite operações concorrentes sem acesso desprotegido ao mapa.
 
-### 11.5 Limitações
+### 11.5 Relação com o Engine
+
+A interface consumida pelo Engine está localizada em `server/internal/engine/storage.go`.
+
+A implementação concreta está no módulo `storage/go`.
+
+Essa organização mantém a abstração no lado do consumidor e permite que a implementação seja reutilizada ou substituída sem acoplar a lógica do Engine ao tipo concreto do Storage.
+
+A extração para um módulo independente representa uma separação de módulos e responsabilidades, não uma separação de processos.
+
+### 11.6 Limitações
 
 - Dados exclusivamente em memória.
 - Sem persistência.
@@ -1136,7 +1193,7 @@ O endereço do cliente é independente do endereço de escuta do servidor. Porta
 
 ## 16. Testes por componente
 
-Os testes automatizados são executados por meio dos scripts centralizados em `scripts/test/`. O repositório possui múltiplos módulos Go, e o pipeline percorre os módulos configurados no workspace.
+Os testes automatizados são executados por meio dos scripts centralizados em `scripts/test/`. O repositório possui sete módulos Go, e o pipeline percorre os módulos configurados no workspace.
 
 Os procedimentos de execução, os comandos disponíveis, os critérios de validação e os relatórios de cobertura estão descritos no [Guia de testes](./TESTES.md).
 
@@ -1149,7 +1206,7 @@ Os testes estão distribuídos junto aos módulos e pacotes.
 | Driver Go | `drivers/go/client_test.go` | Operações, concorrência, contextos, erros, desconexões e resultados indeterminados |
 | Codec Protobuf | `server/internal/codec/protobuf/codec_test.go` | Round-trip, conversões e mensagens inválidas |
 | Engine | `server/internal/engine/engine_test.go` | Comandos, validações e erros |
-| Storage | `server/internal/storage/storage_test.go` | Operações, cópia de bytes e concorrência |
+| Storage | `storage/go/storage_test.go` | Operações, cópia de bytes e concorrência |
 | Executor de idempotência | `server/internal/idempotency/executor_test.go` | Concorrência, replay, conflitos, capacidade, expiração e resultados indeterminados |
 | Fingerprint | `server/internal/idempotency/fingerprint_test.go` | Determinismo, diferenciação de operações e parâmetros semânticos |
 | Handler | `server/internal/transport/tcp/handler_test.go` | Processamento de solicitações, integração com idempotência, replay, erros e timeouts de leitura e escrita |
@@ -1201,9 +1258,9 @@ A cobertura do driver inclui cenários específicos de:
 
 ### 16.4 Validação dos módulos
 
-Em 22/11/2026, foi registrada validação dos módulos do workspace com testes, detector de condições de corrida e análise estática.
+Em 22/11/2026, foi registrada uma validação anterior dos módulos do workspace com testes, detector de condições de corrida e análise estática.
 
-Comandos executados:
+A validação registrada utilizou os seguintes comandos:
 
 ```bash
 for module in server transport/tcp/go protocol/generated/go drivers/go api; do
@@ -1226,17 +1283,17 @@ for module in server transport/tcp/go protocol/generated/go drivers/go api; do
 done
 ```
 
-Segundo o registro dessa validação, os testes e as análises estáticas dos módulos foram concluídos sem erros.
+Esse registro é histórico e corresponde à composição do workspace existente naquela data. Ele não representa uma validação dos sete módulos na composição atual, pois o módulo `storage/go` foi extraído posteriormente.
 
-Também foram verificados:
+Também foram verificados naquela validação:
 
 - formatação com `gofmt`;
 - consistência do diff com `git diff --check`;
 - sincronização entre o branch local e o remoto.
 
-Esses resultados correspondem à validação registrada em 22/11/2026 e não substituem a execução dos testes após alterações futuras.
+Esses resultados não substituem a execução dos testes após alterações futuras.
 
-Para reproduzir as verificações, deve-se utilizar o pipeline centralizado descrito no [Guia de testes](./TESTES.md), em vez de depender dos comandos manuais registrados nesta seção.
+Para reproduzir as verificações na composição atual, deve-se utilizar o pipeline centralizado descrito no [Guia de testes](./TESTES.md), que contempla os módulos configurados no workspace.
 
 ## 17. Limitações transversais
 
@@ -1244,7 +1301,7 @@ Para reproduzir as verificações, deve-se utilizar o pipeline centralizado desc
 |---|---|---|
 | Erros do Handler | Retorno de `Handler.Handle` descartado pelo servidor | Falhas individuais não são propagadas nem registradas nesse ponto |
 | Shutdown | Fechamento forçado das conexões restantes quando o contexto expira | O método ainda aguarda a conclusão das goroutines dos handlers após fechar as conexões |
-| Storage | Engine depende de implementação concreta | Substituição do backend exige alteração do Engine |
+| Storage | Implementação atual em memória, consumida pelo Engine por interface | A implementação pode ser substituída, mas os dados não são persistidos |
 | TTL | Campo existe no schema, mas TTL positivo é rejeitado | Não há expiração de entradas |
 | Idempotência | Registros mantidos somente em memória | A garantia não sobrevive à reinicialização |
 | Capacidade | Limite padrão de 100.000 registros, configurável | Novas operações podem ser rejeitadas quando a capacidade está esgotada |
@@ -1254,6 +1311,7 @@ Para reproduzir as verificações, deve-se utilizar o pipeline centralizado desc
 | Timeouts de I/O | Read e write deadlines configuráveis no Handler | Operações de leitura e escrita possuem prazos individuais; não há timeout global de execução do comando |
 | Distribuição | Executor e Storage são locais à instância | Não há coordenação entre processos ou instâncias |
 | Limite de conexões | Limite configurável de conexões TCP simultâneas | Conexões excedentes são fechadas; não há controle de admissão baseado em carga ou consumo de recursos |
+| Memória do processo | Não há limite global de memória configurável implementado | O limite de conexões e a capacidade do Executor não constituem um limite total de memória |
 
 ## 18. Evoluções que envolvem múltiplos componentes
 
@@ -1285,5 +1343,7 @@ Para reproduzir as verificações, deve-se utilizar o pipeline centralizado desc
 - Manter exemplos alinhados à API pública atual.
 - Distinguir funcionalidades implementadas de evoluções planejadas.
 - Manter as configurações documentadas alinhadas aos nomes das variáveis, valores padrão e regras de validação efetivamente implementados.
+- Manter separados os conceitos de módulo Go, biblioteca, componente em memória e processo executável.
+- Ao extrair um pacote para outro módulo, atualizar caminhos de implementação, testes, workspace e dependências documentadas.
 
 A documentação complementa os comentários do código e não deve substituí-los quando o contrato de uma API pública exigir explicação no próprio código.

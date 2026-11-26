@@ -18,6 +18,8 @@ O projeto tem como objetivo principal aprender e implementar os fundamentos de u
 - Tratar falhas de comunicação e resultados indeterminados como situações explícitas do contrato dos clientes.
 - Não implementar retries automáticos sem definir previamente garantias de idempotência.
 - Diferenciar confirmação de execução em memória de confirmação de persistência durável.
+- Manter os módulos Go independentes, com responsabilidades e contratos explícitos.
+- Permitir que a implementação concreta do Storage seja reutilizada por outros executáveis sem transformá-la em um serviço separado.
 
 ## 3. Escopo do MVP
 
@@ -55,6 +57,8 @@ Os dados são perdidos quando o processo do servidor é encerrado.
 
 Os registros de idempotência também são mantidos exclusivamente em memória e não sobrevivem à reinicialização ou à perda do processo.
 
+A implementação do Storage é um módulo Go independente, mas permanece incorporada ao processo do servidor. Engine e Storage compartilham o mesmo espaço de endereçamento e heap, comunicando-se por chamadas locais, sem RPC, IPC ou tráfego de rede entre esses componentes.
+
 ## 4. Arquitetura implementada
 
 O fluxo atual de comunicação é:
@@ -86,9 +90,14 @@ idempotência              (PING / GET)
    v
 Engine
    |
+   | interface Storage
    v
-Storage
+Storage (módulo independente)
 ```
+
+O Storage é uma biblioteca incorporada ao executável do servidor. A separação em módulo Go permite reutilização e evolução independente, mas não cria uma fronteira de processo ou serviço.
+
+A implementação concreta do Storage fica em `storage/go`. A Engine declara a interface consumidora em `server/internal/engine/storage.go` e recebe a implementação por injeção de dependência.
 
 O driver Java permanece como uma implementação futura, devendo consumir o mesmo contrato de comunicação.
 
@@ -101,8 +110,8 @@ O driver Java permanece como uma implementação futura, devendo consumir o mesm
 | Framing | Delimitar mensagens transmitidas pelo TCP. |
 | Codec | Serializar e desserializar mensagens. |
 | Protocol | Representar requisições e respostas no modelo interno. |
-| Engine | Validar e executar comandos. |
-| Storage | Armazenar, consultar e remover dados. |
+| Engine | Validar e executar comandos, consumindo a interface Storage. |
+| Storage | Armazenar, consultar e remover dados por meio de uma implementação independente. |
 | Idempotency Executor | Controlar a execução de operações mutáveis e reproduzir resultados registrados. |
 | Server | Inicializar os componentes e gerenciar o ciclo de vida do servidor. |
 | API / CLI | Disponibilizar uma interface de utilização do banco. |
@@ -111,6 +120,9 @@ O driver Java permanece como uma implementação futura, devendo consumir o mesm
 
 - O Storage não conhece TCP, Protobuf ou drivers.
 - A Engine não conhece o formato de serialização nem o transporte.
+- A Engine define a interface `Storage` que consome, sem depender do pacote concreto de implementação.
+- A implementação concreta do Storage é injetada na Engine durante a inicialização do servidor.
+- O Storage é executado no mesmo processo do servidor; sua independência é de módulo e biblioteca, não de serviço.
 - O modelo interno de protocolo não depende dos tipos gerados pelo Protobuf.
 - O Codec é responsável por converter entre o contrato externo e o modelo interno.
 - O transporte TCP trabalha com mensagens em bytes, sem conhecer o significado dos comandos.
@@ -196,6 +208,7 @@ memorydb/
 │       ├── engine/
 │       │   ├── command.go
 │       │   ├── engine.go
+│       │   ├── storage.go
 │       │   └── engine_test.go
 │       ├── idempotency/
 │       │   ├── executor.go
@@ -206,10 +219,6 @@ memorydb/
 │       │   └── server_test.go
 │       ├── protocol/
 │       │   └── message.go
-│       ├── storage/
-│       │   ├── entry.go
-│       │   ├── storage.go
-│       │   └── storage_test.go
 │       └── transport/
 │           └── tcp/
 │               ├── communication_test.go
@@ -221,6 +230,13 @@ memorydb/
 ├── shared/
 │   └── config/
 │       └── defaults.go
+│
+├── storage/
+│   └── go/
+│       ├── go.mod
+│       ├── entry.go
+│       ├── storage.go
+│       └── storage_test.go
 │
 ├── transport/
 │   └── tcp/
@@ -235,6 +251,8 @@ memorydb/
 └── memorydb-roadmap.md
 ```
 
+O diretório `server/internal/storage` não faz mais parte da estrutura atual. A implementação concreta foi extraída para `storage/go`, enquanto a interface consumida pela Engine permanece em `server/internal/engine/storage.go`.
+
 ## 6. Organização dos módulos Go
 
 O projeto utiliza Go Workspace para desenvolvimento local com múltiplos módulos independentes.
@@ -244,14 +262,28 @@ O projeto utiliza Go Workspace para desenvolvimento local com múltiplos módulo
 | Protocolo gerado | `protocol/generated/go` | Tipos Go gerados a partir do contrato Protobuf. |
 | Transporte TCP | `transport/tcp/go` | Conexão TCP e framing. |
 | Driver Go | `drivers/go` | Cliente Go para comunicação com o servidor. |
-| Servidor | `server` | Engine, Storage, Codec, protocolo interno, idempotência e inicialização. |
+| Servidor | `server` | Engine, Codec, protocolo interno, idempotência, handlers e inicialização. |
 | API | `api` | Aplicação cliente de demonstração. |
+| Configurações compartilhadas | `shared` | Valores padrão e configurações compartilhadas entre módulos. |
+| Storage Go | `storage/go` | Implementação independente do armazenamento em memória. |
+
+O módulo `storage/go` declara o módulo:
+
+`github.com/pescador95/memorydb/storage/go`
+
+A interface consumida pela Engine está definida em:
+
+`server/internal/engine/storage.go`
+
+A implementação concreta é criada na inicialização do servidor e injetada na Engine. Dessa forma, o módulo Server depende do contrato de Storage, enquanto a implementação concreta permanece fora do módulo Server.
 
 O pacote `shared/config` mantém configurações e valores padrão compartilhados pelo projeto, evitando duplicação de definições comuns.
 
-O arquivo `go.work` reúne os módulos para facilitar o desenvolvimento dentro do repositório.
+O arquivo `go.work` reúne os sete módulos para facilitar o desenvolvimento dentro do repositório.
 
 Os módulos continuam independentes e poderão ser publicados e consumidos separadamente no futuro. Consumidores externos não precisam utilizar o `go.work` do repositório para importar os módulos publicados.
+
+A independência do módulo Storage não significa execução isolada: no estado atual, ele é carregado e executado dentro do processo do servidor, por chamadas locais de métodos Go.
 
 ## 7. Contrato de comunicação
 
@@ -318,6 +350,9 @@ Os arquivos gerados não devem ser editados manualmente. Alterações devem ser 
 - [x] Operação de remoção (`DELETE`).
 - [x] Diferenciação entre chave inexistente e valor vazio.
 - [x] Testes unitários do Storage.
+- [x] Extração da implementação para módulo Go independente.
+- [x] Definição da interface consumidora na Engine.
+- [x] Injeção da implementação concreta do Storage na Engine.
 
 ### Fase 2 — Engine e modelo interno
 
@@ -326,11 +361,12 @@ Os arquivos gerados não devem ser editados manualmente. Alterações devem ser 
 - [x] Definição do modelo interno de requisições e respostas.
 - [x] Definição dos comandos.
 - [x] Implementação da Engine.
-- [x] Integração da Engine com o Storage.
+- [x] Integração da Engine com o Storage por meio de interface.
 - [x] Validação de comandos.
 - [x] Tratamento de comandos não suportados.
 - [x] Rejeição de TTL positivo enquanto a funcionalidade não estiver implementada.
 - [x] Testes unitários da Engine.
+- [x] Injeção de dependência da implementação de Storage.
 
 ### Fase 3 — Contrato Protobuf
 
@@ -539,11 +575,28 @@ As validações reportadas concluíram sem falhas.
 
 A validação completa e as validações direcionadas devem ser interpretadas conforme seus respectivos escopos. Os testes direcionados não substituem uma nova execução integral de todos os módulos.
 
-## 9. Próximas fases
+**Validação da extração do Storage — 25/11/2026**
+
+A extração do armazenamento para módulo independente foi integrada ao workspace no commit `6a8d8a3`.
+
+A alteração contempla:
+
+- [x] Criação do módulo `storage/go`.
+- [x] Transferência da implementação concreta do Storage para o novo módulo.
+- [x] Transferência dos testes do Storage para o novo módulo.
+- [x] Definição da interface consumidora em `server/internal/engine/storage.go`.
+- [x] Injeção da implementação concreta na Engine durante a inicialização do servidor.
+- [x] Atualização do `go.work` para incluir o novo módulo.
+- [x] Atualização dos scripts de teste para considerar o novo módulo.
+- [x] Atualização dos testes da Engine e de integração.
+
+A extração preserva a execução local da implementação de Storage dentro do processo do servidor. Não foi introduzida comunicação entre processos ou serviço de armazenamento separado.
 
 ### Fase 9 — Consolidação da arquitetura e documentação
 
-**Status: em andamento**
+**Status: concluída em 25/11/2026**
+
+A documentação foi revisada e atualizada após a extração do Storage para módulo Go independente, mantendo a distinção entre independência de módulo e isolamento de processo.
 
 **Concluído**
 
@@ -557,21 +610,23 @@ A validação completa e as validações direcionadas devem ser interpretadas co
 - [x] Atualizar o manual de utilização com o contrato de idempotência.
 - [x] Atualizar o README do driver Go.
 - [x] Atualizar o roadmap com o estado da implementação de idempotência.
+- [x] Atualizar o README geral do projeto após a extração do Storage.
+- [x] Atualizar o guia de testes para contemplar os sete módulos Go.
+- [x] Atualizar o manual de utilização com a organização dos sete módulos.
+- [x] Atualizar os requisitos e as evidências de implementação para os novos caminhos do Storage.
+- [x] Atualizar a arquitetura e os componentes para refletir a interface consumida pelo Engine e a injeção de dependência.
+- [x] Atualizar a estrutura documental e os caminhos de implementação após a extração do Storage.
+- [x] Verificar a consistência entre os documentos atualizados.
+- [x] Executar `git diff --check` nas alterações documentais.
+- [x] Conferir se os documentos descrevem os mesmos valores padrão, contratos e limitações da implementação.
 
-Os documentos `REQUISITOS.md`, `ARQUITETURA.md` e `COMPONENTES.md` foram revisados e atualizados para refletir as funcionalidades recentes do servidor.
+A atualização documental foi registrada no commit `811c403` — `docs: atualizado a documentação após extração do storage`.
 
-**Pendências de consolidação e validação**
+A revisão confirmou que os documentos descrevem o Storage como módulo Go independente, reutilizável como biblioteca, mas executado no mesmo processo do servidor. A interface consumida pelo Engine permanece em `server/internal/engine/storage.go`, e a implementação concreta permanece em `storage/go`.
 
-- [ ] Incorporar e validar a versão revisada de `docs/tecnica/TESTES.md`.
-- [ ] Incorporar e validar a versão revisada de `docs/README.md`.
-- [ ] Concluir os pequenos ajustes identificados na revisão de `docs/usuario/MANUAL.md`.
-- [ ] Verificar a consistência entre os documentos após as atualizações.
-- [ ] Executar `git diff --check` nas alterações documentais.
-- [ ] Conferir se todos os documentos descrevem os mesmos valores padrão, contratos e limitações da implementação.
+A documentação deve continuar refletindo o comportamento efetivamente implementado, incluindo as limitações atuais do servidor, do transporte, dos drivers e a fronteira entre os módulos Go.
 
-A documentação deve refletir o comportamento efetivamente implementado, incluindo as limitações atuais do servidor, do transporte e dos drivers.
-
-Novas decisões arquiteturais e mudanças de contrato deverão continuar sendo documentadas conforme o projeto evoluir.
+Novas decisões arquiteturais e mudanças de contrato deverão continuar sendo documentadas conforme o projeto evoluir. Essa manutenção contínua não representa uma pendência da consolidação documental concluída nesta fase.
 
 ### Fase 10 — Driver Java
 
@@ -658,7 +713,7 @@ Permanecem pendentes observabilidade, melhorias operacionais adicionais, experi�
 
 | Configuração | Variável de ambiente | Valor padrão |
 |---|---|---|
-| Endereço de escuta | `MEMORYDB_ADDR` | Conforme configuração padrão do servidor |
+| Endereço de escuta | `MEMORYDB_ADDR` | `:6380` |
 | Timeout de conexão do cliente | `MEMORYDB_DIAL_TIMEOUT` | 5 segundos |
 | Timeout de leitura TCP | `MEMORYDB_READ_TIMEOUT` | 30 segundos |
 | Timeout de escrita TCP | `MEMORYDB_WRITE_TIMEOUT` | 10 segundos |
@@ -871,6 +926,8 @@ A evolução distribuída também exigirá revisar o escopo da idempotência, qu
 - Preservar a distinção entre execução em memória e confirmação durável.
 - Não introduzir multiplexação sem definir previamente seu impacto sobre o protocolo, o transporte e os drivers.
 - Evitar que mecanismos de observabilidade criem dependências desnecessárias no núcleo do banco.
+- Manter a implementação do Storage independente do módulo Server, consumindo-a por meio de uma interface definida pela Engine.
+- Não confundir independência de módulo Go com isolamento de processo ou comunicação entre serviços.
 
 ## 11. Critérios de conclusão do MVP
 
@@ -892,7 +949,9 @@ O MVP será considerado concluído quando:
 
 A validação integrada dos módulos foi registrada em 15/11/2026, e a evolução posterior do driver Go foi validada separadamente em 22/11/2026. Em 25/11/2026, foram implementadas e validadas evoluções de robustez operacional do servidor, incluindo timeouts, limite de conexões e encerramento forçado.
 
-A consolidação documental permanece em andamento até a conclusão da revisão e incorporação de todos os documentos pendentes.
+Em 25/11/2026, a implementação concreta do Storage também foi extraída para um módulo Go independente, mantendo a execução dentro do processo do servidor e a integração por interface e injeção de dependência.
+
+A consolidação documental da arquitetura e da extração do Storage foi concluída e registrada no commit `811c403`. A manutenção da documentação continuará acompanhando as próximas mudanças de implementação, mas não constitui pendência para a conclusão dessa fase.
 
 O projeto pode avançar para as próximas evoluções sem depender de novas funcionalidades para considerar o MVP atual concluído.
 
@@ -908,7 +967,7 @@ O projeto pode avançar para as próximas evoluções sem depender de novas func
 | 6 | Servidor TCP | Concluída |
 | 7 | Driver Go | Concluída |
 | 8 | API e integração | Concluída |
-| 9 | Consolidação e documentação | Em andamento |
+| 9 | Consolidação e documentação | Concluída |
 | 10 | Driver Java | Planejada |
 | 11 | TTL | Planejada |
 | 12 | Robustez, confiabilidade e utilização | Parcialmente concluída |

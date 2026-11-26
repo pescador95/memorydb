@@ -43,6 +43,8 @@ O escopo funcional atual contempla:
 - Conexões TCP persistentes.
 - Atendimento concorrente de múltiplos clientes.
 - Compartilhamento do armazenamento entre conexões da mesma instância.
+- Módulo Storage independente, reutilizável como biblioteca Go.
+- Integração do Storage ao Engine por interface e injeção de dependência.
 - Driver cliente em Go.
 - Operações context-aware no driver Go.
 - Sinalização de resultados indeterminados por `OperationOutcomeUnknownError`.
@@ -74,6 +76,8 @@ A implementação atual não oferece:
 - Driver Java implementado e validado.
 
 Os limites de leitura, escrita e quantidade de conexões TCP são implementados. Eles não devem ser confundidos com limites de inatividade, controle de taxa de requisições ou políticas completas de isolamento entre clientes.
+
+O módulo Storage independente não representa um serviço ou processo separado. Ele é incorporado ao processo do servidor como biblioteca Go e executado por chamadas locais, no mesmo espaço de endereçamento e heap.
 
 ## 3. Requisitos funcionais
 
@@ -109,15 +113,19 @@ Uma nova gravação para a mesma chave deve substituir o valor anterior.
 
 O fluxo de processamento de SET exige um `OperationID` válido. Essa validação é realizada pelo Handler/Executor antes da execução do comando pelo Engine.
 
-**Componentes:** `Handler`, `idempotency.Executor`, `Engine` e `Storage`.
+O Engine utiliza uma abstração de Storage definida em seu próprio pacote. A implementação concreta é fornecida pelo executável do servidor por injeção de dependência.
+
+**Componentes:** `Handler`, `idempotency.Executor`, `Engine` e módulo Storage.
 
 **Evidências:**
 
 - `server/internal/transport/tcp/handler.go` — encaminhamento de SET pelo fluxo de idempotência.
 - `server/internal/engine/engine.go` — `Engine.Execute`.
-- `server/internal/storage/storage.go` — `Storage.Set`.
+- `server/internal/engine/storage.go` — interface consumida pelo Engine.
+- `storage/go/storage.go` — implementação de `Storage.Set`.
+- `server/cmd/memorydb/main.go` — instanciação e injeção da implementação concreta.
 - `server/internal/engine/engine_test.go` — `TestSetAndGet`.
-- `server/internal/storage/storage_test.go` — `TestSetOverwritesExistingValue`.
+- `storage/go/storage_test.go` — `TestSetOverwritesExistingValue`.
 
 **Critérios de aceite**
 
@@ -181,14 +189,15 @@ Cenário: Rejeitar SET com TTL positivo
 
 Para uma chave inexistente, deve retornar `found=false`, sem confundir ausência com valor vazio.
 
-**Componentes:** `Engine` e `Storage`.
+**Componentes:** `Engine` e módulo Storage.
 
 **Evidências:**
 
 - `server/internal/engine/engine.go` — `Engine.Execute`.
-- `server/internal/storage/storage.go` — `Storage.Get`.
+- `server/internal/engine/storage.go` — interface consumida pelo Engine.
+- `storage/go/storage.go` — implementação de `Storage.Get`.
 - `server/internal/engine/engine_test.go` — `TestSetAndGet` e `TestGetMissingKey`.
-- `server/internal/storage/storage_test.go` — `TestEmptyValue`.
+- `storage/go/storage_test.go` — `TestEmptyValue`.
 - `server/internal/integration/server_test.go` — `TestServerEmptyValueAndMissingKey`.
 
 **Critérios de aceite**
@@ -222,14 +231,15 @@ Se a chave não existir, a operação deve continuar sendo uma resposta de suces
 
 DELETE exige um `OperationID` válido. Repetições da mesma operação lógica devem reproduzir o resultado original enquanto o registro de idempotência estiver retido.
 
-**Componentes:** `Handler`, `idempotency.Executor`, `Engine` e `Storage`.
+**Componentes:** `Handler`, `idempotency.Executor`, `Engine` e módulo Storage.
 
 **Evidências:**
 
 - `server/internal/engine/engine.go` — `Engine.Execute`.
-- `server/internal/storage/storage.go` — `Storage.Delete`.
+- `server/internal/engine/storage.go` — interface consumida pelo Engine.
+- `storage/go/storage.go` — implementação de `Storage.Delete`.
 - `server/internal/engine/engine_test.go` — `TestDelete`.
-- `server/internal/storage/storage_test.go` — `TestDelete`.
+- `storage/go/storage_test.go` — `TestDelete`.
 - `server/internal/transport/tcp/handler_test.go` — testes de DELETE e idempotência.
 - `server/internal/integration/server_test.go` — `TestServerSetGetDelete`.
 
@@ -408,16 +418,21 @@ Cenário: Tratar escrita parcial
 
 **Descrição:** O handler deve processar várias requisições sequenciais em uma mesma conexão TCP.
 
-O servidor deve aceitar conexões de múltiplos clientes simultaneamente. As conexões de uma mesma instância devem compartilhar o mesmo armazenamento e o mesmo executor de idempotência.
+O servidor deve aceitar conexões de múltiplos clientes simultaneamente. As conexões de uma mesma instância devem compartilhar a mesma implementação de Storage e o mesmo executor de idempotência.
+
+O módulo Storage é uma biblioteca Go carregada pelo processo do servidor. O compartilhamento ocorre por meio da mesma instância injetada no Engine, sem comunicação RPC, IPC ou tráfego de rede entre Engine e Storage.
 
 O driver Go deve serializar o ciclo de requisição e resposta por conexão, garantindo a correspondência entre cada solicitação e sua resposta.
 
-**Componentes:** `Handler`, `Server`, transporte TCP, `Engine`, `Storage`, `idempotency.Executor` e driver Go.
+**Componentes:** `Handler`, `Server`, transporte TCP, `Engine`, módulo Storage, `idempotency.Executor` e driver Go.
 
 **Evidências:**
 
 - `server/internal/transport/tcp/handler.go` — `Handler.Handle`.
 - `server/internal/transport/tcp/server.go` — `Server.Serve`.
+- `server/internal/engine/storage.go` — interface consumida pelo Engine.
+- `server/cmd/memorydb/main.go` — instanciação e injeção do Storage.
+- `storage/go/storage.go` — implementação do armazenamento.
 - `transport/tcp/go/connection.go` — `Connection`.
 - `drivers/go/client.go` — `Client.execute`.
 - `server/internal/transport/tcp/handler_test.go` — `TestHandlerProcessesMultipleRequests`.
@@ -738,25 +753,31 @@ Esta seção registra características observáveis da implementação atual. It
 
 | ID | Requisito ou característica | Estado | Evidência |
 |---|---|---|---|
-| NFR-001 | Operações concorrentes de armazenamento devem ser sincronizadas. | Implementado e testado | `server/internal/storage/storage.go`, `storage_test.go` |
+| NFR-001 | Operações concorrentes de armazenamento devem ser sincronizadas. | Implementado e testado | `storage/go/storage.go`, `storage/go/storage_test.go` |
 | NFR-002 | Valores devem ser tratados como bytes, inclusive dados binários. | Implementado | `memorydb.proto`, modelo interno e codec |
 | NFR-003 | Frames devem respeitar limite de 1 MiB e codificação Big Endian. | Implementado e testado | `transport/tcp/go/framing.go`, `framing_test.go` |
 | NFR-004 | O servidor deve interromper a aceitação, aguardar conexões ativas e fechá-las quando o contexto de shutdown expirar. | Implementado e testado | `server/internal/transport/tcp/server.go`, `server_test.go` |
-| NFR-005 | Dados devem sobreviver à reinicialização do processo. | Não implementado | `server/internal/storage/storage.go` |
+| NFR-005 | Dados devem sobreviver à reinicialização do processo. | Não implementado | `storage/go/storage.go` |
 | NFR-006 | Comunicação deve oferecer criptografia TLS. | Não implementado | `server/cmd/memorydb/main.go` |
 | NFR-007 | O servidor deve impor timeouts de leitura e escrita e limitar o número de conexões TCP simultâneas. | Implementado e testado | `server/internal/transport/tcp/handler.go`, `handler_test.go`, `server.go`, `server_test.go` |
 | NFR-008 | O projeto deve possuir metas mensuráveis de latência e throughput. | Não identificado | Não foram identificadas metas ou benchmarks de performance |
 | NFR-009 | Falhas de processamento de conexões devem ser observáveis em logs. | Não implementado | `server/internal/transport/tcp/server.go` |
-| NFR-010 | Execução de comandos, storage, protocolo, codec e transporte devem possuir responsabilidades separadas. | Implementado | Pacotes internos do módulo `server` |
+| NFR-010 | Execução de comandos, storage, protocolo, codec e transporte devem possuir responsabilidades separadas. | Implementado | Pacotes internos do módulo `server` e módulo independente `storage/go` |
 | NFR-011 | O transporte TCP deve ser reutilizável sem dependência direta do Protobuf. | Implementado | `transport/tcp/go`, `drivers/go`, handler do servidor |
 | NFR-012 | Aplicações Go devem consumir o serviço por meio de uma API cliente. | Implementado e testado | `drivers/go/client.go`, `drivers/go/client_test.go` |
-| NFR-013 | Os módulos Go devem permitir desenvolvimento e testes independentes no workspace. | Implementado | `go.work` e arquivos `go.mod` |
+| NFR-013 | Os módulos Go devem permitir desenvolvimento e testes independentes no workspace. | Implementado | `go.work` e arquivos `go.mod` dos sete módulos |
 | NFR-014 | O código deve passar pelos testes com detector de condições de corrida e análise estática. | Implementado, validação histórica | Registros de validação por módulo descritos na seção 8 |
 | NFR-015 | O registro de idempotência deve respeitar capacidade padrão de 100.000 registros, retenção de 24 horas e ausência de evicção antecipada de registros válidos. | Implementado e testado | `server/internal/idempotency/executor.go`, `executor_test.go` |
 | NFR-016 | A execução de operações com o mesmo `OperationID` deve ser sincronizada, evitando execuções concorrentes duplicadas. | Implementado e testado | `server/internal/idempotency/executor.go`, `executor_test.go` |
 | NFR-017 | O executor de idempotência deve calcular fingerprints determinísticos para operações mutáveis. | Implementado e testado | `server/internal/idempotency/fingerprint.go`, `fingerprint_test.go` |
 
 ### 4.1. Observações sobre os requisitos não funcionais
+
+**NFR-001 — Sincronização do armazenamento**
+
+A implementação concreta do Storage utiliza `map[string]Entry` protegida por `sync.RWMutex`. As operações de leitura e escrita são sincronizadas. Os métodos de armazenamento também preservam o isolamento dos dados binários por meio da cópia dos slices de bytes.
+
+A implementação está no módulo independente `storage/go`, não mais dentro do módulo `server`.
 
 **NFR-004 — Shutdown**
 
@@ -795,6 +816,26 @@ A goroutine criada por `Server.Serve()` descarta o erro retornado por `Handler.H
 
 O isolamento dessas falhas impede que um erro individual do handler seja propagado como falha do loop de aceitação, mas a ausência de registro dificulta diagnóstico e monitoramento.
 
+**NFR-013 — Organização dos módulos Go**
+
+O workspace é composto por sete módulos independentes:
+
+| Módulo | Diretório | Responsabilidade |
+|---|---|---|
+| API | `api` | Contratos e tipos públicos compartilhados |
+| Driver Go | `drivers/go` | Cliente Go para comunicação com o servidor |
+| Protobuf gerado | `protocol/generated/go` | Tipos Go gerados a partir do contrato Protobuf |
+| Servidor | `server` | Executável, Engine, protocolo interno, codec, handler, idempotência e configuração do servidor |
+| Shared | `shared` | Configurações e definições compartilhadas |
+| Storage | `storage/go` | Implementação independente do armazenamento em memória |
+| Transporte TCP | `transport/tcp/go` | Framing e abstrações de conexão TCP reutilizáveis |
+
+O módulo Storage possui seu próprio `go.mod` e pode ser desenvolvido e testado como módulo Go independente.
+
+A independência do módulo não implica isolamento de processo: o servidor importa a biblioteca e instancia o Storage no mesmo processo em que executa o Engine.
+
+A interface consumida pelo Engine é definida em `server/internal/engine/storage.go`. A implementação concreta é criada no executável e injetada no Engine.
+
 **NFR-014 — Validação**
 
 A aprovação em testes é uma evidência associada a uma versão do código e a uma execução específica. Não representa garantia permanente para alterações futuras.
@@ -818,10 +859,10 @@ Os registros de idempotência são mantidos em memória e não oferecem durabili
 | Comando tipado nulo | Rejeitado como requisição inválida | `engine.go`, `engine_test.go` |
 | Chave vazia | SET, GET e DELETE rejeitam com `INVALID_ARGUMENT` | `engine.go`, `engine_test.go` |
 | TTL maior que zero | SET retorna `UNSUPPORTED_FEATURE` | `engine.go`, `engine_test.go` |
-| Valor vazio | Pode ser armazenado; GET informa `found=true` | `storage.go`, `storage_test.go` |
+| Valor vazio | Pode ser armazenado; GET informa `found=true` | `storage/go/storage.go`, `storage_test.go` |
 | Chave inexistente | GET retorna `found=false`; DELETE retorna `deleted=false` | `engine.go`, `engine_test.go` |
-| Substituição de valor | SET substitui o valor anterior | `storage_test.go` |
-| Mutação de slice pelo chamador | SET e GET copiam bytes | `storage.go`, `storage_test.go` |
+| Substituição de valor | SET substitui o valor anterior | `storage/go/storage_test.go` |
+| Mutação de slice pelo chamador | SET e GET copiam bytes | `storage/go/storage.go`, `storage_test.go` |
 | Frame com tamanho zero | Rejeitado pelo framing | `framing.go`, `framing_test.go` |
 | Frame acima de 1 MiB | Rejeitado pelo framing | `framing.go`, `framing_test.go` |
 | Frame truncado | Cabeçalho ou payload incompleto retorna erro | `framing_test.go` |
@@ -829,7 +870,7 @@ Os registros de idempotência são mantidos em memória e não oferecem durabili
 | Protobuf inválido | Decode retorna erro | `codec.go`, `codec_test.go` |
 | Comando ou resultado ausente no codec | Estrutura inválida é rejeitada | `codec.go`, `codec_test.go` |
 | Cliente desconecta por EOF | Handler encerra sem tratar EOF como falha de aplicação | `handler.go`, testes de integração |
-| Concorrência no storage | Operações são sincronizadas por `RWMutex` | `storage.go`, `storage_test.go` |
+| Concorrência no storage | Operações são sincronizadas por `RWMutex` | `storage/go/storage.go`, `storage_test.go` |
 | Múltiplos clientes | Conexões distintas compartilham o storage da instância | Testes do servidor e integração |
 | Desconexão durante operação | Driver propaga falha de comunicação | `client.go`, `client_test.go` |
 | Cancelamento antes do I/O | Retorna erro de contexto sem invalidar a conexão | `client.go`, `client_test.go` |
@@ -845,13 +886,15 @@ Os registros de idempotência são mantidos em memória e não oferecem durabili
 | Registro de idempotência expirado | Identificador deixa de possuir garantia de deduplicação | `executor_test.go` |
 | Registro em andamento | Não expira pela janela de retenção de operações concluídas | `executor_test.go` |
 | Resposta reproduzida | Mantém o resultado semântico e atualiza o RequestID para a tentativa atual | `executor_test.go`, `handler_test.go` |
-| Reinicialização do servidor | Dados e registros de idempotência são perdidos | `storage.go`, `idempotency/executor.go` |
+| Reinicialização do servidor | Dados e registros de idempotência são perdidos | `storage/go/storage.go`, `idempotency/executor.go` |
 | Conexões simultâneas acima do limite | Conexões excedentes são fechadas sem serem admitidas para processamento | `server.go`, `server_test.go` |
 | Timeout de leitura | Handler aplica deadline antes de cada leitura de frame | `handler.go`, `handler_test.go` |
 | Timeout de escrita | Handler aplica deadline antes de cada escrita de resposta | `handler.go`, `handler_test.go` |
 | Shutdown com conexão ativa | Servidor aguarda a conclusão da conexão antes de retornar | `server.go`, `server_test.go` |
 | Shutdown com contexto expirado | Servidor fecha conexões ativas e aguarda a conclusão dos handlers | `server.go`, `server_test.go` |
 | Nova conexão durante shutdown | Conexão aceita durante a transição para shutdown é fechada, sem iniciar processamento | `server.go`, `server_test.go` |
+| Storage como módulo independente | Implementação possui módulo Go próprio, consumido pelo servidor como biblioteca no mesmo processo | `storage/go/go.mod`, `server/go.mod`, `server/cmd/memorydb/main.go` |
+| Injeção do Storage | Executável instancia a implementação concreta e a fornece ao Engine por sua interface | `server/internal/engine/storage.go`, `server/internal/engine/engine.go`, `server/cmd/memorydb/main.go` |
 
 ## 6. Rastreabilidade requisito–componente–teste
 
@@ -890,7 +933,7 @@ O armazenamento é mantido exclusivamente em memória.
 
 **Impacto:** a reinicialização do processo elimina os dados. Não há durabilidade nem recuperação após falhas.
 
-**Referência:** `server/internal/storage/storage.go`.
+**Referência:** `storage/go/storage.go`.
 
 ### GAP-003 — Autenticação e autorização não implementadas
 
@@ -965,7 +1008,7 @@ O servidor ainda não oferece:
 
 Uma evolução com persistência deverá tratar atomicamente a mutação e o registro de idempotência para evitar divergências entre o estado dos dados e o estado de deduplicação.
 
-**Referências:** `server/internal/idempotency/executor.go`, `server/internal/storage/storage.go`.
+**Referências:** `server/internal/idempotency/executor.go`, `storage/go/storage.go`.
 
 ### GAP-010 — Driver Java não implementado e validado
 
@@ -987,7 +1030,7 @@ Não foi identificada configuração externa para ajustar esses parâmetros no e
 
 ### 8.1. Validação registrada em 22/11/2026
 
-Em 22/11/2026, foram executados testes, análise estática e testes com detector de condições de corrida nos cinco módulos do workspace.
+Em 22/11/2026, foram executados testes, análise estática e testes com detector de condições de corrida nos cinco módulos do workspace existentes naquela versão.
 
 A validação de testes e análise estática utilizou:
 
@@ -1068,6 +1111,26 @@ Essa validação confirma especificamente os testes repetidos do fechamento de c
 
 **Limite da evidência:** essa execução direcionada não substitui uma nova execução integral de todos os módulos do workspace após as mudanças de 25/11/2026. A validação histórica de 22/11/2026 permanece registrada separadamente.
 
+### 8.3. Extração do Storage para módulo independente — 25/11/2026
+
+Em 25/11/2026, a implementação do armazenamento foi extraída do módulo `server` para o módulo Go independente `storage/go`.
+
+A alteração passou a incluir:
+
+- `storage/go/go.mod`, declarando o módulo `github.com/pescador95/memorydb/storage/go`.
+- Implementação do armazenamento em `storage/go/storage.go`.
+- Tipo de entrada em `storage/go/entry.go`.
+- Testes em `storage/go/storage_test.go`.
+- Inclusão do módulo no workspace `go.work`.
+- Interface consumida pelo Engine em `server/internal/engine/storage.go`.
+- Injeção da implementação concreta pelo executável em `server/cmd/memorydb/main.go`.
+
+O Storage continua sendo executado dentro do processo do servidor. A extração estabelece uma fronteira de módulo Go e reutilização de biblioteca, não uma fronteira de processo ou serviço.
+
+**Referência de versão:** commit `6a8d8a3` — `refactor(storage): extraido armazenamento para módulo independente`.
+
+**Limite da evidência:** a existência do módulo e sua integração arquitetural estão registradas no código dessa versão. Os resultados das validações históricas das seções anteriores não devem ser interpretados como execução dos testes do novo módulo, pois ele ainda não existia naquela validação. A validação integral do workspace de sete módulos deve ser registrada separadamente quando executada nessa versão.
+
 ## 9. Critério geral de conclusão do escopo atual
 
 O escopo funcional inicial do MemoryDB é considerado implementado quando:
@@ -1078,13 +1141,15 @@ O escopo funcional inicial do MemoryDB é considerado implementado quando:
 4. O protocolo Protobuf representa requisições e respostas.
 5. O transporte TCP delimita mensagens corretamente.
 6. O servidor atende múltiplos clientes e conexões persistentes.
-7. O driver Go permite consumir as operações sem implementar manualmente o protocolo.
-8. O driver Go oferece operações context-aware e sinaliza resultados indeterminados quando não é possível confirmar o desfecho de uma operação.
-9. O servidor oferece encerramento gracioso e forçado, com espera pelas conexões ativas e fechamento das conexões restantes quando o contexto expira.
-10. O servidor aplica timeouts de leitura e escrita e limita o número de conexões TCP simultâneas.
-11. SET e DELETE exigem `OperationID` e possuem deduplicação server-side com fingerprint, replay de respostas, controle de concorrência, retenção e capacidade.
-12. O driver Go permite gerar e fornecer `OperationID`, sem realizar retries automáticos.
-13. A validação automatizada registrada inclui testes, análise estática e testes com detector de condições de corrida nos módulos do workspace, respeitando as datas e os limites de cada execução documentada.
+7. O módulo Storage é independente como módulo Go e pode ser consumido como biblioteca.
+8. O Engine consome o Storage por interface, com a implementação concreta fornecida por injeção de dependência.
+9. O driver Go permite consumir as operações sem implementar manualmente o protocolo.
+10. O driver Go oferece operações context-aware e sinaliza resultados indeterminados quando não é possível confirmar o desfecho de uma operação.
+11. O servidor oferece encerramento gracioso e forçado, com espera pelas conexões ativas e fechamento das conexões restantes quando o contexto expira.
+12. O servidor aplica timeouts de leitura e escrita e limita o número de conexões TCP simultâneas.
+13. SET e DELETE exigem `OperationID` e possuem deduplicação server-side com fingerprint, replay de respostas, controle de concorrência, retenção e capacidade.
+14. O driver Go permite gerar e fornecer `OperationID`, sem realizar retries automáticos.
+15. A validação automatizada registrada inclui testes, análise estática e testes com detector de condições de corrida nos módulos do workspace, respeitando as datas e os limites de cada execução documentada.
 
 Os GAPs documentados neste arquivo não impedem a conclusão do escopo inicial, pois representam evoluções planejadas e limitações conhecidas da implementação atual.
 

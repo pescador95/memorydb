@@ -15,6 +15,8 @@ A implementação atual contempla:
 - Armazenamento de chaves `string` e valores `[]byte`.
 - Compartilhamento dos dados entre conexões da mesma instância.
 - Proteção concorrente do armazenamento.
+- Storage implementado como módulo Go independente, reutilizado pelo servidor como biblioteca no mesmo processo.
+- Injeção da implementação concreta de Storage no Engine por meio de uma interface definida pelo próprio Engine.
 - Framing TCP independente da serialização.
 - Contrato externo definido em Protobuf.
 - Driver cliente Go.
@@ -47,6 +49,7 @@ A implementação atual não possui:
 - Replicação ou compartilhamento de registros de idempotência entre instâncias.
 - Garantia de execução exatamente uma vez.
 - Observabilidade integrada por métricas, tracing ou monitoramento.
+- Limite global configurável de memória do processo.
 
 O campo `ttl_ms` existe no contrato Protobuf, mas valores positivos são rejeitados como funcionalidade não suportada.
 
@@ -63,6 +66,8 @@ O limite de conexões controla quantas conexões TCP simultâneas o servidor adm
 Os timeouts de leitura e escrita são aplicados às respectivas operações de I/O TCP. Eles não representam um prazo global de execução de uma operação de negócio.
 
 O encerramento forçado fecha as conexões TCP ativas para interromper operações de I/O pendentes. Isso não constitui um mecanismo genérico de cancelamento de qualquer operação interna do servidor.
+
+O limite de tamanho do frame TCP e a capacidade do registro de idempotência não representam um limite global de consumo de memória do processo.
 
 **Segurança:** o servidor não deve ser exposto a redes não confiáveis sem mecanismos adicionais de proteção.
 
@@ -115,21 +120,27 @@ O roadmap apresenta objetivos, princípios, etapas e evoluções planejadas. Ite
 
 ## 4. Estrutura modular do projeto
 
-O MemoryDB utiliza um workspace Go definido em `go.work`, composto por módulos independentes.
+O MemoryDB utiliza um workspace Go definido em `go.work`, composto por sete módulos independentes.
 
 | Módulo | Caminho | Responsabilidade |
 |---|---|---|
-| Servidor | `server/` | Executável, engine, storage, codec, handler e integração com TCP e idempotência |
+| Servidor | `server/` | Executável, Engine, interfaces internas, codec, handler TCP e integração com idempotência |
+| Storage | `storage/go/` | Biblioteca independente de armazenamento em memória, com operações concorrentes de leitura, escrita e remoção |
 | Transporte TCP | `transport/tcp/go/` | Conexão TCP e framing, independentes da serialização |
 | Protocolo gerado | `protocol/generated/go/` | Tipos Go gerados a partir do schema Protobuf |
 | Driver Go | `drivers/go/` | Biblioteca cliente para comunicação com o servidor |
 | API de demonstração | `api/` | Aplicação executável que utiliza o driver Go |
+| Shared | `shared/` | Configurações e definições compartilhadas entre módulos |
 
 O contrato Protobuf está definido em:
 
 `protocol/proto/memorydb/v1/memorydb.proto`
 
 Cada módulo possui seu próprio `go.mod`. O workspace permite desenvolver e testar os módulos locais de forma integrada, sem exigir que estejam publicados como dependências externas.
+
+O módulo Storage possui identidade e ciclo de dependências próprios, mas sua utilização pelo servidor ocorre como biblioteca Go. A implementação concreta é criada na inicialização do servidor e injetada no Engine por meio de uma interface definida no módulo Server.
+
+Portanto, Engine e Storage executam no mesmo processo, compartilham o espaço de endereçamento e o heap da aplicação e se comunicam por chamadas locais de métodos. Não existe comunicação RPC, IPC ou tráfego de rede entre esses componentes.
 
 O workspace facilita o desenvolvimento conjunto, mas aplicações independentes devem utilizar versões publicadas ou referências locais configuradas para os módulos dos quais dependem.
 
@@ -146,7 +157,7 @@ flowchart LR
     Handler["Handler TCP"]
     Executor["Executor de idempotência"]
     Engine["Engine"]
-    Storage["Storage em memória"]
+    Storage["Storage (módulo independente)"]
 
     Client --> Driver
     Driver --> TCP
@@ -167,9 +178,13 @@ flowchart LR
 
 O transporte delimita as mensagens em frames TCP. O codec converte entre o modelo interno e o contrato Protobuf. O handler interpreta as solicitações e encaminha as operações ao executor de idempotência.
 
-Para SET e DELETE, o executor verifica o `OperationID`, compara a impressão digital da operação e controla a execução ou a reprodução de resultados. Quando necessário, encaminha a operação ao engine, que executa o comando sobre o storage.
+Para SET e DELETE, o executor verifica o `OperationID`, compara a impressão digital da operação e controla a execução ou a reprodução de resultados. Quando necessário, encaminha a operação ao Engine, que executa o comando sobre o Storage por meio da interface de armazenamento.
 
-PING e GET são encaminhados diretamente ao engine, sem utilização do mecanismo de idempotência.
+PING e GET são encaminhados diretamente ao Engine, sem utilização do mecanismo de idempotência.
+
+O Engine depende da abstração de Storage, não da implementação concreta. Na inicialização, o executável do servidor instancia o módulo `storage/go` e injeta essa implementação no Engine.
+
+Essa separação modular não introduz uma fronteira de processo: a interação entre Engine e Storage permanece local, por chamadas de métodos Go.
 
 A resposta percorre o caminho inverso até o cliente.
 

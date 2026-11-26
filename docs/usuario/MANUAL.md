@@ -37,6 +37,26 @@ Para executar o projeto localmente:
 
 O projeto é organizado em módulos Go independentes. A raiz do repositório contém um workspace Go, mas não é, por si só, um módulo Go. Por isso, os comandos de execução e validação devem ser realizados no módulo correspondente.
 
+### 2.1. Organização dos módulos
+
+O workspace atual contém sete módulos Go independentes:
+
+| Módulo | Diretório | Responsabilidade |
+|---|---|---|
+| API | `api` | Contratos e tipos públicos compartilhados |
+| Driver Go | `drivers/go` | Biblioteca cliente para comunicação com o servidor |
+| Protobuf gerado | `protocol/generated/go` | Tipos Go gerados a partir do contrato Protobuf |
+| Servidor | `server` | Executável, Engine, protocolo interno, codec, handler, idempotência e configuração do servidor |
+| Shared | `shared` | Configurações e definições compartilhadas |
+| Storage | `storage/go` | Implementação independente do armazenamento em memória |
+| Transporte TCP | `transport/tcp/go` | Framing e abstrações de conexão TCP reutilizáveis |
+
+O módulo Storage possui seu próprio `go.mod` e pode ser desenvolvido e testado independentemente como biblioteca Go.
+
+A implementação do Storage, entretanto, não é um serviço ou processo separado. O executável do servidor instancia a implementação concreta e a fornece ao Engine por meio de uma interface definida em `server/internal/engine/storage.go`.
+
+Engine e Storage são executados no mesmo processo, no mesmo espaço de endereçamento e heap, por chamadas locais Go. Não existe comunicação RPC, IPC ou tráfego de rede entre esses componentes.
+
 ## 3. Executar o servidor
 
 ### 3.1. Iniciar
@@ -921,7 +941,7 @@ A implementação atual possui as seguintes limitações:
 - **Sem TLS:** a comunicação não é criptografada.
 - **Sem isolamento por tenant:** clientes da mesma instância compartilham o armazenamento.
 - **Limite de frame:** payload máximo de 1 MiB.
-- **Sem timeout de inatividade independente:** não existe uma configuração específica para inatividade. Entretanto, o timeout de leitura também limita o tempo de espera pelo próximo frame; uma conexão sem novas solicitações poderá ser encerrada quando esse prazo expira
+- **Sem timeout de inatividade independente:** não existe uma configuração específica para inatividade. Entretanto, o timeout de leitura também limita o tempo de espera pelo próximo frame; uma conexão sem novas solicitações poderá ser encerrada quando esse prazo expira.
 - **Sem limite de requisições por conexão:** o limite de conexões TCP não representa uma cota de operações.
 - **Sem controle de taxa:** não existe limitação de requisições por cliente.
 - **Sem multiplexação:** o driver Go executa uma operação por vez em cada conexão.
@@ -1131,7 +1151,7 @@ Esse comando executa o pipeline completo, composto pelas seguintes etapas:
 6. **coverage:** executa os testes e gera relatórios de cobertura.
 7. **uncovered:** identifica arquivos e blocos de código não cobertos pelos testes.
 
-O pipeline percorre os seis módulos Go do workspace e interrompe a execução quando alguma etapa falha.
+O pipeline percorre os **sete módulos Go** do workspace e interrompe a execução quando alguma etapa falha.
 
 ### 14.1. Executar uma etapa específica
 
@@ -1183,7 +1203,9 @@ O detalhamento dos comandos, módulos verificados, critérios de validação e i
 | Configuração do servidor | `server/internal/config/config.go` |
 | Configuração do cliente de demonstração | `api/client/internal/config/config.go` |
 | Engine | `server/internal/engine/engine.go` |
-| Storage | `server/internal/storage/storage.go` |
+| Interface de Storage consumida pelo Engine | `server/internal/engine/storage.go` |
+| Implementação do Storage | `storage/go/storage.go` |
+| Tipo de entrada do Storage | `storage/go/entry.go` |
 | Modelo interno | `server/internal/protocol/message.go` |
 | Codec | `server/internal/codec/codec.go` |
 | Codec Protobuf | `server/internal/codec/protobuf/codec.go` |
@@ -1196,6 +1218,7 @@ O detalhamento dos comandos, módulos verificados, critérios de validação e i
 | Driver Go | `drivers/go/client.go` |
 | OperationID do driver | `drivers/go/operation_id.go` |
 | Testes do driver Go | `drivers/go/client_test.go` |
+| Testes do Storage | `storage/go/storage_test.go` |
 | Cliente de demonstração | `api/client/main.go` |
 | Executável do servidor | `server/cmd/memorydb/main.go` |
 | Workspace Go | `go.work` |

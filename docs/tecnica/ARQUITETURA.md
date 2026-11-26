@@ -16,7 +16,11 @@ A arquitetura separa responsabilidades de:
 - comunicação de aplicações clientes por meio de um driver Go;
 - definição compartilhada de nomes de variáveis de ambiente e valores padrão.
 
-O servidor mantém uma instância de `Engine`, que possui uma instância própria de `Storage`. Essa mesma instância de `Engine` é utilizada pelos handlers das conexões aceitas pelo servidor. Portanto, as conexões atendidas pelo mesmo processo compartilham o mesmo armazenamento.
+O armazenamento é implementado no módulo Go independente `storage/go`. O servidor utiliza esse módulo como biblioteca e injeta sua implementação no Engine por meio de uma interface definida no próprio módulo Server.
+
+Engine e Storage executam no mesmo processo. Não existe um serviço separado de armazenamento, nem comunicação RPC, IPC ou tráfego de rede entre esses componentes. A interação ocorre por chamadas locais de métodos Go, compartilhando o espaço de endereçamento e o heap do processo.
+
+A mesma instância de Engine é utilizada pelos handlers das conexões aceitas pelo servidor. Portanto, as conexões atendidas pelo mesmo processo compartilham o mesmo armazenamento.
 
 O Handler utiliza um Executor de idempotência compartilhado entre as conexões do servidor. Esse componente coordena as operações `SET` e `DELETE`, evitando a execução repetida de uma mesma operação lógica enquanto seu registro permanecer retido na instância do servidor.
 
@@ -30,11 +34,12 @@ A arquitetura descrita neste documento representa a implementação existente, n
 
 ## 2. Organização dos módulos Go
 
-O repositório utiliza seis módulos Go coordenados pelo workspace da raiz (`go.work`).
+O repositório utiliza sete módulos Go coordenados pelo workspace da raiz (`go.work`).
 
 | Módulo | Diretório | Responsabilidade |
 |---|---|---|
-| Servidor | `server/` | Composição do servidor, configuração, execução de comandos, armazenamento, codec e integração TCP |
+| Servidor | `server/` | Composição do servidor, configuração, execução de comandos, interfaces internas, codec e integração TCP |
+| Storage | `storage/go/` | Biblioteca independente de armazenamento chave-valor em memória |
 | Transporte TCP | `transport/tcp/go/` | Framing e abstração reutilizável de conexão TCP |
 | Driver Go | `drivers/go/` | Biblioteca cliente para aplicações Go |
 | Protocolo gerado | `protocol/generated/go/` | Tipos Go gerados a partir do schema Protobuf |
@@ -49,6 +54,8 @@ O driver e o servidor compartilham os módulos de transporte TCP e de tipos Prot
 
 O módulo `shared` centraliza definições utilizadas por mais de um componente. Atualmente, `shared/config` contém nomes de variáveis de ambiente e valores padrão compartilhados. A interpretação e a validação das configurações permanecem sob responsabilidade de cada componente consumidor.
 
+O módulo `storage/go` possui identidade e ciclo de dependências próprios. O servidor depende dele como biblioteca Go, mas a abstração utilizada pelo Engine pertence ao módulo Server.
+
 ### 2.1 Dependências entre módulos
 
 ```mermaid
@@ -61,6 +68,7 @@ flowchart TD
     Server["server"] --> TCP
     Server --> Generated
     Server --> Shared
+    Server --> Storage["storage/go"]
 
     Schema["protocol/proto/memorydb/v1/memorydb.proto"]
     Schema -. geração .-> Generated
@@ -71,6 +79,8 @@ O executável `api/client` carrega as configurações de conexão a partir do am
 O módulo `drivers/go` não depende de `shared/config` para ler variáveis de ambiente. Ele recebe endereço e timeout explicitamente por meio de `DialConfig`.
 
 O servidor utiliza `shared/config` para obter nomes de variáveis e valores padrão compartilhados, enquanto as configurações específicas do servidor são definidas e carregadas em `server/internal/config`.
+
+O servidor utiliza o módulo `storage/go` como implementação concreta de armazenamento. A interface consumida pelo Engine é definida em `server/internal/engine/storage.go`, mantendo o Engine dependente de uma abstração própria, e não dos detalhes internos da implementação de Storage.
 
 O schema `.proto` é a fonte do contrato externo. Os arquivos Go gerados devem ser tratados como artefatos de geração, não como arquivos para edição manual.
 
@@ -96,9 +106,9 @@ As responsabilidades internas do servidor estão distribuídas entre os seguinte
 | `server/internal/codec` | Contrato de codificação e decodificação |
 | `server/internal/codec/protobuf` | Adaptação entre o modelo interno e os tipos Protobuf |
 | `server/internal/protocol` | Modelo interno de solicitações, comandos, respostas e resultados |
-| `server/internal/engine` | Validação e execução dos comandos |
+| `server/internal/engine` | Validação e execução dos comandos e definição da interface de armazenamento |
 | `server/internal/idempotency` | Controle de identificadores de operação, fingerprints, deduplicação, concorrência, replay, capacidade e retenção |
-| `server/internal/storage` | Armazenamento chave-valor em memória |
+| `storage/go` | Implementação independente do armazenamento chave-valor em memória |
 
 ### 3.1 Diagrama de responsabilidades
 
@@ -116,8 +126,12 @@ flowchart TB
         ProtoCodec["codec/protobuf.Codec"]
         Idempotency["idempotency.Executor"]
         Engine["engine.Engine"]
+        StoragePort["engine.Storage (interface)"]
         Model["internal/protocol"]
-        Storage["storage.Storage"]
+    end
+
+    subgraph StorageModule["Módulo storage/go"]
+        StorageImpl["Storage (implementação)"]
     end
 
     TCPModule["Módulo transport/tcp/go"]
@@ -128,6 +142,8 @@ flowchart TB
     Entry --> TCPServer
     Entry --> Handler
     Entry --> Idempotency
+    Entry --> Engine
+    Entry --> StorageImpl
     TCPServer --> Handler
     Handler --> TCPModule
     Handler --> CodecPort
@@ -137,7 +153,8 @@ flowchart TB
     ProtoCodec --> Model
     ProtoCodec --> Generated
     Engine --> Model
-    Engine --> Storage
+    Engine --> StoragePort
+    StorageImpl -. implementa .-> StoragePort
     Idempotency --> Model
 
     Client --> TCPServer
@@ -153,7 +170,13 @@ O pacote `codec.Codec` define um contrato utilizado pelo Handler. A implementaç
 
 O transporte TCP reutilizável não conhece Protobuf, Engine, Storage ou os pacotes internos do servidor.
 
-O `Engine`, por outro lado, depende diretamente de `*storage.Storage`. Não existe atualmente uma interface de armazenamento que permita substituir o backend sem alterar o Engine.
+O Engine depende de uma interface de armazenamento definida em `server/internal/engine/storage.go`. Essa interface descreve as operações de armazenamento necessárias à execução dos comandos, sem exigir dependência direta da implementação concreta do módulo `storage/go`.
+
+A implementação concreta de Storage pertence ao módulo independente `storage/go`. O executável do servidor instancia essa implementação e a injeta no Engine durante a composição das dependências.
+
+Essa organização aplica o princípio de inversão de dependência na fronteira entre Engine e Storage: o consumidor define a abstração de que necessita, e a implementação concreta satisfaz esse contrato.
+
+A separação em módulos não implica separação de processos. O Engine chama os métodos da implementação de Storage diretamente, dentro do mesmo processo Go.
 
 O pacote `server/internal/idempotency` implementa o controle de idempotência das operações `SET` e `DELETE`.
 
@@ -171,8 +194,8 @@ A separação entre esses componentes é importante para compreender o fluxo de 
 
 - **Handler:** interpreta a solicitação interna, encaminha `SET` e `DELETE` ao fluxo de idempotência e executa diretamente no Engine os comandos `PING` e `GET`. Para operações mutáveis, calcula o fingerprint por meio de `idempotency.Fingerprint()` e fornece esse valor ao Executor.
 - **Executor:** valida o identificador da operação, compara fingerprints de operações previamente registradas, coordena operações concorrentes e controla a retenção, a capacidade e a reprodução dos resultados armazenados.
-- **Engine:** valida os comandos de negócio e executa suas operações sobre o Storage. Para operações mutáveis, é invocado pelo callback fornecido pelo Handler ao Executor.
-- **Storage:** mantém os dados chave-valor em memória e protege o acesso concorrente.
+- **Engine:** valida os comandos de negócio e executa suas operações sobre o Storage por meio da interface definida pelo próprio Engine. Para operações mutáveis, é invocado pelo callback fornecido pelo Handler ao Executor.
+- **Storage:** mantém os dados chave-valor em memória e protege o acesso concorrente. Sua implementação concreta é fornecida pelo módulo `storage/go`.
 
 O cálculo do fingerprint é responsabilidade do fluxo de tratamento da solicitação, realizado pelo Handler por meio da função `idempotency.Fingerprint()`. O Executor recebe o fingerprint calculado e o utiliza para identificar repetições ou conflitos.
 
@@ -285,7 +308,7 @@ sequenceDiagram
         alt Operação inédita
             I->>I: Reservar identificador
             I->>E: Executar callback
-            E->>St: Mutação
+            E->>St: Chamada local pela interface Storage
             St-->>E: Resultado
             E-->>I: Response
             I->>I: Armazenar resultado terminal
@@ -301,7 +324,7 @@ sequenceDiagram
         end
     else PING ou GET
         H->>E: Execute(Request)
-        E->>St: Consultar ou executar comando
+        E->>St: Chamada local pela interface Storage
         St-->>E: Resultado
         E-->>H: Response
     end
@@ -352,7 +375,9 @@ O Handler converte os erros do Executor em respostas do protocolo. Outros erros 
 
 ## 6. Armazenamento e ciclo de vida dos dados
 
-O pacote `server/internal/storage` mantém os dados em um mapa indexado por chave (`string`), com valores em `[]byte`.
+O armazenamento é implementado pelo módulo Go independente `storage/go`, cujo módulo é identificado por `github.com/pescador95/memorydb/storage/go`.
+
+A implementação mantém os dados em um mapa indexado por chave (`string`), com valores em `[]byte`.
 
 O acesso concorrente é protegido por `sync.RWMutex`.
 
@@ -365,7 +390,13 @@ O Storage:
 
 A estrutura `Entry` guarda o valor. Não há campo de expiração.
 
-A instância de `Storage` é criada internamente por `engine.New()`. Não existe atualmente um construtor do Engine que receba uma implementação externa de Storage.
+A interface consumida pelo Engine está definida em `server/internal/engine/storage.go`. Ela representa as operações de armazenamento necessárias ao Engine e não pertence ao módulo de implementação Storage.
+
+A implementação concreta é criada durante a composição do servidor, em `server/cmd/memorydb/main.go`, e injetada no Engine. Dessa forma, o Engine não precisa importar diretamente a implementação concreta para executar os comandos.
+
+A extração para um módulo Go independente permite reutilizar e evoluir o Storage separadamente, sem transformá-lo em um serviço de rede.
+
+Engine e Storage permanecem no mesmo processo. As chamadas entre eles são chamadas locais de métodos, sem serialização de mensagens, sockets, RPC ou IPC.
 
 O servidor cria uma instância de Engine durante sua composição e utiliza esse Engine para processar as conexões. Assim, as conexões de um mesmo processo compartilham os dados.
 
@@ -379,6 +410,7 @@ Os registros de idempotência não são armazenados nesse mapa. O Executor mant�
 - Não há replicação.
 - Não há compartilhamento de dados entre processos ou instâncias.
 - TTL positivo não é implementado.
+- Não existe limite global de memória do processo implementado pelo Storage.
 
 ## 7. Driver Go e modelo de comunicação
 
@@ -515,11 +547,14 @@ As variáveis podem ser definidas no ambiente de execução. Quando uma variáve
 | Variável | Padrão | Descrição |
 |---|---:|---|
 | `MEMORYDB_ADDR` | `:6380` | Endereço TCP utilizado pelo listener |
+| `MEMORYDB_READ_TIMEOUT` | `30s` | Timeout de leitura TCP do Handler |
+| `MEMORYDB_WRITE_TIMEOUT` | `10s` | Timeout de escrita TCP do Handler |
+| `MEMORYDB_MAX_CONNECTIONS` | `1024` | Número máximo de conexões TCP simultâneas |
 | `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Tempo máximo aguardado pelo encerramento gracioso |
 | `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência após a conclusão |
 | `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros de idempotência |
 
-As durações utilizam o formato aceito por `time.ParseDuration`, como `5s`, `30s`, `2m` e `24h`. Os valores de duração devem ser positivos. A capacidade deve ser um inteiro positivo.
+As durações utilizam o formato aceito por `time.ParseDuration`, como `5s`, `30s`, `2m` e `24h`. Os valores de duração devem ser positivos. A capacidade e o limite de conexões devem ser inteiros positivos.
 
 A ausência ou o valor vazio de uma variável utiliza o padrão correspondente. Um valor explicitamente informado que não possa ser interpretado ou que não satisfaça as validações resulta em erro de configuração.
 
@@ -530,13 +565,14 @@ O ponto de entrada realiza a composição do servidor:
 1. carrega e valida as configurações operacionais;
 2. cria o listener TCP utilizando o endereço configurado;
 3. instancia o codec Protobuf;
-4. instancia o Engine;
-5. cria uma instância compartilhada do Executor de idempotência, utilizando os parâmetros configurados;
-6. cria o Handler, injetando Engine, Codec e Executor;
-7. cria o servidor;
-8. inicia `Server.Serve()` em uma goroutine;
-9. trata `SIGINT` e `SIGTERM`;
-10. solicita encerramento com o timeout configurado.
+4. instancia a implementação concreta de Storage;
+5. injeta Storage no Engine por meio da interface definida em `server/internal/engine/storage.go`;
+6. cria uma instância compartilhada do Executor de idempotência, utilizando os parâmetros configurados;
+7. cria o Handler, injetando Engine, Codec e Executor, além dos timeouts de leitura e escrita;
+8. cria o servidor com o limite configurado de conexões simultâneas;
+9. inicia `Server.Serve()` em uma goroutine;
+10. trata `SIGINT` e `SIGTERM`;
+11. solicita encerramento com o timeout configurado.
 
 O Executor é criado uma única vez durante a composição do servidor e compartilhado pelos handlers das conexões atendidas pelo mesmo processo.
 
@@ -557,6 +593,29 @@ O encerramento forçado não representa cancelamento genérico de qualquer opera
 
 O timeout de shutdown é configurado por `MEMORYDB_SHUTDOWN_TIMEOUT`, cujo valor padrão é `10s`.
 
+### 8.2. Limite de conexões simultâneas
+
+O servidor mantém o controle das conexões TCP ativas e admite no máximo a quantidade configurada em `MEMORYDB_MAX_CONNECTIONS`.
+
+O valor padrão é de 1024 conexões simultâneas.
+
+Quando o limite é atingido, novas conexões não são admitidas para processamento. O limite se refere a conexões TCP aceitas pelo servidor, não à quantidade de operações em andamento, nem à quantidade de solicitações que podem ser multiplexadas em uma conexão.
+
+O limite não representa um teto de memória do processo. Cada conexão e seus recursos associados continuam contribuindo para o consumo total de memória.
+
+### 8.3. Timeouts de leitura e escrita
+
+O Handler aplica deadlines de leitura e escrita às operações TCP.
+
+Os valores padrão são:
+
+- leitura: `30s`;
+- escrita: `10s`.
+
+Os valores são configuráveis por `MEMORYDB_READ_TIMEOUT` e `MEMORYDB_WRITE_TIMEOUT`, respectivamente.
+
+Esses timeouts limitam a duração das operações de I/O correspondentes. Não constituem um timeout global de execução de comandos, nem um limite de duração de todas as operações internas do servidor.
+
 ## 9. Limites arquiteturais atuais
 
 | Área | Estado atual |
@@ -575,6 +634,7 @@ O timeout de shutdown é configurado por `MEMORYDB_SHUTDOWN_TIMEOUT`, cujo valor
 | Limite de conexões TCP simultâneas | Implementado e configurável; padrão de 1024 conexões |
 | Timeouts de leitura e escrita TCP no servidor | Implementados e configuráveis; padrões de 30s e 10s, respectivamente |
 | Shutdown gracioso e forçado | Implementado; aguarda conexões ativas e força o fechamento quando o prazo expira |
+| Limite global de memória | Não implementado |
 | Observabilidade estruturada por conexão | Não implementada no fluxo atual |
 
 ### 9.1 Idempotência e deduplicação

@@ -33,7 +33,7 @@ A etapa `format` percorre os arquivos Go do repositório, enquanto as etapas que
 
 ## 3. Organização dos módulos
 
-As verificações são executadas nos seguintes módulos:
+As verificações são executadas nos seguintes sete módulos:
 
 | Módulo | Diretório |
 |---|---|
@@ -43,6 +43,9 @@ As verificações são executadas nos seguintes módulos:
 | Servidor | `server/` |
 | Componentes compartilhados | `shared/` |
 | Transporte TCP Go | `transport/tcp/go/` |
+| Storage | `storage/go/` |
+
+O módulo Storage possui seu próprio `go.mod` e é validado independentemente do módulo Server. Sua extração para um módulo Go independente não altera o fato de que, na execução do servidor, Storage é utilizado como biblioteca no mesmo processo.
 
 O schema Protocol Buffers utilizado pelo projeto está localizado em:
 
@@ -228,6 +231,7 @@ Cada módulo possui um arquivo de cobertura próprio:
 | `server` | `coverage/server.out` |
 | `shared` | `coverage/shared.out` |
 | `transport/tcp/go` | `coverage/transport_tcp_go.out` |
+| `storage/go` | `coverage/storage_go.out` |
 
 O nome dos arquivos substitui as barras dos caminhos dos módulos por sublinhados.
 
@@ -243,6 +247,7 @@ São gerados os seguintes relatórios:
 | `server` | `coverage/server.html` |
 | `shared` | `coverage/shared.html` |
 | `transport/tcp/go` | `coverage/transport_tcp_go.html` |
+| `storage/go` | `coverage/storage_go.html` |
 
 Também é gerado:
 
@@ -288,7 +293,7 @@ Os resultados são apresentados no terminal, sem gerar um relatório adicional p
 
 A análise considera como não cobertos os blocos cujo contador de execução é zero. Para arquivos parcialmente cobertos, são apresentados os intervalos de linhas correspondentes aos blocos não executados.
 
-**Dependência:** a etapa exige que os seis perfis de cobertura estejam presentes em `coverage/`. Caso o diretório ou algum perfil não exista, a execução é interrompida e o script orienta a executar:
+**Dependência:** a etapa exige que os sete perfis de cobertura estejam presentes em `coverage/`. Caso o diretório ou algum perfil não exista, a execução é interrompida e o script orienta a executar:
 
 ```bash
 ./scripts/test.sh coverage
@@ -346,6 +351,8 @@ coverage/
 ├── shared.html
 ├── transport_tcp_go.out
 ├── transport_tcp_go.html
+├── storage_go.out
+├── storage_go.html
 └── index.html
 ```
 
