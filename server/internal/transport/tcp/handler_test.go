@@ -11,6 +11,7 @@ import (
 	"github.com/pescador95/memorydb/server/internal/engine"
 	"github.com/pescador95/memorydb/server/internal/idempotency"
 	"github.com/pescador95/memorydb/server/internal/protocol"
+	memorystorage "github.com/pescador95/memorydb/storage/go"
 	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
 
@@ -18,6 +19,10 @@ type handlerTestCodec struct {
 	request           *protocol.Request
 	decodeRequestErr  error
 	encodeResponseErr error
+}
+
+func newTestEngine() *engine.Engine {
+	return engine.New(memorystorage.New())
 }
 
 func (c *handlerTestCodec) EncodeRequest(*protocol.Request) ([]byte, error) {
@@ -61,7 +66,7 @@ func TestHandlerProcessesMultipleRequests(t *testing.T) {
 		t.Fatalf("NewExecutor() error = %v", err)
 	}
 
-	handler, err := NewHandler(engine.New(), messageCodec, executor)
+	handler, err := NewHandler(newTestEngine(), messageCodec, executor)
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
@@ -202,11 +207,11 @@ func TestNewHandlerRejectsNilDependencies(t *testing.T) {
 		t.Error("expected error for nil engine")
 	}
 
-	if _, err := NewHandler(engine.New(), nil, executor); err == nil {
+	if _, err := NewHandler(newTestEngine(), nil, executor); err == nil {
 		t.Error("expected error for nil codec")
 	}
 
-	if _, err := NewHandler(engine.New(), messageCodec, nil); err == nil {
+	if _, err := NewHandler(newTestEngine(), messageCodec, nil); err == nil {
 		t.Error("expected error for nil idempotency executor")
 	}
 }
@@ -217,7 +222,7 @@ func TestHandlerExecutesIdempotentSet(t *testing.T) {
 		t.Fatalf("NewExecutor() error = %v", err)
 	}
 
-	handler, err := NewHandler(engine.New(), protobuf.New(), executor)
+	handler, err := NewHandler(newTestEngine(), protobuf.New(), executor)
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
@@ -340,7 +345,7 @@ func TestHandlerExecutesIdempotentSet(t *testing.T) {
 }
 
 func TestHandlerExecutesIdempotentDelete(t *testing.T) {
-	commandEngine := engine.New()
+	commandEngine := newTestEngine()
 
 	executor, err := idempotency.NewExecutor(&idempotency.Config{})
 	if err != nil {
@@ -459,7 +464,7 @@ func TestHandlerRejectsInvalidOperationID(t *testing.T) {
 		t.Fatalf("NewExecutor() error = %v", err)
 	}
 
-	handler, err := NewHandler(engine.New(), protobuf.New(), executor)
+	handler, err := NewHandler(newTestEngine(), protobuf.New(), executor)
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
@@ -550,7 +555,7 @@ func TestHandlerRejectsOperationWhenCapacityReached(t *testing.T) {
 		t.Fatalf("NewExecutor() error = %v", err)
 	}
 
-	handler, err := NewHandler(engine.New(), protobuf.New(), executor)
+	handler, err := NewHandler(newTestEngine(), protobuf.New(), executor)
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
@@ -653,7 +658,7 @@ func TestHandlerRejectsNilRequest(t *testing.T) {
 		t.Fatalf("NewExecutor() error = %v", err)
 	}
 
-	handler, err := NewHandler(engine.New(), protobuf.New(), executor)
+	handler, err := NewHandler(newTestEngine(), protobuf.New(), executor)
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
@@ -732,7 +737,7 @@ func TestHandlerRejectsNilRequest(t *testing.T) {
 
 func TestHandlerRejectsNilConnection(t *testing.T) {
 	handler, err := NewHandler(
-		engine.New(),
+		newTestEngine(),
 		protobuf.New(),
 		newTestIdempotencyExecutor(t),
 	)
@@ -753,7 +758,7 @@ func TestHandlerRejectsNilConnection(t *testing.T) {
 
 func TestHandlerReturnsReadFrameError(t *testing.T) {
 	handler, err := NewHandler(
-		engine.New(),
+		newTestEngine(),
 		protobuf.New(),
 		newTestIdempotencyExecutor(t),
 	)
@@ -787,7 +792,7 @@ func TestHandlerReturnsDecodeRequestError(t *testing.T) {
 	decodeErr := errors.New("decode failure")
 
 	handler, err := NewHandler(
-		engine.New(),
+		newTestEngine(),
 		&handlerTestCodec{
 			decodeRequestErr: decodeErr,
 		},
@@ -820,7 +825,7 @@ func TestHandlerReturnsEncodeResponseError(t *testing.T) {
 	encodeErr := errors.New("encode failure")
 
 	handler, err := NewHandler(
-		engine.New(),
+		newTestEngine(),
 		&handlerTestCodec{
 			request: &protocol.Request{
 				RequestID: 1,
@@ -855,7 +860,7 @@ func TestHandlerReturnsEncodeResponseError(t *testing.T) {
 
 func TestHandlerReturnsWriteFrameError(t *testing.T) {
 	handler, err := NewHandler(
-		engine.New(),
+		newTestEngine(),
 		&handlerTestCodec{
 			request: &protocol.Request{
 				RequestID: 1,
@@ -893,7 +898,7 @@ func TestHandlerReturnsWriteFrameError(t *testing.T) {
 
 func TestHandlerReadTimeout(t *testing.T) {
 	handler, err := NewHandlerWithConfig(
-		engine.New(),
+		newTestEngine(),
 		protobuf.New(),
 		newTestIdempotencyExecutor(t),
 		HandlerConfig{
@@ -932,7 +937,7 @@ func TestHandlerReadTimeout(t *testing.T) {
 
 func TestHandlerWriteTimeout(t *testing.T) {
 	handler, err := NewHandlerWithConfig(
-		engine.New(),
+		newTestEngine(),
 		&handlerTestCodec{
 			request: &protocol.Request{
 				RequestID: 1,
@@ -1017,7 +1022,7 @@ func TestNewHandlerWithConfigRejectsInvalidTimeouts(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := NewHandlerWithConfig(
-				engine.New(),
+				newTestEngine(),
 				protobuf.New(),
 				newTestIdempotencyExecutor(t),
 				tt.config,

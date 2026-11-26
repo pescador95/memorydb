@@ -14,6 +14,7 @@ import (
 	"github.com/pescador95/memorydb/server/internal/engine"
 	"github.com/pescador95/memorydb/server/internal/idempotency"
 	"github.com/pescador95/memorydb/server/internal/transport/tcp"
+	memorystorage "github.com/pescador95/memorydb/storage/go"
 )
 
 // main inicia a aplicação MemoryDB.
@@ -53,7 +54,7 @@ func runWith(
 	defer listener.Close()
 
 	messageCodec := protobuf.New()
-	commandEngine := engine.New()
+	commandEngine := engine.New(memorystorage.New())
 
 	executor, err := idempotency.NewExecutor(&config.Idempotency)
 	if err != nil {

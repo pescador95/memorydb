@@ -15,6 +15,7 @@ import (
 	"github.com/pescador95/memorydb/server/internal/idempotency"
 	"github.com/pescador95/memorydb/server/internal/protocol"
 	sharedconfig "github.com/pescador95/memorydb/shared/config"
+	memorystorage "github.com/pescador95/memorydb/storage/go"
 	transporttcp "github.com/pescador95/memorydb/transport/tcp/go"
 )
 
@@ -98,7 +99,7 @@ func newTestServerWithConstructor(
 		t.Fatalf("NewExecutor() error = %v", err)
 	}
 
-	handler, err := NewHandler(engine.New(), protobuf.New(), executor)
+	handler, err := NewHandler(engine.New(memorystorage.New()), protobuf.New(), executor)
 	if err != nil {
 		_ = listener.Close()
 		t.Fatalf("NewHandler() error = %v", err)

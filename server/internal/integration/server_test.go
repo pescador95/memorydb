@@ -14,6 +14,7 @@ import (
 	"github.com/pescador95/memorydb/server/internal/engine"
 	"github.com/pescador95/memorydb/server/internal/idempotency"
 	servertcp "github.com/pescador95/memorydb/server/internal/transport/tcp"
+	memorystorage "github.com/pescador95/memorydb/storage/go"
 )
 
 const shutdownTimeout = 5 * time.Second
@@ -34,7 +35,7 @@ func startTestServer(t *testing.T) *testServer {
 
 	messageCodec := protobuf.New()
 
-	commandEngine := engine.New()
+	commandEngine := engine.New(memorystorage.New())
 
 	executor, err := idempotency.NewExecutor(&idempotency.Config{})
 	if err != nil {

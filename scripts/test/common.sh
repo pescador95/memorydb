@@ -13,6 +13,7 @@ MODULES=(
     "server"
     "shared"
     "transport/tcp/go"
+    "storage/go"
 )
 
 require_go() {

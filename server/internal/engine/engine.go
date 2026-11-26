@@ -2,19 +2,11 @@ package engine
 
 import (
 	"github.com/pescador95/memorydb/server/internal/protocol"
-	"github.com/pescador95/memorydb/server/internal/storage"
 )
 
 // Engine executa comandos utilizando o mecanismo de armazenamento.
 type Engine struct {
-	storage *storage.Storage
-}
-
-// New cria uma instância do mecanismo de execução.
-func New() *Engine {
-	return &Engine{
-		storage: storage.New(),
-	}
+	storage Storage
 }
 
 // Execute valida e executa um comando, produzindo uma resposta interna.

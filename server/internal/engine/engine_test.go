@@ -4,10 +4,15 @@ import (
 	"testing"
 
 	"github.com/pescador95/memorydb/server/internal/protocol"
+	memorystorage "github.com/pescador95/memorydb/storage/go"
 )
 
+func newTestEngine() *Engine {
+	return New(memorystorage.New())
+}
+
 func TestPing(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	response := engine.Execute(&protocol.Request{
 		RequestID: 1,
@@ -28,7 +33,7 @@ func TestPing(t *testing.T) {
 }
 
 func TestSetAndGet(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	setResponse := engine.Execute(&protocol.Request{
 		RequestID: 2,
@@ -64,7 +69,7 @@ func TestSetAndGet(t *testing.T) {
 }
 
 func TestGetMissingKey(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	response := engine.Execute(&protocol.Request{
 		Command: &protocol.GetCommand{
@@ -83,7 +88,7 @@ func TestGetMissingKey(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	engine.Execute(&protocol.Request{
 		Command: &protocol.SetCommand{
@@ -109,7 +114,7 @@ func TestDelete(t *testing.T) {
 }
 
 func TestRejectsEmptyKey(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	response := engine.Execute(&protocol.Request{
 		RequestID: 10,
@@ -131,7 +136,7 @@ func TestRejectsEmptyKey(t *testing.T) {
 }
 
 func TestRejectsUnsupportedTTL(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	response := engine.Execute(&protocol.Request{
 		Command: &protocol.SetCommand{
@@ -156,7 +161,7 @@ func TestRejectsUnsupportedTTL(t *testing.T) {
 }
 
 func TestRejectsNilRequest(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	response := engine.Execute(nil)
 
@@ -175,7 +180,7 @@ func TestRejectsNilRequest(t *testing.T) {
 }
 
 func TestRejectsMissingCommand(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	response := engine.Execute(&protocol.Request{
 		RequestID: 20,
@@ -196,7 +201,7 @@ func TestRejectsMissingCommand(t *testing.T) {
 }
 
 func TestRejectsNilCommands(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	tests := []struct {
 		name    string
@@ -248,7 +253,7 @@ func TestRejectsNilCommands(t *testing.T) {
 }
 
 func TestRejectsEmptyKeyForGetAndDelete(t *testing.T) {
-	engine := New()
+	engine := newTestEngine()
 
 	tests := []struct {
 		name    string

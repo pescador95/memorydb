@@ -6,6 +6,7 @@ use (
 	./protocol/generated/go
 	./server
 	./shared
+	./storage/go
 	./transport/tcp/go
 )
 
@@ -14,3 +15,5 @@ replace github.com/pescador95/memorydb/drivers/go v0.1.0 => ./drivers/go
 replace github.com/pescador95/memorydb/protocol/generated/go v0.1.0 => ./protocol/generated/go
 
 replace github.com/pescador95/memorydb/transport/tcp/go v0.1.0 => ./transport/tcp/go
+
+replace github.com/pescador95/memorydb/storage/go v0.1.0 => ./storage/go
