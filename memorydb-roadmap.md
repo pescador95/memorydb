@@ -132,126 +132,97 @@ O driver Java permanece como uma implementação futura, devendo consumir o mesm
 
 ## 5. Estrutura atual do repositório
 
-A estrutura abaixo representa a organização dos principais componentes do projeto. Novos arquivos de implementação, testes e documentação podem ser adicionados sem alterar essa organização conceitual.
+A estrutura abaixo representa os principais diretórios e arquivos da versão revisada. Os testes seguem ao lado dos pacotes de implementação; a listagem omite arquivos auxiliares de teste para manter o diagrama legível.
 
 ```text
 memorydb/
-├── .github/
-│   ├── copilot_instructions.md
-│   └── documentation.md
-│
 ├── api/
 │   ├── go.mod
 │   └── client/
-│       └── main.go
-│
+│       ├── main.go
+│       └── internal/config/
 ├── docs/
 │   ├── README.md
-│   ├── requisitos/
-│   │   └── REQUISITOS.md
+│   ├── requisitos/REQUISITOS.md
 │   ├── tecnica/
 │   │   ├── ARQUITETURA.md
 │   │   ├── COMPONENTES.md
+│   │   ├── RECURSOS.md
 │   │   └── TESTES.md
-│   └── usuario/
-│       └── MANUAL.md
-│
+│   └── usuario/MANUAL.md
 ├── drivers/
 │   ├── go/
-│   │   ├── client.go
-│   │   ├── client_test.go
-│   │   ├── operation_id.go
 │   │   ├── go.mod
-│   │   └── go.sum
+│   │   ├── client.go
+│   │   ├── config.go
+│   │   └── operation_id.go
 │   └── java/
-│
 ├── protocol/
-│   ├── docs/
-│   ├── generated/
-│   │   └── go/
-│   │       ├── go.mod
-│   │       └── memorydb/v1/
-│   │           └── memorydb.pb.go
-│   ├── proto/
-│   │   └── memorydb/v1/
-│   │       └── memorydb.proto
-│   └── scripts/
-│
+│   ├── generated/go/
+│   │   ├── go.mod
+│   │   └── memorydb/v1/memorydb.pb.go
+│   ├── proto/memorydb/v1/memorydb.proto
+│   └── docs/
 ├── scripts/
-│   ├── go.sh
-│   ├── java.sh
-│   └── test/
-│       ├── common.sh
-│       ├── format.sh
-│       ├── vet.sh
-│       ├── unit.sh
-│       ├── race.sh
-│       ├── build.sh
-│       ├── coverage.sh
-│       └── uncovered.sh
-│
+│   ├── generation/
+│   │   ├── go.sh
+│   │   └── java.sh
+│   ├── test/
+│   │   ├── common.sh
+│   │   ├── format.sh
+│   │   ├── vet.sh
+│   │   ├── unit.sh
+│   │   ├── race.sh
+│   │   ├── build.sh
+│   │   ├── coverage.sh
+│   │   └── uncovered.sh
+│   └── test.sh
 ├── server/
 │   ├── go.mod
-│   ├── go.sum
-│   ├── cmd/
-│   │   └── memorydb/
-│   │       └── main.go
+│   ├── cmd/memorydb/
+│   │   ├── main.go
+│   │   └── resource_validation.go
+│   ├── resources/
+│   │   ├── calculator.go
+│   │   ├── cgroup_linux.go
+│   │   ├── detector_linux.go
+│   │   ├── detector_linux_memory.go
+│   │   ├── detector_windows.go
+│   │   ├── env.go
+│   │   ├── loader.go
+│   │   ├── profile.go
+│   │   └── validator.go
 │   └── internal/
 │       ├── codec/
-│       │   ├── codec.go
-│       │   └── protobuf/
-│       │       ├── codec.go
-│       │       └── codec_test.go
 │       ├── config/
-│       │   ├── config.go
-│       │   └── config_test.go
 │       ├── engine/
-│       │   ├── command.go
-│       │   ├── engine.go
-│       │   ├── storage.go
-│       │   └── engine_test.go
 │       ├── idempotency/
-│       │   ├── executor.go
-│       │   ├── executor_test.go
-│       │   ├── fingerprint.go
-│       │   └── fingerprint_test.go
 │       ├── integration/
-│       │   └── server_test.go
 │       ├── protocol/
-│       │   └── message.go
-│       └── transport/
-│           └── tcp/
-│               ├── communication_test.go
-│               ├── handler.go
-│               ├── handler_test.go
-│               ├── server.go
-│               └── server_test.go
-│
+│       └── transport/tcp/
 ├── shared/
+│   ├── go.mod
 │   └── config/
-│       └── defaults.go
-│
-├── storage/
-│   └── go/
-│       ├── go.mod
-│       ├── entry.go
-│       ├── storage.go
-│       └── storage_test.go
-│
-├── transport/
-│   └── tcp/
-│       └── go/
-│           ├── go.mod
-│           ├── connection.go
-│           ├── framing.go
-│           └── framing_test.go
-│
-├── go.work
+├── storage/go/
+│   ├── go.mod
+│   ├── entry.go
+│   └── storage.go
+├── transport/tcp/go/
+│   ├── go.mod
+│   ├── connection.go
+│   └── framing.go
+├── .gitattributes
 ├── .gitignore
+├── go.work
+├── go.work.sum
 └── memorydb-roadmap.md
 ```
 
-O diretório `server/internal/storage` não faz mais parte da estrutura atual. A implementação concreta foi extraída para `storage/go`, enquanto a interface consumida pela Engine permanece em `server/internal/engine/storage.go`.
+`server/resources` é um pacote Go público dentro do módulo `server`; não é um módulo Go adicional. O pacote oferece API de detecção, cálculo e validação de recursos.
+
+O diretório `server/internal/resources` não faz parte da estrutura atual. A implementação pública está em `server/resources`.
+
+O Storage continua no módulo independente `storage/go`, enquanto sua interface consumidora permanece em `server/internal/engine/storage.go`. Ambos são executados no mesmo processo do servidor.
 
 ## 6. Organização dos módulos Go
 
@@ -575,6 +546,30 @@ As validações reportadas concluíram sem falhas.
 
 A validação completa e as validações direcionadas devem ser interpretadas conforme seus respectivos escopos. Os testes direcionados não substituem uma nova execução integral de todos os módulos.
 
+**Validação integral de recursos — 27/11/2026**
+
+Após a implementação do pacote público `server/resources`, foi executado no WSL Ubuntu:
+
+```bash
+./scripts/test.sh
+```
+
+As etapas `format`, `vet`, `unit`, `race`, `build`, `coverage` e `uncovered` concluíram com sucesso.
+
+Cobertura observada:
+
+| Módulo | Cobertura |
+|---|---:|
+| `api` | 97,6% |
+| `drivers/go` | 95,3% |
+| `protocol/generated/go` | 0,0% (código gerado sem testes próprios) |
+| `server` | 95,1% |
+| `shared` | 100,0% |
+| `transport/tcp/go` | 98,3% |
+| `storage/go` | 98,2% |
+
+O pacote `server/resources` apresentou 96,3% de cobertura. Essa execução valida o caminho Linux; os testes com build tag Windows precisam de execução específica em Windows.
+
 **Validação da extração do Storage — 25/11/2026**
 
 A extração do armazenamento para módulo independente foi integrada ao workspace no commit `6a8d8a3`.
@@ -594,14 +589,15 @@ A extração preserva a execução local da implementação de Storage dentro do
 
 ### Fase 9 — Consolidação da arquitetura e documentação
 
-**Status: concluída em 25/11/2026**
+**Status: concluída em 25/11/2026 e complementada em 27/11/2026**
 
-A documentação foi revisada e atualizada após a extração do Storage para módulo Go independente, mantendo a distinção entre independência de módulo e isolamento de processo.
+A documentação foi revisada e atualizada após a extração do Storage para módulo Go independente, mantendo a distinção entre independência de módulo e isolamento de processo. Em 27/11/2026, foi complementada para descrever os perfis de recursos, a detecção por sistema operacional, os orçamentos lógicos, os limites efetivamente aplicados e as limitações ainda existentes.
 
 **Concluído**
 
 - [x] Revisar a documentação de arquitetura em relação à implementação atual.
 - [x] Revisar a documentação dos componentes.
+- [x] Documentar os perfis, a detecção, os orçamentos e a API pública de recursos em `docs/tecnica/RECURSOS.md`.
 - [x] Atualizar os requisitos funcionais e não funcionais.
 - [x] Documentar o contrato de framing TCP.
 - [x] Documentar o fluxo de comunicação entre driver e servidor.
@@ -697,6 +693,13 @@ Permanecem pendentes observabilidade, melhorias operacionais adicionais, experi�
 - [x] Aguardar o encerramento dos handlers após o fechamento das conexões.
 - [x] Implementar testes de limites de conexões e encerramento do servidor.
 - [x] Implementar testes de timeout de leitura e escrita.
+- [x] Implementar perfis de recursos `low`, `mid`, `high`, `auto` e `custom`.
+- [x] Implementar detecção de CPU e memória no Linux, incluindo cgroups v1/v2 e limites herdados.
+- [x] Implementar detecção de CPU e memória disponíveis no host Windows.
+- [x] Implementar limites lógicos para Storage, Idempotência e Processamento.
+- [x] Implementar limites de requisições em processamento e payload máximo de frame.
+- [x] Expor configuração de recursos por variáveis de ambiente e API Go pública.
+- [x] Validar a soma dos orçamentos e a compatibilidade com os recursos detectados.
 
 **Pendências**
 
@@ -704,8 +707,6 @@ Permanecem pendentes observabilidade, melhorias operacionais adicionais, experi�
 - [ ] Melhorar a observabilidade de erros de processamento no servidor.
 - [ ] Revisar e evoluir mensagens e códigos de erro conforme novos requisitos.
 - [ ] Avaliar a necessidade de timeout global para operações no servidor.
-- [ ] Avaliar limites de tamanho de chave e valor.
-- [ ] Avaliar limites adicionais de recursos por conexão.
 - [ ] Avaliar proteção contra clientes que mantêm conexões abertas sem enviar requisições completas, considerando os limites já impostos pelo timeout de leitura.
 - [ ] Criar testes adicionais de falhas de rede e encerramento inesperado.
 
@@ -714,13 +715,11 @@ Permanecem pendentes observabilidade, melhorias operacionais adicionais, experi�
 | Configuração | Variável de ambiente | Valor padrão |
 |---|---|---|
 | Endereço de escuta | `MEMORYDB_ADDR` | `:6380` |
-| Timeout de conexão do cliente | `MEMORYDB_DIAL_TIMEOUT` | 5 segundos |
 | Timeout de leitura TCP | `MEMORYDB_READ_TIMEOUT` | 30 segundos |
 | Timeout de escrita TCP | `MEMORYDB_WRITE_TIMEOUT` | 10 segundos |
-| Limite de conexões simultâneas | `MEMORYDB_MAX_CONNECTIONS` | 1024 |
 | Timeout de shutdown | `MEMORYDB_SHUTDOWN_TIMEOUT` | 10 segundos |
 
-O timeout de conexão (`MEMORYDB_DIAL_TIMEOUT`) pertence à configuração do cliente. Os demais parâmetros da tabela são configurações operacionais do servidor, com exceção do endereço de escuta, que determina onde o servidor aceita conexões.
+O timeout de conexão (`MEMORYDB_DIAL_TIMEOUT`) pertence à configuração do cliente. Os parâmetros da tabela são configurações operacionais do servidor. Os limites de conexões, requisições, frames, Storage e idempotência pertencem ao dimensionamento de recursos e são detalhados em `docs/tecnica/RECURSOS.md`.
 
 A implementação atual oferece controle básico de recursos e tempo de I/O no servidor. Os timeouts de leitura e escrita são aplicados individualmente às operações de I/O TCP, não representando um prazo global de execução de uma operação de negócio.
 
@@ -731,6 +730,41 @@ O limite de conexões representa o número máximo de conexões TCP simultâneas
 O fechamento forçado durante o shutdown interrompe operações de I/O TCP por meio do fechamento das conexões. Não representa cancelamento genérico de qualquer operação interna que possa ser executada futuramente pelo Handler.
 
 A evolução operacional deverá priorizar previsibilidade, controle de recursos e capacidade de diagnosticar falhas sem introduzir complexidade desnecessária no núcleo do banco.
+
+#### 12.1.1. Dimensionamento e detecção de recursos
+
+**Status: implementação concluída; validação integral Linux registrada em 27/11/2026.**
+
+O pacote público `server/resources` calcula a configuração de recursos no startup e distribui os limites entre os componentes. Ele pertence ao módulo `server`, não constitui um módulo Go separado e não introduz dependências de detecção de hardware nas camadas internas.
+
+**Perfis implementados**
+
+- `low`, `mid` e `high`: presets determinísticos;
+- `auto`: utiliza capacidade detectada;
+- `custom`: recebe CPU e orçamento de memória explicitamente, respeitando os limites detectados.
+
+**Detecção implementada**
+
+- Linux: `runtime.NumCPU`, `MemAvailable` e limites cgroup v1/v2, incluindo hierarquia de ancestrais;
+- Windows: `runtime.NumCPU` e `GlobalMemoryStatusEx`, sem consulta a Windows Job Objects;
+- demais plataformas: erro de plataforma não suportada.
+
+São descontadas margens de segurança de 10% para CPU e 20% para memória.
+
+**Distribuição do orçamento de memória**
+
+| Componente | Percentual |
+|---|---:|
+| Storage | 55% |
+| Idempotência | 15% |
+| Processamento | 15% |
+| Runtime | 15% |
+
+Os limites lógicos de Storage, Idempotência e Processamento são aplicados pelos componentes. A parcela Runtime ainda não é aplicada por `GOMEMLIMIT`; o orçamento total não é limite rígido de heap/RSS. A capacidade de CPU também não altera `GOMAXPROCS` nem aplica uma quota do sistema operacional.
+
+A configuração é calculada uma vez no startup. Não há redimensionamento dinâmico.
+
+A documentação detalhada está em `docs/tecnica/RECURSOS.md`.
 
 #### 12.2. Confiabilidade e idempotência
 
@@ -749,13 +783,13 @@ O mecanismo protege as operações mutáveis `SET` e `DELETE`, permitindo que um
 | Comandos protegidos | `SET` e `DELETE` |
 | Escopo | Global, dentro de uma instância do servidor |
 | Retenção | 24 horas após a conclusão da operação |
-| Capacidade padrão | 100.000 registros |
+| Capacidade no perfil `mid` | 100.000 registros |
 | Armazenamento | Exclusivamente em memória |
 | Evicção antecipada | Não permitida para registros válidos |
 | Identificador ausente ou inválido | Rejeição de `SET` e `DELETE` |
 | Persistência entre reinicializações | Não garantida |
 
-A capacidade é definida na configuração do Executor de idempotência. A exposição dessa configuração como parâmetro operacional do servidor deverá ser tratada separadamente, caso seja necessária.
+A capacidade, o orçamento lógico e a retenção são configuráveis no startup por meio de `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES`, `MEMORYDB_IDEMPOTENCY_MEMORY_BUDGET` e `MEMORYDB_IDEMPOTENCY_RETENTION`. `MEMORYDB_IDEMPOTENCY_CAPACITY` permanece como alias legado para o limite de entradas.
 
 ##### Identificação e fingerprint
 
@@ -970,7 +1004,7 @@ O projeto pode avançar para as próximas evoluções sem depender de novas func
 | 9 | Consolidação e documentação | Concluída |
 | 10 | Driver Java | Planejada |
 | 11 | TTL | Planejada |
-| 12 | Robustez, confiabilidade e utilização | Parcialmente concluída |
+| 12 | Robustez, confiabilidade e utilização | Parcialmente concluída; dimensionamento de recursos concluído |
 | 13 | Segurança | Planejada |
 | 14 | Protocolos alternativos | Planejada |
 | 15 | Persistência | Futura |

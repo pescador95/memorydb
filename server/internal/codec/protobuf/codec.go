@@ -46,7 +46,9 @@ func (c *Codec) EncodeRequest(request *protocol.Request) ([]byte, error) {
 		}
 	case *protocol.GetCommand:
 		message.Command = &memorydbpb.Request_Get{
-			Get: &memorydbpb.GetCommand{Key: command.Key},
+			Get: &memorydbpb.GetCommand{
+				Key: command.Key,
+			},
 		}
 	case *protocol.DeleteCommand:
 		message.Command = &memorydbpb.Request_Delete{
@@ -68,10 +70,13 @@ func (c *Codec) EncodeRequest(request *protocol.Request) ([]byte, error) {
 }
 
 // DecodeRequest converte bytes Protobuf para uma solicitação interna.
+// Campos desconhecidos são descartados porque não fazem parte do protocolo interno.
 func (c *Codec) DecodeRequest(data []byte) (*protocol.Request, error) {
 	message := &memorydbpb.Request{}
 
-	if err := proto.Unmarshal(data, message); err != nil {
+	if err := (proto.UnmarshalOptions{
+		DiscardUnknown: true,
+	}).Unmarshal(data, message); err != nil {
 		return nil, fmt.Errorf("decode request: %w", err)
 	}
 
@@ -158,10 +163,13 @@ func (c *Codec) EncodeResponse(response *protocol.Response) ([]byte, error) {
 }
 
 // DecodeResponse converte bytes Protobuf para uma resposta interna.
+// Campos desconhecidos são descartados porque não fazem parte do protocolo interno.
 func (c *Codec) DecodeResponse(data []byte) (*protocol.Response, error) {
 	message := &memorydbpb.Response{}
 
-	if err := proto.Unmarshal(data, message); err != nil {
+	if err := (proto.UnmarshalOptions{
+		DiscardUnknown: true,
+	}).Unmarshal(data, message); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 

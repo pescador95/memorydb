@@ -9,9 +9,14 @@ import (
 func TestSetAndGet(t *testing.T) {
 	storage := New()
 
-	storage.Set("name", []byte("memorydb"))
+	if err := storage.Set("name", []byte("memorydb")); err != nil {
+		t.Fatal(err)
+	}
 
-	value, found := storage.Get("name")
+	value, found, err := storage.Get("name")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !found {
 		t.Fatal("expected key to exist")
@@ -25,7 +30,10 @@ func TestSetAndGet(t *testing.T) {
 func TestGetMissingKey(t *testing.T) {
 	storage := New()
 
-	_, found := storage.Get("missing")
+	_, found, err := storage.Get("missing")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if found {
 		t.Fatal("expected key not to exist")
@@ -35,10 +43,17 @@ func TestGetMissingKey(t *testing.T) {
 func TestSetOverwritesExistingValue(t *testing.T) {
 	storage := New()
 
-	storage.Set("name", []byte("old"))
-	storage.Set("name", []byte("new"))
+	if err := storage.Set("name", []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.Set("name", []byte("new")); err != nil {
+		t.Fatal(err)
+	}
 
-	value, found := storage.Get("name")
+	value, found, err := storage.Get("name")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !found {
 		t.Fatal("expected key to exist")
@@ -52,13 +67,23 @@ func TestSetOverwritesExistingValue(t *testing.T) {
 func TestDelete(t *testing.T) {
 	storage := New()
 
-	storage.Set("name", []byte("memorydb"))
+	if err := storage.Set("name", []byte("memorydb")); err != nil {
+		t.Fatal(err)
+	}
 
-	if !storage.Delete("name") {
+	deleted, err := storage.Delete("name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deleted {
 		t.Fatal("expected delete to return true")
 	}
 
-	if storage.Delete("name") {
+	deleted, err = storage.Delete("name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted {
 		t.Fatal("expected second delete to return false")
 	}
 }
@@ -66,9 +91,14 @@ func TestDelete(t *testing.T) {
 func TestEmptyValue(t *testing.T) {
 	storage := New()
 
-	storage.Set("empty", []byte{})
+	if err := storage.Set("empty", []byte{}); err != nil {
+		t.Fatal(err)
+	}
 
-	value, found := storage.Get("empty")
+	value, found, err := storage.Get("empty")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !found {
 		t.Fatal("expected empty key value to exist")
@@ -83,11 +113,16 @@ func TestSetCopiesInputValue(t *testing.T) {
 	storage := New()
 
 	value := []byte("original")
-	storage.Set("key", value)
+	if err := storage.Set("key", value); err != nil {
+		t.Fatal(err)
+	}
 
 	value[0] = 'X'
 
-	result, _ := storage.Get("key")
+	result, _, err := storage.Get("key")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !bytes.Equal(result, []byte("original")) {
 		t.Fatalf("stored value was modified: %s", result)
@@ -97,12 +132,20 @@ func TestSetCopiesInputValue(t *testing.T) {
 func TestGetReturnsCopy(t *testing.T) {
 	storage := New()
 
-	storage.Set("key", []byte("original"))
+	if err := storage.Set("key", []byte("original")); err != nil {
+		t.Fatal(err)
+	}
 
-	value, _ := storage.Get("key")
+	value, _, err := storage.Get("key")
+	if err != nil {
+		t.Fatal(err)
+	}
 	value[0] = 'X'
 
-	result, _ := storage.Get("key")
+	result, _, err := storage.Get("key")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !bytes.Equal(result, []byte("original")) {
 		t.Fatalf("stored value was modified: %s", result)
@@ -122,9 +165,19 @@ func TestConcurrentAccess(t *testing.T) {
 
 			key := "key"
 
-			storage.Set(key, []byte{byte(i)})
-			storage.Get(key)
-			storage.Delete(key)
+			if err := storage.Set(key, []byte{byte(i)}); err != nil {
+				t.Errorf("Set failed: %v", err)
+				return
+			}
+
+			if _, _, err := storage.Get(key); err != nil {
+				t.Errorf("Get failed: %v", err)
+				return
+			}
+
+			if _, err := storage.Delete(key); err != nil {
+				t.Errorf("Delete failed: %v", err)
+			}
 		}(i)
 	}
 

@@ -78,3 +78,8 @@ local.*
 
 # Relatórios locais de cobertura de testes
 /coverage/
+
+# Arquivos compressos
+*.zip
+*.7z
+*.rar

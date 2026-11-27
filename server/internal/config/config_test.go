@@ -1,10 +1,11 @@
 package config
 
 import (
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/pescador95/memorydb/server/internal/idempotency"
+	"github.com/pescador95/memorydb/server/resources"
 	sharedconfig "github.com/pescador95/memorydb/shared/config"
 )
 
@@ -15,17 +16,57 @@ func setDefaultEnvironment(t *testing.T) {
 	t.Setenv(envShutdownTimeout, "")
 	t.Setenv(envReadTimeout, "")
 	t.Setenv(envWriteTimeout, "")
-	t.Setenv(envIdempotencyRetention, "")
-	t.Setenv(envIdempotencyCapacity, "")
-	t.Setenv(sharedconfig.EnvServerMaxConnections, "")
+}
+
+func validResourceConfig() resources.ResourceConfig {
+	const (
+		mib = int64(1024 * 1024)
+		gib = 1024 * mib
+	)
+
+	return resources.ResourceConfig{
+		Profile:             resources.ResourceProfile("mid"),
+		ProcessMemoryBudget: gib,
+		CPUCapacity:         2000,
+		Storage: resources.StorageResourceConfig{
+			MaxEntries:   500_000,
+			MemoryBudget: 590_558_003,
+			MaxKeySize:   512,
+			MaxValueSize: 64 * 1024,
+		},
+		Idempotency: resources.IdempotencyResourceConfig{
+			MaxEntries:   100_000,
+			MemoryBudget: 161_061_273,
+			Retention:    24 * time.Hour,
+		},
+		Network: resources.NetworkResourceConfig{
+			MaxConnections:      1024,
+			MaxInFlightRequests: 256,
+			MaxFramePayloadSize: 256 * 1024,
+		},
+		Processing: resources.ProcessingResourceConfig{
+			MemoryBudget: 161_061_273,
+		},
+		Runtime: resources.RuntimeResourceConfig{
+			MemoryBudget: 161_061_275,
+		},
+	}
+}
+
+func resourceLoader(config resources.ResourceConfig) func() (resources.ResourceConfig, error) {
+	return func() (resources.ResourceConfig, error) {
+		return config, nil
+	}
 }
 
 func TestLoadAppliesDefaultConfig(t *testing.T) {
 	setDefaultEnvironment(t)
 
-	got, err := Load()
+	expectedResources := validResourceConfig()
+
+	got, err := loadWithResourceConfig(resourceLoader(expectedResources))
 	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+		t.Fatalf("loadWithResourceConfig() error = %v", err)
 	}
 
 	if got.Address != sharedconfig.DefaultServerAddress {
@@ -41,22 +82,6 @@ func TestLoadAppliesDefaultConfig(t *testing.T) {
 			"ShutdownTimeout = %v, want %v",
 			got.ShutdownTimeout,
 			defaultShutdownTimeout,
-		)
-	}
-
-	if got.Idempotency.Retention != idempotency.DefaultRetention {
-		t.Errorf(
-			"Idempotency.Retention = %v, want %v",
-			got.Idempotency.Retention,
-			idempotency.DefaultRetention,
-		)
-	}
-
-	if got.Idempotency.Capacity != idempotency.DefaultCapacity {
-		t.Errorf(
-			"Idempotency.Capacity = %d, want %d",
-			got.Idempotency.Capacity,
-			idempotency.DefaultCapacity,
 		)
 	}
 
@@ -76,28 +101,58 @@ func TestLoadAppliesDefaultConfig(t *testing.T) {
 		)
 	}
 
-	if got.MaxConnections != sharedconfig.DefaultServerMaxConnections {
+	if got.Resources.ProcessMemoryBudget != expectedResources.ProcessMemoryBudget {
 		t.Errorf(
-			"MaxConnections = %d, want %d",
-			got.MaxConnections,
-			sharedconfig.DefaultServerMaxConnections,
+			"Resources.ProcessMemoryBudget = %d, want %d",
+			got.Resources.ProcessMemoryBudget,
+			expectedResources.ProcessMemoryBudget,
+		)
+	}
+
+	if got.Resources.CPUCapacity != expectedResources.CPUCapacity {
+		t.Errorf(
+			"Resources.CPUCapacity = %d, want %d",
+			got.Resources.CPUCapacity,
+			expectedResources.CPUCapacity,
+		)
+	}
+
+	if got.Resources.Storage != expectedResources.Storage {
+		t.Errorf(
+			"Resources.Storage = %+v, want %+v",
+			got.Resources.Storage,
+			expectedResources.Storage,
+		)
+	}
+
+	if got.Resources.Idempotency != expectedResources.Idempotency {
+		t.Errorf(
+			"Resources.Idempotency = %+v, want %+v",
+			got.Resources.Idempotency,
+			expectedResources.Idempotency,
+		)
+	}
+
+	if got.Resources.Network != expectedResources.Network {
+		t.Errorf(
+			"Resources.Network = %+v, want %+v",
+			got.Resources.Network,
+			expectedResources.Network,
 		)
 	}
 }
 
 func TestLoadUsesEnvironmentConfig(t *testing.T) {
 	setDefaultEnvironment(t)
+
 	t.Setenv(sharedconfig.EnvServerAddress, "0.0.0.0:6381")
 	t.Setenv(envShutdownTimeout, "15s")
-	t.Setenv(envIdempotencyRetention, "48h")
-	t.Setenv(envIdempotencyCapacity, "200000")
 	t.Setenv(envReadTimeout, "45s")
 	t.Setenv(envWriteTimeout, "20s")
-	t.Setenv(sharedconfig.EnvServerMaxConnections, "2048")
 
-	got, err := Load()
+	got, err := loadWithResourceConfig(resourceLoader(validResourceConfig()))
 	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+		t.Fatalf("loadWithResourceConfig() error = %v", err)
 	}
 
 	if got.Address != "0.0.0.0:6381" {
@@ -108,18 +163,6 @@ func TestLoadUsesEnvironmentConfig(t *testing.T) {
 		t.Errorf("ShutdownTimeout = %v, want %v", got.ShutdownTimeout, 15*time.Second)
 	}
 
-	if got.Idempotency.Retention != 48*time.Hour {
-		t.Errorf(
-			"Idempotency.Retention = %v, want %v",
-			got.Idempotency.Retention,
-			48*time.Hour,
-		)
-	}
-
-	if got.Idempotency.Capacity != 200000 {
-		t.Errorf("Idempotency.Capacity = %d, want %d", got.Idempotency.Capacity, 200000)
-	}
-
 	if got.ReadTimeout != 45*time.Second {
 		t.Errorf("ReadTimeout = %v, want %v", got.ReadTimeout, 45*time.Second)
 	}
@@ -127,87 +170,17 @@ func TestLoadUsesEnvironmentConfig(t *testing.T) {
 	if got.WriteTimeout != 20*time.Second {
 		t.Errorf("WriteTimeout = %v, want %v", got.WriteTimeout, 20*time.Second)
 	}
-
-	if got.MaxConnections != 2048 {
-		t.Errorf("MaxConnections = %d, want 2048", got.MaxConnections)
-	}
 }
 
 func TestLoadRejectsInvalidDurations(t *testing.T) {
-	setDefaultEnvironment(t)
-	tests := []struct {
-		name  string
-		value string
-	}{
-		{name: "invalid format", value: "invalid"},
-		{name: "zero", value: "0s"},
-		{name: "negative", value: "-5s"},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv(envShutdownTimeout, test.value)
-
-			_, err := Load()
-			if err == nil {
-				t.Fatal("Load() error = nil, want error")
-			}
-		})
-	}
-}
-
-func TestLoadRejectsInvalidIdempotencyRetention(t *testing.T) {
-	setDefaultEnvironment(t)
-	tests := []struct {
-		name  string
-		value string
-	}{
-		{name: "invalid format", value: "invalid"},
-		{name: "zero", value: "0s"},
-		{name: "negative", value: "-1h"},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv(envIdempotencyRetention, test.value)
-
-			_, err := Load()
-			if err == nil {
-				t.Fatal("Load() error = nil, want error")
-			}
-		})
-	}
-}
-
-func TestLoadRejectsInvalidIdempotencyCapacity(t *testing.T) {
-	setDefaultEnvironment(t)
-	tests := []struct {
-		name  string
-		value string
-	}{
-		{name: "invalid format", value: "invalid"},
-		{name: "zero", value: "0"},
-		{name: "negative", value: "-1"},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv(envIdempotencyCapacity, test.value)
-
-			_, err := Load()
-			if err == nil {
-				t.Fatal("Load() error = nil, want error")
-			}
-		})
-	}
-}
-
-func TestLoadRejectsInvalidNetworkTimeouts(t *testing.T) {
 	tests := []struct {
 		name  string
 		env   string
 		value string
 	}{
+		{"shutdown invalid format", envShutdownTimeout, "invalid"},
+		{"shutdown zero", envShutdownTimeout, "0s"},
+		{"shutdown negative", envShutdownTimeout, "-5s"},
 		{"read invalid format", envReadTimeout, "invalid"},
 		{"read zero", envReadTimeout, "0s"},
 		{"read negative", envReadTimeout, "-1s"},
@@ -221,31 +194,39 @@ func TestLoadRejectsInvalidNetworkTimeouts(t *testing.T) {
 			setDefaultEnvironment(t)
 			t.Setenv(test.env, test.value)
 
-			if _, err := Load(); err == nil {
-				t.Fatal("Load() error = nil, want error")
+			_, err := loadWithResourceConfig(resourceLoader(validResourceConfig()))
+			if err == nil {
+				t.Fatal("loadWithResourceConfig() error = nil, want error")
 			}
 		})
 	}
 }
 
-func TestLoadRejectsInvalidMaxConnections(t *testing.T) {
-	tests := []struct {
-		name  string
-		value string
-	}{
-		{"invalid format", "invalid"},
-		{"zero", "0"},
-		{"negative", "-1"},
+func TestLoadPropagatesResourceLoaderError(t *testing.T) {
+	sentinel := errors.New("resource detection failure")
+
+	_, err := loadWithResourceConfig(func() (resources.ResourceConfig, error) {
+		return resources.ResourceConfig{}, sentinel
+	})
+
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v, want wrapped error %v", err, sentinel)
 	}
+}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			setDefaultEnvironment(t)
-			t.Setenv(sharedconfig.EnvServerMaxConnections, test.value)
+func TestLoadRejectsInvalidResourceConfig(t *testing.T) {
+	invalid := validResourceConfig()
+	invalid.Storage.MaxEntries = 0
 
-			if _, err := Load(); err == nil {
-				t.Fatal("Load() error = nil, want error")
-			}
-		})
+	_, err := loadWithResourceConfig(resourceLoader(invalid))
+	if err == nil {
+		t.Fatal("loadWithResourceConfig() error = nil, want validation error")
+	}
+}
+
+func TestLoadRejectsNilResourceLoader(t *testing.T) {
+	_, err := loadWithResourceConfig(nil)
+	if err == nil {
+		t.Fatal("loadWithResourceConfig(nil) error = nil, want error")
 	}
 }

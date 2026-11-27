@@ -47,38 +47,72 @@ func runWith(
 		return fmt.Errorf("load server configuration: %w", err)
 	}
 
-	listener, err := listen("tcp", config.Address)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", config.Address, err)
+	if err := config.Resources.Validate(); err != nil {
+		return fmt.Errorf("validate resource configuration: %w", err)
 	}
-	defer listener.Close()
 
-	messageCodec := protobuf.New()
-	commandEngine := engine.New(memorystorage.New())
+	if err := validateProtocolFrameLimits(config.Resources); err != nil {
+		return fmt.Errorf("validate protocol frame limits: %w", err)
+	}
 
-	executor, err := idempotency.NewExecutor(&config.Idempotency)
+	storage, err := memorystorage.NewWithConfig(memorystorage.Config{
+		MaxEntries:   config.Resources.Storage.MaxEntries,
+		MemoryBudget: config.Resources.Storage.MemoryBudget,
+		MaxKeySize:   config.Resources.Storage.MaxKeySize,
+		MaxValueSize: config.Resources.Storage.MaxValueSize,
+	})
+	if err != nil {
+		return fmt.Errorf("create storage: %w", err)
+	}
+
+	idempotencyCapacity, err := resourceEntriesToInt(
+		config.Resources.Idempotency.MaxEntries,
+	)
+	if err != nil {
+		return fmt.Errorf("configure idempotency executor: %w", err)
+	}
+
+	idempotencyConfig := idempotency.Config{
+		Retention:    config.Resources.Idempotency.Retention,
+		Capacity:     idempotencyCapacity,
+		MemoryBudget: config.Resources.Idempotency.MemoryBudget,
+	}
+
+	executor, err := idempotency.NewExecutor(&idempotencyConfig)
 	if err != nil {
 		return fmt.Errorf("create idempotency executor: %w", err)
 	}
+
+	messageCodec := protobuf.New()
+	commandEngine := engine.New(storage)
 
 	handler, err := tcp.NewHandlerWithConfig(
 		commandEngine,
 		messageCodec,
 		executor,
 		tcp.HandlerConfig{
-			ReadTimeout:  config.ReadTimeout,
-			WriteTimeout: config.WriteTimeout,
+			ReadTimeout:            config.ReadTimeout,
+			WriteTimeout:           config.WriteTimeout,
+			MaxInFlightRequests:    config.Resources.Network.MaxInFlightRequests,
+			MaxFramePayloadSize:    config.Resources.Network.MaxFramePayloadSize,
+			ProcessingMemoryBudget: config.Resources.Processing.MemoryBudget,
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("create handler: %w", err)
 	}
 
+	listener, err := listen("tcp", config.Address)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", config.Address, err)
+	}
+	defer listener.Close()
+
 	server, err := tcp.NewServerWithConfig(
 		listener,
 		handler,
 		tcp.ServerConfig{
-			MaxConnections: config.MaxConnections,
+			MaxConnections: config.Resources.Network.MaxConnections,
 		},
 	)
 	if err != nil {
@@ -127,4 +161,19 @@ func runWith(
 		log.Println("MemoryDB stopped")
 		return nil
 	}
+}
+
+// resourceEntriesToInt converte um limite de entradas para int,
+// respeitando a capacidade da arquitetura em execução.
+func resourceEntriesToInt(entries int64) (int, error) {
+	maxInt := int64(^uint(0) >> 1)
+
+	if entries <= 0 || entries > maxInt {
+		return 0, fmt.Errorf(
+			"idempotency maximum entries %d exceeds supported int range",
+			entries,
+		)
+	}
+
+	return int(entries), nil
 }

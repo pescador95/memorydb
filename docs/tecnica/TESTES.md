@@ -301,6 +301,25 @@ A análise considera como não cobertos os blocos cujo contador de execução é
 
 A etapa `uncovered` não executa novamente os testes nem atualiza os perfis. Ela utiliza os arquivos gerados pela execução anterior de `coverage`.
 
+### 5.8. Testes de dimensionamento e detecção de recursos
+
+O pacote `server/resources` pertence ao módulo `server`; ele não é um oitavo módulo Go. Seus testes são executados junto com os demais pacotes do módulo:
+
+```bash
+cd server
+go test ./resources/...
+go test -race ./resources/...
+```
+
+A suíte contém testes unitários e de integração com arquivos temporários para a descoberta de montagens e memberships de cgroups, resolução de hierarquias, limites herdados, valores ilimitados, caminhos inválidos, erros de leitura, parsing de variáveis de ambiente, cálculo de perfis e validação de overrides.
+
+Os arquivos específicos de plataforma utilizam build tags:
+- `*_linux.go` e testes `//go:build linux` são compilados e executados em Linux;
+- `detector_windows.go` e testes `//go:build windows` são compilados e executados em Windows;
+- `detector_unsupported.go` atende plataformas diferentes de Linux e Windows.
+
+Uma execução no WSL Ubuntu valida o caminho Linux. Ela não executa os testes Windows; para validar esse caminho é necessária uma execução em Windows ou uma compilação/teste cruzado apropriado.
+
 ## 6. Pipeline completo
 
 Comando:
@@ -333,7 +352,39 @@ Ao concluir todas as etapas, o script apresenta a mensagem:
 PIPELINE CONCLUÍDO COM SUCESSO
 ```
 
-## 7. Artefatos gerados
+## 7. Validação integral registrada em 27/11/2026
+
+Em 27/11/2026, o usuário executou `./scripts/test.sh` no WSL Ubuntu. Todas as etapas do pipeline foram concluídas com sucesso:
+
+- `format`;
+- `vet`;
+- `unit`;
+- `race`;
+- `build`;
+- `coverage`;
+- `uncovered`.
+
+A execução percorreu os sete módulos do workspace. O pacote `server/resources` foi incluído nas etapas do módulo `server`.
+
+### Cobertura observada
+
+| Módulo | Cobertura |
+|---|---:|
+| `api` | 97,6% |
+| `drivers/go` | 95,3% |
+| `protocol/generated/go` | 0,0% |
+| `server` | 95,1% |
+| `shared` | 100,0% |
+| `transport/tcp/go` | 98,3% |
+| `storage/go` | 98,2% |
+
+O código Protobuf gerado apresentou 0,0% por não possuir testes próprios. No módulo `server`, `server/resources` apresentou 96,3% de cobertura. Nenhum arquivo do pacote `server/resources` ficou na categoria sem cobertura; alguns arquivos permaneceram parcialmente cobertos.
+
+A etapa `uncovered` listou blocos não executados em diferentes componentes. Cobertura parcial não é, por si só, uma falha: os caminhos restantes devem ser avaliados pelo comportamento que representam, e não apenas pelo percentual.
+
+**Escopo da evidência:** essa execução comprova o resultado do pipeline Linux informado nessa data. Ela não substitui uma execução em Windows para os caminhos protegidos por build tags Windows, nem garante que alterações posteriores continuem aprovadas.
+
+## 8. Artefatos gerados
 
 A execução da etapa `coverage` gera os seguintes artefatos:
 

@@ -19,6 +19,7 @@ func NewConnection(conn net.Conn) (*Connection, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("connection cannot be nil")
 	}
+
 	value := reflect.ValueOf(conn)
 
 	switch value.Kind() {
@@ -36,19 +37,47 @@ func NewConnection(conn net.Conn) (*Connection, error) {
 
 // ReadFrame lê um quadro completo da conexão.
 func (c *Connection) ReadFrame() ([]byte, error) {
+	payload, release, err := c.ReadFrameWithReservation(
+		MaxFrameSize,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if release != nil {
+		release()
+	}
+
+	return payload, nil
+}
+
+// ReadFrameWithReservation lê um quadro obtendo uma reserva opcional
+// antes de alocar o payload.
+//
+// A função release retornada deve ser chamada pelo consumidor depois
+// de terminar o processamento do quadro.
+func (c *Connection) ReadFrameWithReservation(
+	maxSize uint32,
+	reserve func(size uint32) (release func(), err error),
+) ([]byte, func(), error) {
 	if c == nil {
-		return nil, fmt.Errorf("connection cannot be nil")
+		return nil, nil, fmt.Errorf("connection cannot be nil")
 	}
 
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
-	payload, err := ReadFrame(c.conn)
+	payload, release, err := ReadFrameWithReservation(
+		c.conn,
+		maxSize,
+		reserve,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("read frame: %w", err)
+		return nil, nil, fmt.Errorf("read frame: %w", err)
 	}
 
-	return payload, nil
+	return payload, release, nil
 }
 
 // WriteFrame escreve um quadro completo na conexão.
@@ -56,6 +85,7 @@ func (c *Connection) WriteFrame(payload []byte) error {
 	if c == nil {
 		return fmt.Errorf("connection cannot be nil")
 	}
+
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
@@ -71,5 +101,6 @@ func (c *Connection) Close() error {
 	if c == nil {
 		return fmt.Errorf("connection cannot be nil")
 	}
+
 	return c.conn.Close()
 }

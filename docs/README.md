@@ -32,6 +32,9 @@ A implementação atual contempla:
 - Deduplicação de solicitações repetidas e reprodução de respostas.
 - Detecção de reutilização de `OperationID` com parâmetros diferentes.
 - Controle de retenção e capacidade dos registros de idempotência.
+- Dimensionamento de recursos por perfis `low`, `mid`, `high`, `auto` e `custom`.
+- Detecção de CPU e memória disponíveis no Linux (incluindo limites de cgroups v1/v2) e no Windows (recursos do host).
+- Limites lógicos configuráveis para Storage, idempotência, processamento, conexões, requisições em processamento e tamanho de frame.
 
 ### Limitações importantes
 
@@ -49,7 +52,7 @@ A implementação atual não possui:
 - Replicação ou compartilhamento de registros de idempotência entre instâncias.
 - Garantia de execução exatamente uma vez.
 - Observabilidade integrada por métricas, tracing ou monitoramento.
-- Limite global configurável de memória do processo.
+- Limite rígido de memória do processo aplicado pelo runtime ou pelo sistema operacional.
 
 O campo `ttl_ms` existe no contrato Protobuf, mas valores positivos são rejeitados como funcionalidade não suportada.
 
@@ -67,9 +70,17 @@ Os timeouts de leitura e escrita são aplicados às respectivas operações de I
 
 O encerramento forçado fecha as conexões TCP ativas para interromper operações de I/O pendentes. Isso não constitui um mecanismo genérico de cancelamento de qualquer operação interna do servidor.
 
-O limite de tamanho do frame TCP e a capacidade do registro de idempotência não representam um limite global de consumo de memória do processo.
+O pacote `server/resources` calcula um orçamento lógico de memória para o processo e o divide entre Storage, idempotência, processamento e runtime. Os limites de Storage, idempotência e processamento são aplicados por contabilização lógica. A parcela de runtime não é aplicada por `GOMEMLIMIT` ou `debug.SetMemoryLimit`, e o orçamento total não é um limite rígido de heap ou RSS.
+
+A capacidade de CPU também é detectada e validada para o dimensionamento, mas não altera `GOMAXPROCS` nem configura um limite de CPU no sistema operacional.
 
 **Segurança:** o servidor não deve ser exposto a redes não confiáveis sem mecanismos adicionais de proteção.
+
+### Dimensionamento de recursos
+
+A configuração de recursos é carregada no startup pelo pacote público `server/resources`. O perfil padrão é `mid`. Os perfis `low`, `mid` e `high` usam presets fixos; `auto` dimensiona com base nos recursos detectados; `custom` recebe CPU e orçamento de memória explicitamente.
+
+A detecção Linux considera o host e os limites aplicáveis de cgroups v1/v2. No Windows, considera os recursos do host e ainda não consulta Windows Job Objects. Consulte o [guia de dimensionamento de recursos](./tecnica/RECURSOS.md) para os valores dos perfis, variáveis de ambiente, algoritmo, API Go e limitações.
 
 ## 2. Documentação disponível
 
@@ -81,6 +92,7 @@ O limite de tamanho do frame TCP e a capacidade do registro de idempotência nã
 | [Manual do usuário](./usuario/MANUAL.md) | Pré-requisitos, inicialização, demonstração, comandos, driver Go, erros e limitações | Desenvolvedores consumidores, QA e suporte |
 | [Guia do driver Go](../drivers/go/README.md) | Instalação e integração do driver Go em aplicações independentes | Desenvolvedores consumidores |
 | [Guia de testes](./tecnica/TESTES.md) | Execução dos testes, verificações técnicas e análise de cobertura | Desenvolvimento e QA |
+| [Dimensionamento de recursos](./tecnica/RECURSOS.md) | Perfis, detecção de recursos, orçamentos, variáveis de ambiente e limitações | Desenvolvimento e operação |
 
 ## 3. Por onde começar
 
@@ -215,6 +227,23 @@ Para detalhes sobre o contrato, os estados, os erros e o comportamento em situa�
 
 ## 7. Validação técnica
 
+Em 27/11/2026, o pipeline `./scripts/test.sh` foi executado no WSL Ubuntu e concluiu com sucesso todas as etapas: `format`, `vet`, `unit`, `race`, `build`, `coverage` e `uncovered`.
+
+Cobertura registrada nessa execução:
+
+| Módulo | Cobertura |
+|---|---:|
+| `api` | 97,6% |
+| `drivers/go` | 95,3% |
+| `protocol/generated/go` | 0,0% (código gerado, sem testes próprios) |
+| `server` | 95,1% |
+| `shared` | 100,0% |
+| `transport/tcp/go` | 98,3% |
+| `storage/go` | 98,2% |
+
+No módulo `server`, o pacote `server/resources` apresentou 96,3% de cobertura. Esses percentuais são evidências da execução informada em 27/11/2026, não garantias para alterações futuras. O detalhamento está no [Guia de testes](./tecnica/TESTES.md).
+
+
 O projeto possui testes automatizados para os principais componentes e fluxos:
 
 - Engine e validação de comandos.
@@ -231,6 +260,8 @@ O projeto possui testes automatizados para os principais componentes e fluxos:
 - Resultados indeterminados.
 - Limites de conexões simultâneas.
 - Timeouts de leitura e escrita.
+- Dimensionamento por perfis e detecção de recursos no Linux/Windows.
+- Testes de parsing de configuração, cgroups, limites herdados, valores ilimitados e validação de orçamentos.
 - Encerramento gracioso e forçado do servidor.
 
 Os procedimentos reproduzíveis de validação estão centralizados nos scripts de `scripts/test/` e documentados no [Guia de testes](./tecnica/TESTES.md). Os resultados históricos abaixo registram execuções realizadas naquele momento e não substituem uma nova execução após alterações no código.

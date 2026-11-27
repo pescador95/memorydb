@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"testing"
 
+	memorydbpb "github.com/pescador95/memorydb/protocol/generated/go/memorydb/v1"
 	"github.com/pescador95/memorydb/server/internal/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestRequestRoundTrip(t *testing.T) {
@@ -291,5 +293,72 @@ func TestDecodeRejectsMissingCommandOrResult(t *testing.T) {
 
 	if _, err := codec.DecodeResponse(nil); err == nil {
 		t.Error("DecodeResponse() expected error for missing result")
+	}
+}
+
+func TestDecodeRequestDiscardsUnknownFields(t *testing.T) {
+	codec := New()
+
+	request := &memorydbpb.Request{
+		RequestId: 42,
+		Command: &memorydbpb.Request_Ping{
+			Ping: &memorydbpb.PingCommand{},
+		},
+	}
+
+	request.ProtoReflect().SetUnknown([]byte{
+		0xA0, 0x06, 0x01,
+	})
+
+	data, err := proto.Marshal(request)
+	if err != nil {
+		t.Fatalf("proto.Marshal() error = %v", err)
+	}
+
+	got, err := codec.DecodeRequest(data)
+	if err != nil {
+		t.Fatalf("DecodeRequest() error = %v", err)
+	}
+
+	if got.RequestID != request.RequestId {
+		t.Errorf("RequestID = %d, want %d", got.RequestID, request.RequestId)
+	}
+
+	if _, ok := got.Command.(*protocol.PingCommand); !ok {
+		t.Errorf("Command type = %T, want *protocol.PingCommand", got.Command)
+	}
+}
+
+func TestDecodeResponseDiscardsUnknownFields(t *testing.T) {
+	codec := New()
+
+	response := &memorydbpb.Response{
+		RequestId: 42,
+		Success:   true,
+		Result: &memorydbpb.Response_Pong{
+			Pong: &memorydbpb.PongResult{},
+		},
+	}
+
+	response.ProtoReflect().SetUnknown([]byte{
+		0xA0, 0x06, 0x01,
+	})
+
+	data, err := proto.Marshal(response)
+	if err != nil {
+		t.Fatalf("proto.Marshal() error = %v", err)
+	}
+
+	got, err := codec.DecodeResponse(data)
+	if err != nil {
+		t.Fatalf("DecodeResponse() error = %v", err)
+	}
+
+	if got.RequestID != response.RequestId {
+		t.Errorf("RequestID = %d, want %d", got.RequestID, response.RequestId)
+	}
+
+	if _, ok := got.Result.(*protocol.PongResult); !ok {
+		t.Errorf("Result type = %T, want *protocol.PongResult", got.Result)
 	}
 }

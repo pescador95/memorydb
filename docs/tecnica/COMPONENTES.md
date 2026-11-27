@@ -15,6 +15,7 @@ As descrições refletem a implementação conhecida do projeto. Funcionalidades
 | Executável do servidor | `server/cmd/memorydb` | Compor as dependências e controlar a inicialização e o encerramento do servidor |
 | Configuração do servidor | `server/internal/config` | Carregar, validar e disponibilizar as configurações operacionais do servidor |
 | Configuração compartilhada | `shared/config` | Centralizar nomes de variáveis de ambiente e valores padrão compartilhados |
+| Dimensionamento de recursos | `server/resources` | Detectar recursos, calcular perfis, aplicar overrides e validar limites por componente |
 | Server TCP | `server/internal/transport/tcp/server.go` | Aceitar conexões e controlar seu ciclo de vida |
 | Handler TCP | `server/internal/transport/tcp/handler.go` | Processar solicitações de uma conexão e coordenar a execução dos comandos |
 | Codec | `server/internal/codec/codec.go` | Definir as operações de serialização e desserialização |
@@ -53,7 +54,7 @@ O Storage possui seu próprio `go.mod` e pode ser reutilizado como biblioteca Go
 
 O ponto de entrada chama `run()`. A função `run`:
 
-1. Carrega e valida as configurações operacionais do servidor.
+1. Carrega e valida as configurações operacionais e a configuração de recursos detectados/calculados.
 2. Cria um listener TCP usando o endereço configurado.
 3. Instancia o codec Protobuf.
 4. Instancia o Storage.
@@ -82,9 +83,8 @@ As configurações específicas do servidor são carregadas por `server/internal
 | `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Prazo da tentativa de encerramento gracioso antes do fechamento forçado das conexões restantes |
 | `MEMORYDB_READ_TIMEOUT` | `30s` | Timeout de leitura de cada frame recebido pelo Handler |
 | `MEMORYDB_WRITE_TIMEOUT` | `10s` | Timeout de escrita de cada resposta enviada pelo Handler |
-| `MEMORYDB_MAX_CONNECTIONS` | `1024` | Limite de conexões TCP simultâneas admitidas pelo servidor |
-| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência após a conclusão |
-| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros de idempotência |
+
+Os limites de conexões, idempotência, processamento e tamanho de frame agora fazem parte da configuração de recursos carregada por `server/resources`. Seus valores dependem do perfil selecionado e podem receber overrides por variáveis de ambiente. Consulte [Dimensionamento e detecção de recursos](./RECURSOS.md).
 
 Variáveis ausentes ou vazias utilizam os valores padrão. Valores explicitamente informados, mas inválidos, fazem o carregamento da configuração retornar erro e impedem a inicialização normal do servidor.
 
@@ -96,11 +96,32 @@ A configuração `MEMORYDB_ADDR` é utilizada pelo listener do servidor. Ela nã
 
 - Não há configuração de TLS.
 - Não há autenticação ou autorização.
-- O limite de conexões controla a quantidade de conexões TCP simultâneas admitidas, mas não representa um limite de requisições ou de operações simultâneas por conexão.
+- O limite de conexões controla conexões TCP simultâneas admitidas, não requisições ou operações simultâneas por conexão.
 - Conexões excedentes ao limite configurado são fechadas pelo servidor.
-- Os timeouts de leitura e escrita são aplicados pelo Handler às operações de I/O TCP.
+- Os timeouts de leitura e escrita são aplicados às operações de I/O TCP.
 - O fechamento forçado durante o shutdown interrompe operações bloqueadas na conexão, mas não representa cancelamento genérico de qualquer operação executada pelo Handler.
-- Não existe um limite global de memória do processo configurado por esses controles.
+- Os orçamentos lógicos de recursos não constituem um limite rígido de heap ou RSS. A parcela de runtime ainda não é aplicada por `GOMEMLIMIT`.
+- A capacidade de CPU detectada é usada no dimensionamento e na validação, mas não configura `GOMAXPROCS` nem um limite de CPU do sistema operacional.
+
+### 3.3 Pacote público de recursos
+
+**Localização:** `server/resources/`
+
+**Import path:** `github.com/pescador95/memorydb/server/resources`
+
+O pacote pertence ao módulo `server`, mas sua API Go é pública. Ele disponibiliza detecção de capacidade, carregamento por perfil, overrides e validação de `ResourceConfig`.
+
+O carregamento ocorre uma vez durante o startup por meio de `server/internal/config.Load()`. O pacote não instancia componentes nem consulta hardware dentro do Storage, Engine ou Handler. Antes de abrir o listener, o executável também verifica com `proto.Size` se os maiores comandos e respostas configurados cabem no payload máximo do frame, incluindo o overhead do Protobuf.
+
+A detecção Linux utiliza recursos do host e limites aplicáveis de cgroups v1/v2. A detecção Windows utiliza recursos do host e não consulta Windows Job Objects. Outros sistemas operacionais não possuem implementação.
+
+Os perfis `low`, `mid` e `high` são presets fixos; `auto` e `custom` utilizam o algoritmo de dimensionamento comum. O preset padrão é `mid`.
+
+Os orçamentos de memória são distribuídos em 55% para Storage, 15% para Idempotência, 15% para Processamento e 15% para Runtime. A validação exige que a soma corresponda ao orçamento total.
+
+O pacote de recursos não impõe um limite rígido de memória ou CPU ao processo. Os limites lógicos de Storage, Idempotência e Processamento são aplicados pelos componentes que recebem suas configurações.
+
+Consulte `RECURSOS.md` para a tabela de presets, todas as variáveis de ambiente, os critérios de detecção e os limites dessa implementação.
 
 ## 4. Server TCP
 
@@ -221,8 +242,11 @@ A configuração é representada por:
 
 ```go
 type HandlerConfig struct {
-    ReadTimeout  time.Duration
-    WriteTimeout time.Duration
+    ReadTimeout            time.Duration
+    WriteTimeout           time.Duration
+    MaxInFlightRequests    int
+    MaxFramePayloadSize    int64
+    ProcessingMemoryBudget int64
 }
 ```
 
@@ -231,14 +255,14 @@ Os construtores recebem:
 - `commandEngine`: instância de `*engine.Engine`;
 - `messageCodec`: implementação da interface `codec.Codec`;
 - `executor`: instância de `*idempotency.Executor`;
-- `config`: configuração explícita dos timeouts, utilizada por `NewHandlerWithConfig`.
+- `config`: timeouts e limites de processamento, utilizada por `NewHandlerWithConfig`.
 
 `NewHandler` utiliza os valores padrão definidos em `shared/config`:
 
 - leitura: `DefaultServerReadTimeout` (30 segundos);
 - escrita: `DefaultServerWriteTimeout` (10 segundos).
 
-`NewHandlerWithConfig` permite configurar explicitamente os dois timeouts.
+`NewHandlerWithConfig` permite configurar explicitamente os timeouts, o máximo de requisições em processamento, o payload máximo do frame e o orçamento lógico de processamento. Quando os limites de processamento são zero, o construtor utiliza o máximo padrão de 256 requisições em processamento, o limite máximo do transporte (1 MiB) e orçamento de processamento ilimitado. O executável do servidor não utiliza esses fallbacks: injeta os valores calculados pelo pacote `server/resources`.
 
 Os construtores verificam se o Engine, o Codec e o Executor recebidos são `nil`. Como `messageCodec` é uma interface, a verificação não detecta uma interface que contenha um ponteiro tipado nulo.
 
@@ -274,11 +298,12 @@ O fechamento da conexão é registrado com `defer`.
 O Handler aplica os seguintes controles de I/O:
 
 - antes de cada leitura de frame, configura o read deadline da conexão;
+- lê o cabeçalho e reserva uma vaga e orçamento lógico de processamento antes de alocar o payload;
 - antes de cada escrita de resposta, configura o write deadline da conexão.
 
 Os prazos são configurados por `HandlerConfig.ReadTimeout` e `HandlerConfig.WriteTimeout`, respectivamente.
 
-Os deadlines limitam operações individuais de leitura e escrita. Não representam um timeout global para toda a duração da conexão ou para a execução completa de um comando.
+Os deadlines limitam operações individuais de leitura e escrita. Não representam um timeout global para toda a duração da conexão ou para a execução completa de um comando. O limite de requisições em processamento e o orçamento de processamento são compartilhados pela instância de Handler utilizada por todas as conexões do servidor.
 
 ### 5.3 Execução de operações mutáveis
 
@@ -693,18 +718,22 @@ A implementação utiliza os seguintes valores padrão:
 
 | Propriedade | Valor padrão |
 |---|---|
-| Capacidade | 100.000 registros |
+| Capacidade | 100.000 registros no perfil `mid` |
 | Retenção | 24 horas após a conclusão |
 | Escopo | Global por instância do servidor |
 | Armazenamento | Memória |
 | Evicção antecipada de registros válidos | Não permitida |
 
-A capacidade e a retenção são configuráveis na inicialização do servidor:
+A capacidade e a retenção são configuráveis na inicialização do servidor por meio do pacote `server/resources`:
 
-| Variável | Padrão | Descrição |
+| Variável | Padrão no perfil `mid` | Descrição |
 |---|---:|---|
-| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros |
+| `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` | `100000` | Capacidade máxima de registros |
+| `MEMORYDB_IDEMPOTENCY_CAPACITY` | Alias legado | Aceito se não houver conflito com o nome canônico |
+| `MEMORYDB_IDEMPOTENCY_MEMORY_BUDGET` | 15% do orçamento do processo | Orçamento lógico da idempotência |
 | `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Retenção dos registros concluídos |
+
+A soma dos orçamentos de Storage, Idempotência, Processamento e Runtime deve corresponder ao orçamento do processo. Consulte `RECURSOS.md` para a configuração completa.
 
 A capacidade contabiliza operações em andamento e concluídas.
 
@@ -786,20 +815,42 @@ A estrutura `Entry` mantém o valor em um campo não exportado.
 
 | Método | Comportamento |
 |---|---|
-| `New()` | Cria um Storage vazio |
-| `Set(key, value)` | Armazena uma cópia do valor |
-| `Get(key)` | Retorna uma cópia do valor e indica se a chave existe |
-| `Delete(key)` | Remove a chave e informa se ela existia |
+| `New()` | Cria um Storage sem limites explícitos |
+| `NewWithConfig(config)` | Cria um Storage com limites lógicos e tamanhos máximos |
+| `Set(key, value)` | Armazena uma cópia do valor e retorna erro se algum limite for excedido |
+| `Get(key)` | Retorna uma cópia do valor, informa se a chave existe e retorna eventual erro |
+| `Delete(key)` | Remove a chave, informa se ela existia e retorna eventual erro |
+| `Usage()` | Retorna o consumo lógico contabilizado |
+| `Len()` | Retorna a quantidade de entradas |
+
+A configuração é representada por:
+
+```go
+type Config struct {
+    MaxEntries   int64
+    MemoryBudget int64
+    MaxKeySize   int64
+    MaxValueSize int64
+}
+```
 
 Assinaturas relevantes:
 
 ```go
-Set(key string, value []byte)
+NewWithConfig(config Config) (*Storage, error)
 
-Get(key string) ([]byte, bool)
+Set(key string, value []byte) error
 
-Delete(key string) bool
+Get(key string) ([]byte, bool, error)
+
+Delete(key string) (bool, error)
+
+Usage() int64
+
+Len() int64
 ```
+
+O executável do servidor utiliza `NewWithConfig`, fornecendo os limites calculados pelo pacote `server/resources`. `New()` permanece disponível para consumidores que desejam criar um Storage sem limites explícitos.
 
 ### 11.3 Isolamento dos dados
 
@@ -807,7 +858,21 @@ O Storage copia os bytes recebidos em `Set` e os bytes retornados em `Get`.
 
 Essa estratégia evita que alterações posteriores nos slices do chamador modifiquem diretamente os dados armazenados ou que o chamador altere o conteúdo interno por meio do valor retornado.
 
-### 11.4 Concorrência
+### 11.4 Limites e contabilização
+
+O servidor instancia o Storage com `NewWithConfig`. Os limites são:
+- máximo de entradas;
+- orçamento lógico de memória;
+- tamanho máximo de chave;
+- tamanho máximo de valor.
+
+O orçamento contabiliza `len(key)+len(value)` por entrada. A substituição de valor recalcula o consumo considerando o valor anterior; a remoção libera o consumo lógico. `Usage()` retorna essa contabilização, não o heap ou RSS real.
+
+O Storage retorna `LimitError` para violações de limites, com códigos como `STORAGE_KEY_TOO_LARGE`, `STORAGE_VALUE_TOO_LARGE`, `STORAGE_MAX_ENTRIES_REACHED` e `STORAGE_MEMORY_BUDGET_REACHED`.
+
+As estruturas internas, overhead de `map`, objetos, locks, alocações e cópias não são incluídos no orçamento lógico. Consulte `RECURSOS.md` para a distribuição do orçamento de memória do processo.
+
+### 11.5 Concorrência
 
 `Set` e `Delete` utilizam lock exclusivo.
 
@@ -815,7 +880,7 @@ Essa estratégia evita que alterações posteriores nos slices do chamador modif
 
 O controle permite operações concorrentes sem acesso desprotegido ao mapa.
 
-### 11.5 Relação com o Engine
+### 11.6 Relação com o Engine
 
 A interface consumida pelo Engine está localizada em `server/internal/engine/storage.go`.
 
@@ -825,7 +890,7 @@ Essa organização mantém a abstração no lado do consumidor e permite que a i
 
 A extração para um módulo independente representa uma separação de módulos e responsabilidades, não uma separação de processos.
 
-### 11.6 Limitações
+### 11.7 Limitações
 
 - Dados exclusivamente em memória.
 - Sem persistência.
@@ -1304,14 +1369,16 @@ Para reproduzir as verificações na composição atual, deve-se utilizar o pipe
 | Storage | Implementação atual em memória, consumida pelo Engine por interface | A implementação pode ser substituída, mas os dados não são persistidos |
 | TTL | Campo existe no schema, mas TTL positivo é rejeitado | Não há expiração de entradas |
 | Idempotência | Registros mantidos somente em memória | A garantia não sobrevive à reinicialização |
-| Capacidade | Limite padrão de 100.000 registros, configurável | Novas operações podem ser rejeitadas quando a capacidade está esgotada |
+| Capacidade | 100.000 registros no perfil `mid`, configurável por perfil/override | Novas operações podem ser rejeitadas quando a capacidade está esgotada |
 | Retenção | Padrão de 24 horas após a conclusão, configurável | Após a expiração, o identificador pode deixar de ser reconhecido |
 | Multiplexação | Driver serializa operações por conexão | Uma operação por vez em cada conexão |
 | Observabilidade | Não há registro estruturado de falhas de conexão no servidor | Diagnóstico operacional limitado |
 | Timeouts de I/O | Read e write deadlines configuráveis no Handler | Operações de leitura e escrita possuem prazos individuais; não há timeout global de execução do comando |
 | Distribuição | Executor e Storage são locais à instância | Não há coordenação entre processos ou instâncias |
 | Limite de conexões | Limite configurável de conexões TCP simultâneas | Conexões excedentes são fechadas; não há controle de admissão baseado em carga ou consumo de recursos |
-| Memória do processo | Não há limite global de memória configurável implementado | O limite de conexões e a capacidade do Executor não constituem um limite total de memória |
+| Orçamento do processo | É calculado e dividido entre Storage, Idempotência, Processamento e Runtime | Não é um limite rígido de heap ou RSS; a parcela Runtime não é aplicada por `GOMEMLIMIT` |
+| CPU | Capacidade detectada/configurada e validada | Não altera `GOMAXPROCS` nem configura limite do sistema operacional |
+| Detecção Windows | Consulta CPU e memória disponíveis no host | Não consulta limites de Windows Job Objects |
 
 ## 18. Evoluções que envolvem múltiplos componentes
 

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"hash"
 
 	"github.com/pescador95/memorydb/server/internal/protocol"
 )
@@ -21,6 +22,9 @@ const (
 //
 // OperationID e RequestID não participam do cálculo.
 // Somente SET e DELETE são operações idempotentes nesta versão.
+//
+// Os campos são escritos incrementalmente no hash para evitar a criação
+// de um buffer temporário contendo toda a operação.
 func Fingerprint(command protocol.Command) ([32]byte, error) {
 	var zero [32]byte
 
@@ -28,8 +32,9 @@ func Fingerprint(command protocol.Command) ([32]byte, error) {
 		return zero, ErrUnsupportedCommand
 	}
 
-	data := make([]byte, 0, 128)
-	data = append(data, fingerprintVersion...)
+	hasher := sha256.New()
+
+	_, _ = hasher.Write([]byte(fingerprintVersion))
 
 	switch command := command.(type) {
 	case *protocol.SetCommand:
@@ -37,37 +42,48 @@ func Fingerprint(command protocol.Command) ([32]byte, error) {
 			return zero, ErrUnsupportedCommand
 		}
 
-		data = append(data, setCommandMarker)
+		_, _ = hasher.Write([]byte{setCommandMarker})
 
-		data = appendBytesField(data, []byte(command.Key))
-		data = appendBytesField(data, command.Value)
-		data = appendUint64(data, command.TTLMillis)
+		writeStringField(hasher, command.Key)
+		writeBytesField(hasher, command.Value)
+		writeUint64(hasher, command.TTLMillis)
 
 	case *protocol.DeleteCommand:
 		if command == nil {
 			return zero, ErrUnsupportedCommand
 		}
 
-		data = append(data, deleteCommandMarker)
-		data = appendBytesField(data, []byte(command.Key))
+		_, _ = hasher.Write([]byte{deleteCommandMarker})
+
+		writeStringField(hasher, command.Key)
 
 	default:
 		return zero, ErrUnsupportedCommand
 	}
 
-	return sha256.Sum256(data), nil
+	hasher.Sum(zero[:0])
+
+	return zero, nil
 }
 
-// appendBytesField acrescenta um campo precedido por seu tamanho em uint64
-// Big Endian. Isso evita ambiguidades causadas pela concatenação simples.
-func appendBytesField(data []byte, value []byte) []byte {
-	data = appendUint64(data, uint64(len(value)))
-	return append(data, value...)
+// writeStringField acrescenta uma string precedida por seu tamanho
+// em uint64 Big Endian.
+func writeStringField(hasher hash.Hash, value string) {
+	writeUint64(hasher, uint64(len(value)))
+	_, _ = hasher.Write([]byte(value))
 }
 
-// appendUint64 acrescenta um inteiro uint64 em Big Endian.
-func appendUint64(data []byte, value uint64) []byte {
+// writeBytesField acrescenta um slice precedido por seu tamanho
+// em uint64 Big Endian.
+func writeBytesField(hasher hash.Hash, value []byte) {
+	writeUint64(hasher, uint64(len(value)))
+	_, _ = hasher.Write(value)
+}
+
+// writeUint64 acrescenta um inteiro uint64 em Big Endian.
+func writeUint64(hasher hash.Hash, value uint64) {
 	var encoded [8]byte
+
 	binary.BigEndian.PutUint64(encoded[:], value)
-	return append(data, encoded[:]...)
+	_, _ = hasher.Write(encoded[:])
 }

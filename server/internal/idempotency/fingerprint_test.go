@@ -1,6 +1,8 @@
 package idempotency
 
 import (
+	"bytes"
+	"encoding/hex"
 	"errors"
 	"testing"
 
@@ -16,6 +18,50 @@ func calculateFingerprint(t *testing.T, command protocol.Command) [32]byte {
 	}
 
 	return fingerprint
+}
+
+func TestFingerprintPreservesPreviousFormat(t *testing.T) {
+	tests := []struct {
+		name     string
+		command  protocol.Command
+		expected string
+	}{
+		{
+			name: "SET",
+			command: &protocol.SetCommand{
+				Key:       "customer:1",
+				Value:     []byte("value"),
+				TTLMillis: 0,
+			},
+			expected: "59a54e98d1f20d06f59111750f00f49d39615982b16e456aabeb72345c8d21bc",
+		},
+		{
+			name: "DELETE",
+			command: &protocol.DeleteCommand{
+				Key: "customer:1",
+			},
+			expected: "8836fcf84fb73ff2b5add8e2322ebd4b29e95bcaf06c32c0b352dea249f36e75",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := calculateFingerprint(t, test.command)
+
+			expected, err := hex.DecodeString(test.expected)
+			if err != nil {
+				t.Fatalf("hex.DecodeString() error = %v", err)
+			}
+
+			if !bytes.Equal(got[:], expected) {
+				t.Fatalf(
+					"fingerprint = %x, want %s",
+					got,
+					test.expected,
+				)
+			}
+		})
+	}
 }
 
 func TestFingerprintSetIsDeterministic(t *testing.T) {

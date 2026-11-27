@@ -10,7 +10,7 @@ import (
 	"time"
 
 	serverconfig "github.com/pescador95/memorydb/server/internal/config"
-	"github.com/pescador95/memorydb/server/internal/idempotency"
+	"github.com/pescador95/memorydb/server/resources"
 	sharedconfig "github.com/pescador95/memorydb/shared/config"
 )
 
@@ -61,6 +61,47 @@ func (l *shutdownFailingListener) Addr() net.Addr {
 	return &net.TCPAddr{
 		IP:   net.IPv4(127, 0, 0, 1),
 		Port: 6380,
+	}
+}
+
+func validServerConfig(address string) serverconfig.Config {
+	const (
+		mib = int64(1024 * 1024)
+		gib = 1024 * mib
+	)
+
+	return serverconfig.Config{
+		Address:         address,
+		ShutdownTimeout: 10 * time.Second,
+		ReadTimeout:     sharedconfig.DefaultServerReadTimeout,
+		WriteTimeout:    sharedconfig.DefaultServerWriteTimeout,
+		Resources: resources.ResourceConfig{
+			Profile:             resources.ResourceProfile("mid"),
+			ProcessMemoryBudget: gib,
+			CPUCapacity:         2000,
+			Storage: resources.StorageResourceConfig{
+				MaxEntries:   500_000,
+				MemoryBudget: 590_558_003,
+				MaxKeySize:   512,
+				MaxValueSize: 64 * 1024,
+			},
+			Idempotency: resources.IdempotencyResourceConfig{
+				MaxEntries:   100_000,
+				MemoryBudget: 161_061_273,
+				Retention:    24 * time.Hour,
+			},
+			Network: resources.NetworkResourceConfig{
+				MaxConnections:      1024,
+				MaxInFlightRequests: 256,
+				MaxFramePayloadSize: 256 * 1024,
+			},
+			Processing: resources.ProcessingResourceConfig{
+				MemoryBudget: 161_061_273,
+			},
+			Runtime: resources.RuntimeResourceConfig{
+				MemoryBudget: 161_061_275,
+			},
+		},
 	}
 }
 
@@ -121,15 +162,48 @@ func TestRunWithConfigurationFailure(t *testing.T) {
 	}
 }
 
+func TestRunWithInvalidResourceConfigurationBeforeListening(t *testing.T) {
+	config := validServerConfig(":6380")
+	config.Resources.Storage.MaxEntries = 0
+
+	listenCalls := 0
+
+	err := runWith(
+		func() (serverconfig.Config, error) {
+			return config, nil
+		},
+		func(network, address string) (net.Listener, error) {
+			listenCalls++
+			return nil, errors.New("listener should not be created")
+		},
+		func(
+			parent context.Context,
+			signals ...os.Signal,
+		) (context.Context, context.CancelFunc) {
+			return context.WithCancel(parent)
+		},
+	)
+
+	if err == nil {
+		t.Fatal("expected resource configuration validation error")
+	}
+
+	if !strings.Contains(err.Error(), "validate resource configuration") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if listenCalls != 0 {
+		t.Errorf("listen foi chamado %d vezes; esperado 0", listenCalls)
+	}
+}
+
 func TestRunWithListenFailure(t *testing.T) {
 	sentinel := errors.New("listen failure")
 
 	listenCalls := 0
 	notifyCalls := 0
 
-	config := serverconfig.Config{
-		Address: ":6380",
-	}
+	config := validServerConfig(":6380")
 
 	err := runWith(
 		func() (serverconfig.Config, error) {
@@ -171,13 +245,7 @@ func TestRunWithListenFailure(t *testing.T) {
 }
 
 func TestRunWithGracefulShutdown(t *testing.T) {
-	config := serverconfig.Config{
-		Address:         "127.0.0.1:0",
-		ShutdownTimeout: 2 * time.Second,
-		ReadTimeout:     sharedconfig.DefaultServerReadTimeout,
-		WriteTimeout:    sharedconfig.DefaultServerWriteTimeout,
-		MaxConnections:  sharedconfig.DefaultServerMaxConnections,
-	}
+	config := validServerConfig("127.0.0.1:0")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -252,13 +320,7 @@ func TestRunWithServeFailure(t *testing.T) {
 
 	err := runWith(
 		func() (serverconfig.Config, error) {
-			return serverconfig.Config{
-				Address:         ":6380",
-				ShutdownTimeout: time.Second,
-				ReadTimeout:     sharedconfig.DefaultServerReadTimeout,
-				WriteTimeout:    sharedconfig.DefaultServerWriteTimeout,
-				MaxConnections:  sharedconfig.DefaultServerMaxConnections,
-			}, nil
+			return validServerConfig(":6380"), nil
 		},
 		func(network, address string) (net.Listener, error) {
 			return listener, nil
@@ -291,51 +353,6 @@ func TestRunWithServeFailure(t *testing.T) {
 	}
 }
 
-func TestRunWithInvalidIdempotencyConfiguration(t *testing.T) {
-	listener := &failingListener{
-		err: errors.New("listener should not be used"),
-	}
-
-	err := runWith(
-		func() (serverconfig.Config, error) {
-			return serverconfig.Config{
-				Address:        ":6380",
-				ReadTimeout:    sharedconfig.DefaultServerReadTimeout,
-				WriteTimeout:   sharedconfig.DefaultServerWriteTimeout,
-				MaxConnections: sharedconfig.DefaultServerMaxConnections,
-				Idempotency: idempotency.Config{
-					Retention: -time.Second,
-					Capacity:  100,
-				},
-			}, nil
-		},
-		func(network, address string) (net.Listener, error) {
-			return listener, nil
-		},
-		func(
-			parent context.Context,
-			signals ...os.Signal,
-		) (context.Context, context.CancelFunc) {
-			return context.WithCancel(parent)
-		},
-	)
-
-	if err == nil {
-		t.Fatal("expected idempotency executor error")
-	}
-
-	if !strings.Contains(err.Error(), "create idempotency executor") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if listener.closeCalls != 1 {
-		t.Errorf(
-			"expected listener to be closed once, got %d",
-			listener.closeCalls,
-		)
-	}
-}
-
 func TestRunWithShutdownFailure(t *testing.T) {
 	sentinel := errors.New("listener close failure")
 
@@ -353,13 +370,7 @@ func TestRunWithShutdownFailure(t *testing.T) {
 	go func() {
 		done <- runWith(
 			func() (serverconfig.Config, error) {
-				return serverconfig.Config{
-					Address:         ":6380",
-					ShutdownTimeout: time.Second,
-					ReadTimeout:     sharedconfig.DefaultServerReadTimeout,
-					WriteTimeout:    sharedconfig.DefaultServerWriteTimeout,
-					MaxConnections:  sharedconfig.DefaultServerMaxConnections,
-				}, nil
+				return validServerConfig(":6380"), nil
 			},
 			func(network, address string) (net.Listener, error) {
 				return listener, nil

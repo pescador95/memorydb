@@ -55,6 +55,8 @@ O escopo funcional atual contempla:
 - Encerramento gracioso e forçado do servidor.
 - Controle do número máximo de conexões TCP simultâneas.
 - Timeouts de leitura e escrita no processamento das conexões TCP.
+- Dimensionamento de recursos por perfis, com detecção de CPU e memória disponíveis no ambiente.
+- Limites lógicos de Storage, idempotência e processamento, além de limites de conexões, requisições em processamento e tamanho de frame.
 - Workspace Go composto por módulos independentes.
 
 ### 2.1. Limitações do escopo
@@ -74,6 +76,7 @@ A implementação atual não oferece:
 - Garantia de idempotência após reinicialização, perda do processo ou expiração do registro.
 - Retry automático no driver.
 - Driver Java implementado e validado.
+- Limite rígido de memória do processo ou limite de CPU aplicado pelo runtime/sistema operacional.
 
 Os limites de leitura, escrita e quantidade de conexões TCP são implementados. Eles não devem ser confundidos com limites de inatividade, controle de taxa de requisições ou políticas completas de isolamento entre clientes.
 
@@ -612,7 +615,7 @@ O servidor calcula um fingerprint dos parâmetros semanticamente relevantes da o
 | Escopo | Global na instância do servidor |
 | Operações protegidas | `SET` e `DELETE` |
 | Retenção | 24 horas após a conclusão da operação |
-| Capacidade padrão | 100.000 registros |
+| Capacidade no perfil `mid` | 100.000 registros |
 | Capacidade configurável | Não identificada como configuração externa na implementação atual |
 | Armazenamento | Memória |
 | Evicção antecipada | Não ocorre para registros ainda válidos |
@@ -747,6 +750,58 @@ Cenário: Reutilizar identificador após rejeição por capacidade
 
 **Observação de compatibilidade:** Tornar `OperationID` obrigatório para `SET` e `DELETE` altera o comportamento esperado dos clientes existentes. Os drivers devem ser atualizados de forma coordenada com o servidor.
 
+### FR-013 — Dimensionar e validar recursos no startup
+
+**Objetivo:** permitir que o servidor calcule os limites dos componentes a partir de um perfil de recursos e da capacidade detectada ou explicitamente informada.
+
+**Critérios de aceite**
+
+```gherkin
+Cenário: Utilizar o perfil padrão
+  Dado que MEMORYDB_RESOURCE_PROFILE não foi definida
+  Quando o servidor carregar a configuração de recursos
+  Então deverá utilizar o perfil mid
+
+Cenário: Utilizar um preset fixo
+  Dado que o operador selecionou low, mid ou high
+  Quando a configuração for calculada
+  Então os valores do preset deverão ser utilizados
+  E a configuração deverá ser rejeitada se exceder a capacidade detectada
+
+Cenário: Dimensionar automaticamente
+  Dado que o operador selecionou auto
+  Quando o pacote detectar CPU e memória disponíveis
+  Então deverá calcular os limites a partir da capacidade detectada
+
+Cenário: Utilizar configuração customizada
+  Dado que o operador selecionou custom
+  E informou MEMORYDB_RESOURCE_CPU e MEMORYDB_RESOURCE_MEMORY
+  Quando a configuração for calculada
+  Então deverá utilizar esses valores como entradas do algoritmo comum de dimensionamento
+  E rejeitar valores maiores que a capacidade detectada
+
+Cenário: Aplicar overrides
+  Dado que o operador informou overrides de limites
+  Quando a configuração final for validada
+  Então deverá rejeitar valores inválidos ou inconsistentes
+  E os quatro orçamentos de memória deverão somar o orçamento do processo
+
+Cenário: Detectar recursos em Linux
+  Dado que o servidor está em Linux
+  Quando os metadados de cgroups estiverem disponíveis
+  Então deverá considerar os limites aplicáveis de CPU e memória do cgroup atual e seus ancestrais
+  E comparar os limites com os recursos disponíveis no host
+
+Cenário: Plataforma sem detector
+  Dado que o sistema operacional não possui implementação de detecção
+  Quando a configuração de recursos for carregada
+  Então deverá retornar erro de plataforma não suportada
+```
+
+**Estado:** Implementado e testado no pacote `server/resources`, com testes específicos de plataforma.
+
+**Limite:** os orçamentos são controles lógicos por componente, não limites rígidos de heap/RSS ou de CPU aplicados pelo sistema operacional. A detecção Windows ainda não consulta Job Objects.
+
 ## 4. Requisitos não funcionais e características verificáveis
 
 Esta seção registra características observáveis da implementação atual. Itens não implementados representam lacunas, não garantias oferecidas pelo sistema.
@@ -759,17 +814,19 @@ Esta seção registra características observáveis da implementação atual. It
 | NFR-004 | O servidor deve interromper a aceitação, aguardar conexões ativas e fechá-las quando o contexto de shutdown expirar. | Implementado e testado | `server/internal/transport/tcp/server.go`, `server_test.go` |
 | NFR-005 | Dados devem sobreviver à reinicialização do processo. | Não implementado | `storage/go/storage.go` |
 | NFR-006 | Comunicação deve oferecer criptografia TLS. | Não implementado | `server/cmd/memorydb/main.go` |
-| NFR-007 | O servidor deve impor timeouts de leitura e escrita e limitar o número de conexões TCP simultâneas. | Implementado e testado | `server/internal/transport/tcp/handler.go`, `handler_test.go`, `server.go`, `server_test.go` |
+| NFR-007 | O servidor deve impor timeouts de leitura/escrita e limites de conexões, requisições em processamento e payload de frame. | Implementado e testado | `server/internal/transport/tcp/handler.go`, `handler_resource_test.go`, `server.go`, `server_test.go` |
 | NFR-008 | O projeto deve possuir metas mensuráveis de latência e throughput. | Não identificado | Não foram identificadas metas ou benchmarks de performance |
 | NFR-009 | Falhas de processamento de conexões devem ser observáveis em logs. | Não implementado | `server/internal/transport/tcp/server.go` |
 | NFR-010 | Execução de comandos, storage, protocolo, codec e transporte devem possuir responsabilidades separadas. | Implementado | Pacotes internos do módulo `server` e módulo independente `storage/go` |
 | NFR-011 | O transporte TCP deve ser reutilizável sem dependência direta do Protobuf. | Implementado | `transport/tcp/go`, `drivers/go`, handler do servidor |
 | NFR-012 | Aplicações Go devem consumir o serviço por meio de uma API cliente. | Implementado e testado | `drivers/go/client.go`, `drivers/go/client_test.go` |
 | NFR-013 | Os módulos Go devem permitir desenvolvimento e testes independentes no workspace. | Implementado | `go.work` e arquivos `go.mod` dos sete módulos |
-| NFR-014 | O código deve passar pelos testes com detector de condições de corrida e análise estática. | Implementado, validação histórica | Registros de validação por módulo descritos na seção 8 |
-| NFR-015 | O registro de idempotência deve respeitar capacidade padrão de 100.000 registros, retenção de 24 horas e ausência de evicção antecipada de registros válidos. | Implementado e testado | `server/internal/idempotency/executor.go`, `executor_test.go` |
+| NFR-014 | O código deve passar pelos testes com detector de condições de corrida e análise estática. | Validado na execução registrada de 27/11/2026 | Registros por módulo descritos na seção 8; a validação é específica daquela execução |
+| NFR-015 | O registro de idempotência deve respeitar capacidade de acordo com o perfil/override, retenção padrão de 24 horas e ausência de evicção antecipada de registros válidos. | Implementado e testado | `server/resources`, `server/internal/idempotency/executor.go`, `executor_test.go` |
 | NFR-016 | A execução de operações com o mesmo `OperationID` deve ser sincronizada, evitando execuções concorrentes duplicadas. | Implementado e testado | `server/internal/idempotency/executor.go`, `executor_test.go` |
 | NFR-017 | O executor de idempotência deve calcular fingerprints determinísticos para operações mutáveis. | Implementado e testado | `server/internal/idempotency/fingerprint.go`, `fingerprint_test.go` |
+| NFR-018 | A configuração de recursos deve ser calculada e validada no startup, respeitando capacidade detectada e consistência dos orçamentos. | Implementado e testado | `server/resources`, `server/cmd/memorydb/resource_validation.go` |
+| NFR-019 | Os limites lógicos de Storage, Idempotência e Processamento devem ser aplicados pelos respectivos componentes. | Implementado e testado | `storage/go/storage.go`, `server/internal/idempotency/executor.go`, `server/internal/transport/tcp/handler.go` |
 
 ### 4.1. Observações sobre os requisitos não funcionais
 
@@ -787,13 +844,16 @@ O executável utiliza timeout configurável, com padrão de 10 segundos.
 
 O fechamento das conexões interrompe operações de I/O TCP, mas não equivale ao cancelamento genérico de qualquer operação executada pelo handler.
 
-**NFR-007 — Limites operacionais**
+**NFR-007 — Limites operacionais e de admissão**
 
 O servidor implementa:
 
 - Timeout de leitura TCP, com padrão de 30 segundos.
 - Timeout de escrita TCP, com padrão de 10 segundos.
-- Limite de 1.024 conexões simultâneas por padrão.
+- Limite de conexões TCP definido pelo perfil de recursos (1.024 no perfil `mid`).
+- Limite de requisições em processamento (256 no perfil `mid`).
+- Limite de payload por frame (256 KiB no perfil `mid`, sem ultrapassar o máximo de 1 MiB do transporte).
+- Reserva lógica de processamento antes da alocação do payload.
 
 Os valores podem ser ajustados por variáveis de ambiente:
 
@@ -801,7 +861,10 @@ Os valores podem ser ajustados por variáveis de ambiente:
 |---|---|---|
 | `MEMORYDB_READ_TIMEOUT` | Timeout de leitura TCP | 30 segundos |
 | `MEMORYDB_WRITE_TIMEOUT` | Timeout de escrita TCP | 10 segundos |
-| `MEMORYDB_MAX_CONNECTIONS` | Número máximo de conexões TCP simultâneas | 1.024 |
+| `MEMORYDB_MAX_CONNECTIONS` | Número máximo de conexões TCP simultâneas | Depende do perfil; 1.024 em `mid` |
+| `MEMORYDB_MAX_IN_FLIGHT_REQUESTS` | Máximo de requisições em processamento | Depende do perfil; 256 em `mid` |
+| `MEMORYDB_MAX_FRAME_PAYLOAD_SIZE` | Payload máximo do frame | Depende do perfil; 256 KiB em `mid` |
+| `MEMORYDB_RESOURCE_PROFILE` | Perfil de dimensionamento | `mid` |
 | `MEMORYDB_SHUTDOWN_TIMEOUT` | Prazo para encerramento do servidor | 10 segundos |
 
 Os timeouts são aplicados individualmente às operações de leitura e escrita, não como um prazo global para toda a vida da conexão.
@@ -815,6 +878,24 @@ Essas proteções não substituem mecanismos ainda não implementados, como time
 A goroutine criada por `Server.Serve()` descarta o erro retornado por `Handler.Handle`. Portanto, falhas individuais de conexão não são registradas de forma estruturada nesse ponto.
 
 O isolamento dessas falhas impede que um erro individual do handler seja propagado como falha do loop de aceitação, mas a ausência de registro dificulta diagnóstico e monitoramento.
+
+**NFR-018 e NFR-019 — Dimensionamento e contabilização de recursos**
+
+O pacote público `server/resources` pertence ao módulo `server` e expõe API Go para detectar recursos, carregar perfis, aplicar overrides e validar a configuração final.
+
+A memória do processo é distribuída em 55% para Storage, 15% para Idempotência, 15% para Processamento e 15% para Runtime. A soma dos quatro orçamentos deve ser igual ao orçamento total do processo.
+
+A contabilização possui semânticas distintas:
+- Storage contabiliza bytes lógicos de chave e valor;
+- Idempotência contabiliza uma reserva-base estimada e dados variáveis da resposta;
+- Processamento reserva memória lógica para frame e buffers antes da alocação do payload;
+- Runtime recebe o restante, mas ainda não possui aplicação por `GOMEMLIMIT`.
+
+Portanto, `ProcessMemoryBudget` não é um limite rígido de heap ou RSS. A capacidade de CPU também é utilizada no dimensionamento e validação, mas não configura `GOMAXPROCS` ou limite de CPU do sistema operacional.
+
+No Linux, a detecção considera cgroups v1/v2 e a hierarquia de ancestrais. No Windows, a detecção utiliza recursos do host e ainda não consulta Windows Job Objects.
+
+Consulte `docs/tecnica/RECURSOS.md` para os valores dos perfis e todas as variáveis de ambiente.
 
 **NFR-013 — Organização dos módulos Go**
 
@@ -844,7 +925,7 @@ A validação histórica de 22/11/2026 e a validação direcionada de 25/11/2026
 
 **NFR-015 a NFR-017 — Idempotência**
 
-A capacidade de 100.000 registros corresponde ao valor padrão implementado. Não deve ser interpretada como uma configuração externa disponível ao operador.
+A capacidade de 100.000 registros corresponde ao valor do perfil `mid`. O limite pode ser alterado por `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES`; `MEMORYDB_IDEMPOTENCY_CAPACITY` permanece aceito como alias legado. A retenção padrão é de 24 horas e pode ser alterada por `MEMORYDB_IDEMPOTENCY_RETENTION`.
 
 A retenção de 24 horas começa após a conclusão da operação. Registros em andamento não expiram por essa janela.
 
@@ -895,6 +976,13 @@ Os registros de idempotência são mantidos em memória e não oferecem durabili
 | Nova conexão durante shutdown | Conexão aceita durante a transição para shutdown é fechada, sem iniciar processamento | `server.go`, `server_test.go` |
 | Storage como módulo independente | Implementação possui módulo Go próprio, consumido pelo servidor como biblioteca no mesmo processo | `storage/go/go.mod`, `server/go.mod`, `server/cmd/memorydb/main.go` |
 | Injeção do Storage | Executável instancia a implementação concreta e a fornece ao Engine por sua interface | `server/internal/engine/storage.go`, `server/internal/engine/engine.go`, `server/cmd/memorydb/main.go` |
+| Perfil de recursos ausente | Carregador utiliza `mid` | `server/resources/env.go`, `loader_test.go` |
+| Perfil preset acima da capacidade detectada | Carregador rejeita a configuração | `server/resources/loader.go`, `loader_test.go` |
+| CPU/memória custom acima da capacidade detectada | Carregador rejeita a configuração | `server/resources/loader.go`, `loader_test.go` |
+| Limite de cgroup v2 ilimitado | Detecção utiliza capacidade do host quando não há limite finito | `server/resources/detector_linux.go`, `detector_linux_limits_test.go` |
+| Limite de memória cgroup v2 finito | Capacidade disponível considera limite menos uso atual | `server/resources/detector_linux_memory.go`, testes Linux de recursos |
+| Variáveis canônica e legada de capacidade idempotente divergentes | Carregador retorna conflito | `server/resources/env.go`, `env_edge_cases_test.go` |
+| Soma dos orçamentos de memória inconsistente | Validação rejeita a configuração | `server/resources/validator.go`, `validator_test.go` |
 
 ## 6. Rastreabilidade requisito–componente–teste
 
@@ -912,6 +1000,7 @@ Os registros de idempotência são mantidos em memória e não oferecem durabili
 | FR-010 | Server / Executável | `TestServerShutdownWaitsForActiveConnections`, `TestServerClosesAcceptedConnectionDuringShutdown` e testes de integração | Coberto para espera graciosa e fechamento forçado; fluxo de sinais sem teste específico identificado |
 | FR-011 | Driver Go / Executor / Handler | Testes de escrita parcial, execução no servidor com perda da resposta, cancelamento durante leitura e replay no servidor | Parcial: cancelamento e sinalização de resultado indeterminado cobertos; recuperação por repetição validada no servidor, sem teste ponta a ponta com o driver |
 | FR-012 | Protobuf / Handler / Executor / Driver Go | `executor_test.go`, `fingerprint_test.go`, `handler_test.go`, `server_test.go`, `client_test.go` e testes de integração | Parcial: cenários de idempotência cobertos; recuperação ponta a ponta após resultado indeterminado sem teste específico identificado |
+| FR-013 | `server/resources` / Configuração / Executável | `calculator_test.go`, `loader_test.go`, `env_test.go`, testes de detecção Linux/Windows e `resource_validation_test.go` | Coberto para perfis, cálculo, detecção e validação; caminhos específicos dependem da plataforma de execução |
 
 ## 7. Lacunas de especificação e comportamento
 
@@ -1018,13 +1107,30 @@ A arquitetura permite evolução para outros drivers, mas não há implementaç�
 
 ### GAP-011 — Configuração operacional da idempotência não exposta
 
-A implementação utiliza capacidade padrão de 100.000 registros e retenção padrão de 24 horas.
+**Estado: resolvido na implementação atual.**
 
-Não foi identificada configuração externa para ajustar esses parâmetros no executável do servidor.
+A capacidade e a retenção do Executor agora são carregadas pelo pacote `server/resources` e aplicadas durante a composição do servidor.
 
-**Impacto:** operadores não podem ajustar esses limites por configuração de inicialização. Alterações nos valores padrão exigem mudança na implementação.
+- `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` configura o máximo de registros.
+- `MEMORYDB_IDEMPOTENCY_CAPACITY` permanece como alias legado.
+- `MEMORYDB_IDEMPOTENCY_MEMORY_BUDGET` configura o orçamento lógico.
+- `MEMORYDB_IDEMPOTENCY_RETENTION` configura a retenção.
 
-**Referências:** `server/internal/idempotency/executor.go`, `server/cmd/memorydb/main.go`.
+Se os nomes canônico e legado forem informados simultaneamente com valores diferentes, o carregamento retorna erro de conflito.
+
+**Referências:** `server/resources/env.go`, `server/cmd/memorydb/main.go`, `server/internal/idempotency/executor.go`.
+
+### GAP-012 — Limites rígidos de CPU e memória do processo
+
+A configuração de recursos calcula um orçamento de memória para o processo e uma capacidade de CPU, mas não aplica limites globais do runtime ou do sistema operacional.
+
+`Runtime.MemoryBudget` não é aplicado por `GOMEMLIMIT` ou `debug.SetMemoryLimit`. `ProcessMemoryBudget` não representa um limite rígido de heap ou RSS. `CPUCapacity` não altera `GOMAXPROCS`, afinidade ou quota de CPU.
+
+No Windows, a detecção ainda não consulta limites de Windows Job Objects.
+
+**Impacto:** os orçamentos e limites lógicos reduzem e organizam o consumo previsto por componente, mas não garantem que o processo permaneça abaixo de um teto global de memória ou CPU.
+
+**Referências:** `server/resources`, `server/internal/config/config.go`, `server/cmd/memorydb/main.go`.
 
 ## 8. Histórico de validação técnica
 
@@ -1131,6 +1237,36 @@ O Storage continua sendo executado dentro do processo do servidor. A extração 
 
 **Limite da evidência:** a existência do módulo e sua integração arquitetural estão registradas no código dessa versão. Os resultados das validações históricas das seções anteriores não devem ser interpretados como execução dos testes do novo módulo, pois ele ainda não existia naquela validação. A validação integral do workspace de sete módulos deve ser registrada separadamente quando executada nessa versão.
 
+### 8.4. Dimensionamento de recursos e pipeline integral — 27/11/2026
+
+Em 27/11/2026, o pipeline completo `./scripts/test.sh` foi executado no WSL Ubuntu após as alterações no pacote `server/resources`.
+
+Todas as etapas concluíram com sucesso:
+
+- formatação;
+- análise estática (`go vet`);
+- testes unitários;
+- testes com detector de condições de corrida;
+- compilação;
+- cobertura;
+- análise de blocos não cobertos.
+
+Cobertura observada:
+
+| Módulo | Cobertura |
+|---|---:|
+| `api` | 97,6% |
+| `drivers/go` | 95,3% |
+| `protocol/generated/go` | 0,0% |
+| `server` | 95,1% |
+| `shared` | 100,0% |
+| `transport/tcp/go` | 98,3% |
+| `storage/go` | 98,2% |
+
+O pacote `server/resources` apresentou 96,3% de cobertura dentro do módulo `server`. O arquivo Protobuf gerado não possui testes próprios e, por isso, aparece com cobertura zero.
+
+**Escopo da evidência:** a execução comprova o pipeline Linux informado em WSL Ubuntu. Testes protegidos por `//go:build windows` não são executados nessa plataforma. Uma validação Windows deve ser registrada separadamente.
+
 ## 9. Critério geral de conclusão do escopo atual
 
 O escopo funcional inicial do MemoryDB é considerado implementado quando:
@@ -1146,10 +1282,11 @@ O escopo funcional inicial do MemoryDB é considerado implementado quando:
 9. O driver Go permite consumir as operações sem implementar manualmente o protocolo.
 10. O driver Go oferece operações context-aware e sinaliza resultados indeterminados quando não é possível confirmar o desfecho de uma operação.
 11. O servidor oferece encerramento gracioso e forçado, com espera pelas conexões ativas e fechamento das conexões restantes quando o contexto expira.
-12. O servidor aplica timeouts de leitura e escrita e limita o número de conexões TCP simultâneas.
-13. SET e DELETE exigem `OperationID` e possuem deduplicação server-side com fingerprint, replay de respostas, controle de concorrência, retenção e capacidade.
-14. O driver Go permite gerar e fornecer `OperationID`, sem realizar retries automáticos.
-15. A validação automatizada registrada inclui testes, análise estática e testes com detector de condições de corrida nos módulos do workspace, respeitando as datas e os limites de cada execução documentada.
+12. O servidor aplica timeouts de leitura e escrita e limites configuráveis de conexões, requisições em processamento e payload de frame.
+13. O pacote público `server/resources` detecta capacidade, calcula perfis, aplica overrides e valida os orçamentos lógicos no startup.
+14. SET e DELETE exigem `OperationID` e possuem deduplicação server-side com fingerprint, replay de respostas, controle de concorrência, retenção e capacidade.
+15. O driver Go permite gerar e fornecer `OperationID`, sem realizar retries automáticos.
+16. A validação automatizada registrada inclui testes, análise estática e testes com detector de condições de corrida nos módulos do workspace, respeitando as datas e os limites de cada execução documentada.
 
 Os GAPs documentados neste arquivo não impedem a conclusão do escopo inicial, pois representam evoluções planejadas e limitações conhecidas da implementação atual.
 

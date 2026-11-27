@@ -14,7 +14,8 @@ A arquitetura separa responsabilidades de:
 - armazenamento em memória;
 - controle de idempotência para operações mutáveis;
 - comunicação de aplicações clientes por meio de um driver Go;
-- definição compartilhada de nomes de variáveis de ambiente e valores padrão.
+- definição compartilhada de nomes de variáveis de ambiente e valores padrão;
+- detecção, dimensionamento e validação de recursos disponíveis no ambiente.
 
 O armazenamento é implementado no módulo Go independente `storage/go`. O servidor utiliza esse módulo como biblioteca e injeta sua implementação no Engine por meio de uma interface definida no próprio módulo Server.
 
@@ -102,6 +103,7 @@ As responsabilidades internas do servidor estão distribuídas entre os seguinte
 |---|---|
 | `server/cmd/memorydb` | Inicialização, composição das dependências, carregamento de configurações e encerramento |
 | `server/internal/config` | Carregamento, aplicação de padrões e validação das configurações operacionais do servidor |
+| `server/resources` | API Go pública para detecção, cálculo, override e validação de limites e orçamentos de recursos |
 | `server/internal/transport/tcp` | Aceitação de conexões e processamento de solicitações |
 | `server/internal/codec` | Contrato de codificação e decodificação |
 | `server/internal/codec/protobuf` | Adaptação entre o modelo interno e os tipos Protobuf |
@@ -139,6 +141,7 @@ flowchart TB
 
     Entry --> Config
     Config --> SharedConfig
+    Config --> Resources["server/resources"]
     Entry --> TCPServer
     Entry --> Handler
     Entry --> Idempotency
@@ -186,7 +189,11 @@ O Executor mantém seus próprios registros em memória, separados dos dados de 
 
 A instância do Executor é criada durante a composição do servidor e compartilhada entre os handlers das conexões aceitas pelo mesmo processo.
 
-Os nomes das variáveis de ambiente e os valores padrão compartilhados são definidos em `shared/config/defaults.go`. As regras de carregamento e validação específicas do servidor ficam em `server/internal/config/config.go`.
+Os nomes das variáveis de ambiente e os valores padrão compartilhados são definidos em `shared/config/defaults.go`. As regras de carregamento das configurações operacionais específicas do servidor ficam em `server/internal/config/config.go`.
+
+O pacote `server/resources` é uma API Go pública dentro do módulo `server`. Ele detecta a capacidade disponível, calcula os limites dos componentes a partir de um perfil, aplica overrides e valida a configuração final. `server/internal/config` chama `LoadResourceConfigFromEnv()` durante o startup e agrega o resultado às configurações operacionais do servidor.
+
+O pacote de recursos não é uma camada de execução nem um serviço separado. Ele não detecta hardware dentro do Storage, Engine ou Handler: a detecção ocorre antes da composição e os componentes recebem somente seus próprios limites.
 
 ### 3.3 Responsabilidades do Handler, Executor e Engine
 
@@ -410,7 +417,9 @@ Os registros de idempotência não são armazenados nesse mapa. O Executor mant�
 - Não há replicação.
 - Não há compartilhamento de dados entre processos ou instâncias.
 - TTL positivo não é implementado.
-- Não existe limite global de memória do processo implementado pelo Storage.
+- No servidor, `NewWithConfig` aplica máximo de entradas, orçamento lógico e tamanhos máximos de chave e valor.
+- O orçamento do Storage contabiliza `len(key)+len(value)` e não inclui overhead de `map`, estruturas Go, cópias ou runtime.
+- O limite do Storage não representa limite global de memória do processo.
 
 ## 7. Driver Go e modelo de comunicação
 
@@ -538,41 +547,35 @@ O erro `OPERATION_OUTCOME_UNKNOWN` retornado pelo servidor e o erro local `Opera
 
 O executável está em `server/cmd/memorydb/main.go`.
 
-As configurações operacionais são carregadas pelo pacote `server/internal/config`, implementado em `server/internal/config/config.go`.
+As configurações operacionais são carregadas por `server/internal/config`. A configuração de recursos é carregada pelo pacote público `server/resources`, chamado por `server/internal/config.Load()` durante o startup.
 
-Os nomes das variáveis de ambiente e os valores padrão compartilhados são definidos em `shared/config/defaults.go`.
+Os nomes e valores padrão compartilhados são definidos em `shared/config/defaults.go`. Variáveis ausentes ou vazias utilizam o padrão correspondente; valores presentes, mas inválidos ou inconsistentes, impedem a inicialização.
 
-As variáveis podem ser definidas no ambiente de execução. Quando uma variável está ausente ou vazia, seu valor padrão é utilizado. Valores explicitamente informados, mas inválidos, impedem a inicialização.
-
-| Variável | Padrão | Descrição |
+| Variável operacional | Padrão | Descrição |
 |---|---:|---|
 | `MEMORYDB_ADDR` | `:6380` | Endereço TCP utilizado pelo listener |
 | `MEMORYDB_READ_TIMEOUT` | `30s` | Timeout de leitura TCP do Handler |
 | `MEMORYDB_WRITE_TIMEOUT` | `10s` | Timeout de escrita TCP do Handler |
-| `MEMORYDB_MAX_CONNECTIONS` | `1024` | Número máximo de conexões TCP simultâneas |
 | `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Tempo máximo aguardado pelo encerramento gracioso |
-| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência após a conclusão |
-| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros de idempotência |
 
-As durações utilizam o formato aceito por `time.ParseDuration`, como `5s`, `30s`, `2m` e `24h`. Os valores de duração devem ser positivos. A capacidade e o limite de conexões devem ser inteiros positivos.
+O perfil padrão de recursos é `mid`. Limites como máximo de conexões, requisições em processamento, payload máximo, capacidade e orçamento de idempotência são determinados pelo perfil e podem ser sobrescritos por variáveis como `MEMORYDB_MAX_CONNECTIONS`, `MEMORYDB_MAX_IN_FLIGHT_REQUESTS`, `MEMORYDB_MAX_FRAME_PAYLOAD_SIZE`, `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` e `MEMORYDB_IDEMPOTENCY_RETENTION`.
 
-A ausência ou o valor vazio de uma variável utiliza o padrão correspondente. Um valor explicitamente informado que não possa ser interpretado ou que não satisfaça as validações resulta em erro de configuração.
+As durações operacionais utilizam o formato aceito por `time.ParseDuration`. A configuração de recursos também aceita unidades de memória e quantidades de CPU. Consulte [Dimensionamento e detecção de recursos](./RECURSOS.md) para a tabela completa e os valores dos perfis.
 
 A configuração do endereço é carregada como texto. A validação de sua utilização como endereço TCP ocorre quando o executável tenta criar o listener por meio de `net.Listen`.
 
 O ponto de entrada realiza a composição do servidor:
 
-1. carrega e valida as configurações operacionais;
-2. cria o listener TCP utilizando o endereço configurado;
-3. instancia o codec Protobuf;
-4. instancia a implementação concreta de Storage;
-5. injeta Storage no Engine por meio da interface definida em `server/internal/engine/storage.go`;
-6. cria uma instância compartilhada do Executor de idempotência, utilizando os parâmetros configurados;
-7. cria o Handler, injetando Engine, Codec e Executor, além dos timeouts de leitura e escrita;
-8. cria o servidor com o limite configurado de conexões simultâneas;
+1. carrega e valida as configurações operacionais e a configuração de recursos;
+2. instancia o Storage com os limites calculados;
+3. cria o Executor de idempotência com capacidade, orçamento e retenção configurados;
+4. instancia o codec Protobuf e o Engine, injetando Storage por meio da interface definida em `server/internal/engine/storage.go`;
+5. cria o Handler com Engine, Codec, Executor e limites de processamento;
+6. cria o listener TCP utilizando o endereço configurado;
+7. cria o servidor com o limite configurado de conexões simultâneas;
+8. registra o contexto de sinais para `SIGINT` e `SIGTERM`;
 9. inicia `Server.Serve()` em uma goroutine;
-10. trata `SIGINT` e `SIGTERM`;
-11. solicita encerramento com o timeout configurado.
+10. ao receber sinal, solicita encerramento com o timeout configurado.
 
 O Executor é criado uma única vez durante a composição do servidor e compartilhado pelos handlers das conexões atendidas pelo mesmo processo.
 
@@ -616,7 +619,41 @@ Os valores são configuráveis por `MEMORYDB_READ_TIMEOUT` e `MEMORYDB_WRITE_TIM
 
 Esses timeouts limitam a duração das operações de I/O correspondentes. Não constituem um timeout global de execução de comandos, nem um limite de duração de todas as operações internas do servidor.
 
-## 9. Limites arquiteturais atuais
+## 9. Dimensionamento e aplicação de recursos
+
+O pacote `server/resources` calcula uma configuração de recursos no startup. O perfil padrão é `mid`; também são suportados `low`, `high`, `auto` e `custom`.
+
+Os presets `low`, `mid` e `high` são determinísticos e podem ser rejeitados quando excedem os recursos detectados. `auto` usa a capacidade detectada de CPU e memória; `custom` recebe esses dois valores explicitamente, mas também precisa respeitar a capacidade detectada. Os perfis `auto` e `custom` utilizam o mesmo algoritmo de distribuição.
+
+O orçamento de memória do processo é dividido em quatro parcelas: Storage (55%), Idempotência (15%), Processamento (15%) e Runtime (15%). A soma é validada para corresponder exatamente ao orçamento do processo.
+
+A configuração é distribuída no ponto de composição:
+- Storage recebe `MaxEntries`, `MemoryBudget`, `MaxKeySize` e `MaxValueSize`;
+- Executor recebe `MaxEntries`, `MemoryBudget` e `Retention`;
+- Handler recebe `MaxInFlightRequests`, `MaxFramePayloadSize` e `Processing.MemoryBudget`;
+- Server TCP recebe `MaxConnections`.
+
+O pacote de recursos é desacoplado dos componentes. Ele não introduz detecção de cgroups ou hardware nas camadas de armazenamento e processamento.
+
+### 9.1. Detecção de capacidade
+
+No Linux, a detecção utiliza `runtime.NumCPU()`, `MemAvailable` de `/proc/meminfo` e os limites aplicáveis de cgroups v1/v2. CPU é calculada a partir de quota/período; memória disponível no cgroup é limite menos uso atual. A detecção considera o cgroup atual e seus ancestrais, usando o menor limite aplicável e comparando-o com a capacidade disponível do host. Sem metadados de cgroups, utiliza os recursos do host.
+
+No Windows, CPU é obtida por `runtime.NumCPU()` e memória disponível por `GlobalMemoryStatusEx`. A implementação atual não consulta Windows Job Objects. Outros sistemas operacionais não possuem implementação de detecção e retornam erro de plataforma não suportada.
+
+São descontadas margens de segurança de 10% para CPU e 20% para memória detectadas.
+
+### 9.2. Limites lógicos versus limites do processo
+
+Os orçamentos de Storage, Idempotência e Processamento são aplicados por contabilização lógica. Eles não equivalem a uma medição exata do heap Go ou do RSS.
+
+O orçamento de Storage contabiliza `len(key)+len(value)`. O de Idempotência contabiliza uma estimativa da estrutura base e dos dados variáveis da resposta. O Handler reserva capacidade lógica para o frame e buffers de processamento antes de alocar o payload.
+
+A parcela Runtime é o restante do orçamento, mas ainda não é aplicada por `GOMEMLIMIT` ou `debug.SetMemoryLimit`. O orçamento total do processo não é um limite rígido de memória do sistema operacional. Da mesma forma, `CPUCapacity` é uma capacidade utilizada no cálculo e na validação; não configura `GOMAXPROCS`, afinidade ou limite de CPU.
+
+Consulte [Dimensionamento e detecção de recursos](./RECURSOS.md) para os presets, variáveis de ambiente, API Go e detalhes de implementação.
+
+## 10. Limites arquiteturais atuais
 
 | Área | Estado atual |
 |---|---|
@@ -637,7 +674,7 @@ Esses timeouts limitam a duração das operações de I/O correspondentes. Não 
 | Limite global de memória | Não implementado |
 | Observabilidade estruturada por conexão | Não implementada no fluxo atual |
 
-### 9.1 Idempotência e deduplicação
+### 10.1 Idempotência e deduplicação
 
 **Estado: implementado e validado em 22/11/2026.**
 
@@ -673,11 +710,11 @@ O Executor recebe o fingerprint calculado pelo Handler e o utiliza para comparar
 A implementação utiliza:
 
 - retenção padrão de 24 horas após a conclusão da operação;
-- capacidade padrão de 100.000 registros;
+- capacidade de 100.000 registros no perfil `mid`;
 - armazenamento exclusivamente em memória;
 - compartilhamento dos registros entre as conexões da mesma instância.
 
-A retenção e a capacidade podem ser configuradas no servidor por meio das variáveis `MEMORYDB_IDEMPOTENCY_RETENTION` e `MEMORYDB_IDEMPOTENCY_CAPACITY`, respectivamente.
+A retenção e a capacidade podem ser configuradas no servidor por meio de `MEMORYDB_IDEMPOTENCY_RETENTION` e `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES`, respectivamente. `MEMORYDB_IDEMPOTENCY_CAPACITY` é aceito como alias legado; se os dois nomes forem informados com valores diferentes, a configuração é rejeitada.
 
 A capacidade contabiliza operações em andamento e concluídas.
 
@@ -716,7 +753,7 @@ A implementação não oferece:
 
 A aplicação consumidora é responsável por fornecer e reutilizar o mesmo identificador nas tentativas da mesma operação lógica, preservando os parâmetros semânticos.
 
-## 10. Evoluções arquiteturais
+## 11. Evoluções arquiteturais
 
 As evoluções abaixo exigem decisões de contrato e mudanças coordenadas entre componentes.
 

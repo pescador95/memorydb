@@ -40,7 +40,9 @@ func (e *Engine) Execute(request *protocol.Request) *protocol.Response {
 			return errorResponse(requestID, ErrUnsupportedFeature, "TTL is not supported yet")
 		}
 
-		e.storage.Set(command.Key, command.Value)
+		if err := e.storage.Set(command.Key, command.Value); err != nil {
+			return storageErrorResponse(requestID, err)
+		}
 
 		return &protocol.Response{
 			RequestID: requestID,
@@ -56,7 +58,10 @@ func (e *Engine) Execute(request *protocol.Request) *protocol.Response {
 			return errorResponse(requestID, ErrInvalidArgument, "key cannot be empty")
 		}
 
-		value, found := e.storage.Get(command.Key)
+		value, found, err := e.storage.Get(command.Key)
+		if err != nil {
+			return storageErrorResponse(requestID, err)
+		}
 
 		return &protocol.Response{
 			RequestID: requestID,
@@ -75,7 +80,10 @@ func (e *Engine) Execute(request *protocol.Request) *protocol.Response {
 			return errorResponse(requestID, ErrInvalidArgument, "key cannot be empty")
 		}
 
-		deleted := e.storage.Delete(command.Key)
+		deleted, err := e.storage.Delete(command.Key)
+		if err != nil {
+			return storageErrorResponse(requestID, err)
+		}
 
 		return &protocol.Response{
 			RequestID: requestID,

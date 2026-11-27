@@ -173,6 +173,142 @@ func TestReadFrameRejectsIncompletePayload(t *testing.T) {
 	}
 }
 
+func TestReadFrameWithReservationReleasesOnPayloadError(t *testing.T) {
+	var buffer bytes.Buffer
+
+	_ = binary.Write(&buffer, binary.BigEndian, uint32(10))
+	buffer.Write([]byte("short"))
+
+	releaseCalls := 0
+
+	_, release, err := ReadFrameWithReservation(
+		&buffer,
+		MaxFrameSize,
+		func(size uint32) (func(), error) {
+			return func() {
+				releaseCalls++
+			}, nil
+		},
+	)
+
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("error = %v, want io.ErrUnexpectedEOF", err)
+	}
+
+	if release != nil {
+		t.Fatal("release function must be nil when payload reading fails")
+	}
+
+	if releaseCalls != 1 {
+		t.Fatalf("release calls = %d, want 1", releaseCalls)
+	}
+}
+
+func TestReadFrameWithReservationReleasesWhenReserveReturnsError(t *testing.T) {
+	var buffer bytes.Buffer
+
+	if err := WriteFrame(&buffer, []byte("test")); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedErr := errors.New("resource reservation failed")
+	releaseCalls := 0
+
+	payload, release, err := ReadFrameWithReservation(
+		&buffer,
+		MaxFrameSize,
+		func(size uint32) (func(), error) {
+			return func() {
+				releaseCalls++
+			}, expectedErr
+		},
+	)
+
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("error = %v, want %v", err, expectedErr)
+	}
+
+	if payload != nil {
+		t.Fatalf("payload = %q, want nil", payload)
+	}
+
+	if release != nil {
+		t.Fatal("release function must be nil when reservation fails")
+	}
+
+	if releaseCalls != 1 {
+		t.Fatalf("release calls = %d, want 1", releaseCalls)
+	}
+}
+
+func TestReadFrameWithReservationRejectsNilRelease(t *testing.T) {
+	var buffer bytes.Buffer
+
+	if err := WriteFrame(&buffer, []byte("test")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, release, err := ReadFrameWithReservation(
+		&buffer,
+		MaxFrameSize,
+		func(size uint32) (func(), error) {
+			return nil, nil
+		},
+	)
+
+	if err == nil {
+		t.Fatal("expected error when reservation returns nil release")
+	}
+
+	if release != nil {
+		t.Fatal("release function must be nil")
+	}
+}
+
+func TestReadFrameWithReservationTransfersReleaseOwnership(t *testing.T) {
+	payload := []byte("reserved payload")
+
+	var buffer bytes.Buffer
+
+	if err := WriteFrame(&buffer, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	releaseCalls := 0
+
+	got, release, err := ReadFrameWithReservation(
+		&buffer,
+		MaxFrameSize,
+		func(size uint32) (func(), error) {
+			return func() {
+				releaseCalls++
+			}, nil
+		},
+	)
+
+	if err != nil {
+		t.Fatalf("ReadFrameWithReservation() error = %v", err)
+	}
+
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+
+	if release == nil {
+		t.Fatal("expected release function")
+	}
+
+	if releaseCalls != 0 {
+		t.Fatalf("release calls before ownership transfer = %d, want 0", releaseCalls)
+	}
+
+	release()
+
+	if releaseCalls != 1 {
+		t.Fatalf("release calls after release = %d, want 1", releaseCalls)
+	}
+}
+
 func TestWriteFrameRejectsEmptyPayload(t *testing.T) {
 	var buffer bytes.Buffer
 

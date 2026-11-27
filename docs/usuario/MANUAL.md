@@ -85,7 +85,9 @@ Linux:
 MEMORYDB_ADDR=127.0.0.1:6380 go run ./cmd/memorydb
 ```
 
-O servidor disponibiliza configurações para endereço, encerramento, timeouts de I/O, limite de conexões e Executor de idempotência.
+O servidor carrega a configuração de recursos durante o startup. O perfil padrão é `mid`; ele define os limites iniciais de Storage, idempotência, conexões, requisições em processamento e tamanho de frame.
+
+#### Configurações operacionais do servidor
 
 | Variável | Padrão | Descrição |
 |---|---:|---|
@@ -93,44 +95,79 @@ O servidor disponibiliza configurações para endereço, encerramento, timeouts 
 | `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` | Prazo para encerramento do servidor |
 | `MEMORYDB_READ_TIMEOUT` | `30s` | Timeout de cada operação de leitura TCP |
 | `MEMORYDB_WRITE_TIMEOUT` | `10s` | Timeout de cada operação de escrita TCP |
-| `MEMORYDB_MAX_CONNECTIONS` | `1024` | Número máximo de conexões TCP simultâneas admitidas |
-| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros de idempotência concluídos |
-| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros de idempotência |
 
-Os timeouts de leitura e escrita são aplicados individualmente às operações de I/O. Eles não representam um prazo global para toda a conexão.
+Os timeouts de leitura e escrita são aplicados individualmente às operações de I/O. Eles não representam um prazo global para toda a conexão ou execução do comando. O limite de requisições em processamento é compartilhado pelo Handler entre as conexões do servidor, não sendo um limite independente por conexão.
 
-O limite de conexões considera conexões TCP simultâneas admitidas pelo servidor. Não representa quantidade de requisições por conexão. Quando o limite é atingido, novas conexões são fechadas sem serem admitidas para processamento.
+#### Perfil e limites de recursos
+
+| Variável | Padrão no perfil `mid` | Descrição |
+|---|---:|---|
+| `MEMORYDB_RESOURCE_PROFILE` | `mid` | Perfil `low`, `mid`, `high`, `auto` ou `custom` |
+| `MEMORYDB_RESOURCE_CPU` | Não definida; obrigatória em `custom` | Capacidade de CPU informada pelo operador |
+| `MEMORYDB_RESOURCE_MEMORY` | Não definida; obrigatória em `custom` | Orçamento de memória informado pelo operador |
+| `MEMORYDB_STORAGE_MAX_ENTRIES` | `500000` | Override do máximo de entradas do Storage |
+| `MEMORYDB_STORAGE_MEMORY_BUDGET` | 55% do orçamento do processo | Override do orçamento lógico do Storage |
+| `MEMORYDB_STORAGE_MAX_KEY_SIZE` | `512` bytes | Tamanho máximo da chave |
+| `MEMORYDB_STORAGE_MAX_VALUE_SIZE` | `64KiB` | Tamanho máximo do valor |
+| `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` | `100000` | Máximo de registros de idempotência |
+| `MEMORYDB_IDEMPOTENCY_CAPACITY` | Alias legado | Alias de `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` |
+| `MEMORYDB_IDEMPOTENCY_MEMORY_BUDGET` | 15% do orçamento do processo | Orçamento lógico da idempotência |
+| `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Retenção dos registros concluídos |
+| `MEMORYDB_MAX_CONNECTIONS` | `1024` | Máximo de conexões TCP simultâneas |
+| `MEMORYDB_MAX_IN_FLIGHT_REQUESTS` | `256` | Máximo de requisições em processamento |
+| `MEMORYDB_MAX_FRAME_PAYLOAD_SIZE` | `256KiB` | Tamanho máximo do payload de cada frame |
+| `MEMORYDB_PROCESSING_MEMORY_BUDGET` | 15% do orçamento do processo | Orçamento lógico de processamento |
+| `MEMORYDB_RUNTIME_MEMORY_BUDGET` | 15% do orçamento do processo | Parcela reservada ao runtime |
+
+Os valores da tabela são os do perfil `mid`. Os perfis `low` e `high` possuem limites diferentes. `auto` calcula o dimensionamento com base na capacidade detectada; `custom` utiliza CPU e orçamento de memória informados explicitamente. Presets fixos podem ser rejeitados quando excederem os recursos disponíveis.
+
+No perfil `mid`, o orçamento total de memória do processo é 1 GiB, dividido em 55% para Storage, 15% para Idempotência, 15% para Processamento e 15% para Runtime. Esses orçamentos são contabilizações lógicas por componente, não um limite rígido de heap ou RSS. A parcela Runtime ainda não é aplicada por `GOMEMLIMIT`.
+
+Exemplo Linux utilizando o perfil automático:
+
+```bash
+MEMORYDB_RESOURCE_PROFILE=auto \
+MEMORYDB_ADDR=127.0.0.1:6380 \
+go run ./cmd/memorydb
+```
+
+Exemplo Linux utilizando o perfil customizado:
+
+```bash
+MEMORYDB_RESOURCE_PROFILE=custom \
+MEMORYDB_RESOURCE_CPU=1500m \
+MEMORYDB_RESOURCE_MEMORY=2GiB \
+MEMORYDB_MAX_CONNECTIONS=1500 \
+MEMORYDB_IDEMPOTENCY_MAX_ENTRIES=150000 \
+MEMORYDB_IDEMPOTENCY_RETENTION=48h \
+go run ./cmd/memorydb
+```
 
 Exemplo PowerShell:
 
 ```powershell
-$env:MEMORYDB_ADDR = "127.0.0.1:6381"
-$env:MEMORYDB_SHUTDOWN_TIMEOUT = "15s"
-$env:MEMORYDB_READ_TIMEOUT = "45s"
-$env:MEMORYDB_WRITE_TIMEOUT = "15s"
-$env:MEMORYDB_MAX_CONNECTIONS = "2048"
+$env:MEMORYDB_RESOURCE_PROFILE = "custom"
+$env:MEMORYDB_RESOURCE_CPU = "1500m"
+$env:MEMORYDB_RESOURCE_MEMORY = "2GiB"
+$env:MEMORYDB_MAX_CONNECTIONS = "1500"
+$env:MEMORYDB_IDEMPOTENCY_MAX_ENTRIES = "150000"
 $env:MEMORYDB_IDEMPOTENCY_RETENTION = "48h"
-$env:MEMORYDB_IDEMPOTENCY_CAPACITY = "200000"
 
 go run ./cmd/memorydb
 ```
 
-Exemplo Linux:
+A capacidade de CPU aceita cores ou millicores, por exemplo `1.5` ou `1500m`. Tamanhos de memória aceitam bytes e unidades decimais/binárias, como `512MB`, `2GB`, `512MiB` e `2GiB`.
 
-```bash
-MEMORYDB_ADDR=127.0.0.1:6381 \
-MEMORYDB_SHUTDOWN_TIMEOUT=15s \
-MEMORYDB_READ_TIMEOUT=45s \
-MEMORYDB_WRITE_TIMEOUT=15s \
-MEMORYDB_MAX_CONNECTIONS=2048 \
-MEMORYDB_IDEMPOTENCY_RETENTION=48h \
-MEMORYDB_IDEMPOTENCY_CAPACITY=200000 \
-go run ./cmd/memorydb
-```
+Se `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` e `MEMORYDB_IDEMPOTENCY_CAPACITY` forem informadas ao mesmo tempo, os valores precisam ser iguais; valores divergentes impedem o startup.
 
-As variáveis ausentes ou vazias utilizam seus respectivos valores padrão. Valores explicitamente informados, mas inválidos, impedem a inicialização do servidor.
+Os overrides são validados em conjunto. Uma configuração inválida — por exemplo, orçamentos que não somam o orçamento total do processo, valores não positivos ou valor máximo maior que o payload máximo do frame — impede a inicialização.
 
-As configurações de duração aceitam os formatos reconhecidos por `time.ParseDuration`, como `5s`, `10m` e `24h`. Os valores de duração e capacidade devem ser positivos.
+A detecção de recursos varia por sistema operacional:
+- Linux: CPU e memória do host, com limites aplicáveis de cgroups v1/v2;
+- Windows: CPU e memória disponíveis no host; limites de Windows Job Objects ainda não são consultados;
+- outras plataformas: detecção não implementada.
+
+Consulte o [guia de dimensionamento de recursos](../tecnica/RECURSOS.md) para os valores completos dos perfis, algoritmo, variáveis de ambiente e limitações.
 
 Para remover uma variável na sessão atual do PowerShell:
 
@@ -715,22 +752,24 @@ Operações em andamento não expiram enquanto estiverem sendo executadas.
 
 A capacidade considera tanto operações em andamento quanto operações concluídas ainda retidas.
 
-Os parâmetros de retenção e capacidade podem ser alterados por variáveis de ambiente no servidor:
+Os parâmetros de retenção, capacidade e orçamento lógico podem ser alterados por variáveis de ambiente no servidor:
 
-| Variável | Padrão | Descrição |
+| Variável | Padrão no perfil `mid` | Descrição |
 |---|---:|---|
+| `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` | `100000` | Capacidade máxima de registros |
+| `MEMORYDB_IDEMPOTENCY_CAPACITY` | Alias legado | Alias compatível com o nome canônico |
+| `MEMORYDB_IDEMPOTENCY_MEMORY_BUDGET` | 15% do orçamento do processo | Orçamento lógico de memória |
 | `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` | Tempo de retenção dos registros concluídos |
-| `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` | Capacidade máxima de registros |
 
 Exemplo:
 
 ```bash
 MEMORYDB_IDEMPOTENCY_RETENTION=48h \
-MEMORYDB_IDEMPOTENCY_CAPACITY=200000 \
+MEMORYDB_IDEMPOTENCY_MAX_ENTRIES=200000 \
 go run ./cmd/memorydb
 ```
 
-As durações aceitam os formatos reconhecidos por `time.ParseDuration`. A capacidade deve ser um inteiro positivo.
+As durações aceitam os formatos reconhecidos por `time.ParseDuration`. A capacidade deve ser um inteiro positivo. Se o nome canônico e o alias legado forem informados simultaneamente, os valores precisam ser iguais.
 
 Variáveis ausentes ou vazias utilizam os valores padrão. Valores explicitamente informados, mas inválidos ou não positivos, impedem a inicialização do servidor.
 
@@ -905,16 +944,21 @@ Depois de uma falha de comunicação ou cancelamento durante I/O, não reutilize
 | Timeout de shutdown inválido | Duração inválida ou não positiva | Confira `MEMORYDB_SHUTDOWN_TIMEOUT` |
 | Timeout de leitura inválido | Duração inválida ou não positiva | Confira `MEMORYDB_READ_TIMEOUT` |
 | Timeout de escrita inválido | Duração inválida ou não positiva | Confira `MEMORYDB_WRITE_TIMEOUT` |
-| Limite de conexões inválido | Valor não inteiro ou não positivo | Confira `MEMORYDB_MAX_CONNECTIONS` |
+| Limite de conexões inválido | Valor não inteiro ou não positivo | Confira `MEMORYDB_MAX_CONNECTIONS` e o perfil de recursos |
+| Configuração de recursos inválida | Perfil, quantidade, orçamento ou override inconsistente | Confira `MEMORYDB_RESOURCE_PROFILE` e as variáveis de recursos em `RECURSOS.md` |
+| Recursos insuficientes | Preset ou perfil customizado excede CPU/memória detectados | Escolha um perfil menor ou ajuste os valores customizados |
+| Limite de requisições em processamento atingido | Limite de admissão simultânea foi atingido | Ajuste `MEMORYDB_MAX_IN_FLIGHT_REQUESTS` considerando o orçamento de processamento |
+| Orçamento lógico de processamento atingido | Reserva de frame/buffers não cabe no orçamento disponível | Revise `MEMORYDB_PROCESSING_MEMORY_BUDGET`, o tamanho de frame e o número de requisições em processamento |
 | Conexão fechada ao atingir limite | Número máximo de conexões simultâneas atingido | Verifique a utilização de conexões e ajuste o limite, se necessário |
 | Timeout de leitura ou escrita | Operação de I/O excedeu seu prazo | Verifique a comunicação e os tempos de resposta do cliente |
 | Configuração de retenção inválida | Duração inválida ou não positiva | Confira `MEMORYDB_IDEMPOTENCY_RETENTION` |
-| Capacidade de idempotência inválida | Valor não inteiro ou não positivo | Confira `MEMORYDB_IDEMPOTENCY_CAPACITY` |
+| Capacidade de idempotência inválida | Valor não inteiro ou não positivo | Confira `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` ou o alias `MEMORYDB_IDEMPOTENCY_CAPACITY` |
 | Chave vazia | SET, GET ou DELETE recebeu uma chave vazia | Envie uma chave não vazia |
 | TTL positivo | Funcionalidade ainda não implementada | Utilize `ttl_ms = 0` |
 | OperationID inválido | Identificador ausente ou diferente de 16 bytes | Gere um identificador com `memorydb.NewOperationID()` |
 | OperationID em conflito | Mesmo identificador utilizado com parâmetros diferentes | Confira os parâmetros; use outro identificador somente para uma nova operação lógica |
 | Capacidade de idempotência esgotada | Limite de registros atingido | Aguarde a expiração de registros concluídos antes de tentar novamente |
+| Orçamento lógico de idempotência atingido | Reserva da entrada ou resposta não cabe no orçamento | Revise `MEMORYDB_IDEMPOTENCY_MEMORY_BUDGET` e o perfil de recursos |
 | Frame com tamanho zero | Payload inválido | Envie um payload Protobuf válido |
 | Frame maior que 1 MiB | Payload excede o limite do transporte | Reduza o tamanho da mensagem |
 | Frame incompleto | A mensagem não foi transmitida integralmente | Confira o tamanho declarado e o envio dos bytes |
@@ -941,7 +985,7 @@ A implementação atual possui as seguintes limitações:
 - **Sem TLS:** a comunicação não é criptografada.
 - **Sem isolamento por tenant:** clientes da mesma instância compartilham o armazenamento.
 - **Limite de frame:** payload máximo de 1 MiB.
-- **Sem timeout de inatividade independente:** não existe uma configuração específica para inatividade. Entretanto, o timeout de leitura também limita o tempo de espera pelo próximo frame; uma conexão sem novas solicitações poderá ser encerrada quando esse prazo expira.
+- **Sem timeout de inatividade independente:** não existe uma configuração específica para inatividade. O timeout de leitura também limita o tempo de espera pelo próximo frame; uma conexão sem novas solicitações poderá ser encerrada quando esse prazo expira.
 - **Sem limite de requisições por conexão:** o limite de conexões TCP não representa uma cota de operações.
 - **Sem controle de taxa:** não existe limitação de requisições por cliente.
 - **Sem multiplexação:** o driver Go executa uma operação por vez em cada conexão.
@@ -950,17 +994,19 @@ A implementação atual possui as seguintes limitações:
 - **Sem retry automático:** comandos não são repetidos após falhas de comunicação. A aplicação consumidora controla novas tentativas.
 - **Idempotência limitada:** o mecanismo está disponível somente para SET e DELETE.
 - **Retenção de idempotência:** registros concluídos são mantidos por 24 horas por padrão, com possibilidade de configuração por variável de ambiente.
-- **Capacidade de idempotência:** a configuração padrão permite até 100.000 registros por instância, incluindo operações em andamento. O limite pode ser alterado por variável de ambiente.
+- **Capacidade de idempotência:** o perfil `mid` permite até 100.000 registros por instância, incluindo operações em andamento. O limite pode ser alterado por `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` (ou pelo alias legado `MEMORYDB_IDEMPOTENCY_CAPACITY`).
 - **Sem persistência da idempotência:** os registros são mantidos somente em memória e são perdidos quando o processo termina ou reinicia.
 - **Sem garantia após expiração:** depois da remoção de um registro expirado, o mesmo `OperationID` poderá ser tratado como uma nova operação.
 - **Sem garantia de execução exatamente uma vez:** a proteção contra duplicação é limitada à existência do registro na memória da instância.
 - **Resultado indeterminado:** uma interrupção durante a comunicação pode impedir que o cliente saiba se o comando foi executado.
-- **Sem API pública de configuração do Executor:** os parâmetros de idempotência são configurados no servidor, não pelo driver.
+- **Sem API pública de configuração do Executor no driver:** os parâmetros de idempotência são configurados no startup do servidor por meio do pacote `server/resources` e variáveis de ambiente.
 - **Sem configuração automática por ambiente no driver:** a biblioteca recebe endereço e timeout explicitamente. A aplicação consumidora é responsável por obter e fornecer esses valores.
 - **Sem interface HTTP ou REST:** o protocolo disponível é TCP com framing e Protobuf.
 - **Sem driver Java implementado e validado nesta etapa:** a integração Java não faz parte do escopo funcional atual.
 
-Os timeouts de leitura e escrita e o limite de conexões TCP são mecanismos implementados. Eles reduzem alguns riscos operacionais, mas não substituem controles de inatividade, taxa de requisições ou isolamento por cliente.
+Os timeouts de leitura e escrita, os limites de conexões e requisições em processamento e os orçamentos lógicos por componente são mecanismos implementados. Eles reduzem alguns riscos operacionais, mas não substituem controles de taxa por cliente, isolamento por cliente ou limites rígidos de CPU e memória do processo.
+
+A configuração `ProcessMemoryBudget` não limita diretamente o heap ou RSS. `Runtime.MemoryBudget` ainda não é aplicado por `GOMEMLIMIT`, e a capacidade de CPU não configura `GOMAXPROCS` nem afinidade de CPU.
 
 O encerramento forçado fecha as conexões TCP ainda ativas quando o contexto expira e aguarda a conclusão dos handlers. Esse mecanismo não representa cancelamento genérico de operações que eventualmente venham a ser executadas fora do I/O TCP.
 
@@ -1036,7 +1082,7 @@ Operações em andamento não expiram enquanto estiverem sendo executadas.
 
 ### Existe limite de OperationIDs?
 
-Sim. A capacidade padrão é de 100.000 registros por instância, incluindo operações em andamento. O limite pode ser alterado por `MEMORYDB_IDEMPOTENCY_CAPACITY`.
+Sim. No perfil `mid`, a capacidade é de 100.000 registros por instância, incluindo operações em andamento. O limite pode ser alterado por `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES`; `MEMORYDB_IDEMPOTENCY_CAPACITY` permanece como alias legado.
 
 Quando a capacidade está esgotada, novas operações são rejeitadas até que haja espaço disponível. O identificador rejeitado não é reservado.
 
@@ -1123,13 +1169,34 @@ As variáveis são independentes. Quando o servidor utilizar um endereço difere
 | Timeout de shutdown | `MEMORYDB_SHUTDOWN_TIMEOUT` | `10s` |
 | Timeout de leitura do servidor | `MEMORYDB_READ_TIMEOUT` | `30s` |
 | Timeout de escrita do servidor | `MEMORYDB_WRITE_TIMEOUT` | `10s` |
-| Máximo de conexões simultâneas | `MEMORYDB_MAX_CONNECTIONS` | `1024` |
+| Perfil de recursos | `MEMORYDB_RESOURCE_PROFILE` | `mid` |
+| Orçamento de memória do processo (`mid`) | `MEMORYDB_RESOURCE_MEMORY` | 1 GiB no preset; variável não definida, obrigatória apenas em `custom` |
+| Capacidade de CPU (`mid`) | `MEMORYDB_RESOURCE_CPU` | 2.000m no preset; variável não definida, obrigatória apenas em `custom` |
+| Máximo de conexões (`mid`) | `MEMORYDB_MAX_CONNECTIONS` | `1024` |
+| Máximo de requisições em processamento (`mid`) | `MEMORYDB_MAX_IN_FLIGHT_REQUESTS` | `256` |
+| Payload máximo do frame (`mid`) | `MEMORYDB_MAX_FRAME_PAYLOAD_SIZE` | `256KiB` |
+| Máximo de registros de idempotência (`mid`) | `MEMORYDB_IDEMPOTENCY_MAX_ENTRIES` | `100000` |
 | Retenção de idempotência | `MEMORYDB_IDEMPOTENCY_RETENTION` | `24h` |
-| Capacidade de idempotência | `MEMORYDB_IDEMPOTENCY_CAPACITY` | `100000` |
 
 Variáveis ausentes ou vazias utilizam seus respectivos padrões. Valores explicitamente informados, mas inválidos, provocam erro de configuração.
 
 Para executar os testes automatizados, também é necessário ter Bash disponível no ambiente.
+
+### Quais são os perfis de recursos disponíveis?
+
+`low`, `mid` e `high` são presets fixos; `auto` calcula os limites com base nos recursos detectados; `custom` recebe CPU e orçamento de memória explicitamente. O perfil padrão é `mid`. Consulte o [guia de recursos](../tecnica/RECURSOS.md).
+
+### O orçamento de memória limita o RSS do processo?
+
+Não. `ProcessMemoryBudget` é um orçamento lógico dividido entre Storage, Idempotência, Processamento e Runtime. Alguns componentes aplicam contabilização lógica; a parcela Runtime não é aplicada por `GOMEMLIMIT`, e o orçamento não é um hard limit de heap ou RSS.
+
+### O MemoryDB detecta limites de containers?
+
+No Linux, a detecção considera limites aplicáveis de cgroups v1 e v2, incluindo hierarquia de ancestrais. No Windows, a implementação atual consulta os recursos do host, mas não detecta limites de Windows Job Objects.
+
+### A capacidade de CPU configurada limita o uso de CPU?
+
+Não. A capacidade é usada para dimensionamento e validação. Ela não altera `GOMAXPROCS` nem configura afinidade ou quota de CPU no sistema operacional.
 
 ## 14. Executar testes e validar o projeto
 
