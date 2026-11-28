@@ -2,20 +2,30 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/pescador95/memorydb/server/internal/codec/protobuf"
 	serverconfig "github.com/pescador95/memorydb/server/internal/config"
 	"github.com/pescador95/memorydb/server/internal/engine"
+	"github.com/pescador95/memorydb/server/internal/health"
 	"github.com/pescador95/memorydb/server/internal/idempotency"
 	"github.com/pescador95/memorydb/server/internal/transport/tcp"
 	memorystorage "github.com/pescador95/memorydb/storage/go"
 )
+
+var errServerStoppedUnexpectedly = errors.New("server stopped unexpectedly")
+
+type serveResult struct {
+	name string
+	err  error
+}
 
 // main inicia a aplicação MemoryDB.
 func main() {
@@ -24,7 +34,7 @@ func main() {
 	}
 }
 
-// run configura as dependências e inicia o servidor.
+// run configura as dependências e inicia os servidores.
 func run() error {
 	return runWith(
 		serverconfig.Load,
@@ -33,7 +43,8 @@ func run() error {
 	)
 }
 
-// runWith inicializa o servidor usando dependências externas injetáveis.
+// runWith inicializa os servidores TCP e HTTP usando dependências externas
+// injetáveis.
 func runWith(
 	loadConfig func() (serverconfig.Config, error),
 	listen func(network, address string) (net.Listener, error),
@@ -99,24 +110,50 @@ func runWith(
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("create handler: %w", err)
+		return fmt.Errorf("create TCP handler: %w", err)
 	}
 
-	listener, err := listen("tcp", config.Address)
+	tcpListener, err := listen("tcp", config.Address)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", config.Address, err)
+		return fmt.Errorf("listen on TCP address %s: %w", config.Address, err)
 	}
-	defer listener.Close()
 
-	server, err := tcp.NewServerWithConfig(
-		listener,
+	healthListener, err := listen("tcp", config.HealthAddress)
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf("listen on health address %s: %w", config.HealthAddress, err),
+			closeListeners(tcpListener),
+		)
+	}
+
+	tcpServer, err := tcp.NewServerWithConfig(
+		tcpListener,
 		handler,
 		tcp.ServerConfig{
 			MaxConnections: config.Resources.Network.MaxConnections,
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("create server: %w", err)
+		return errors.Join(
+			fmt.Errorf("create TCP server: %w", err),
+			closeListeners(tcpListener, healthListener),
+		)
+	}
+
+	healthHandler, err := health.NewHandler(tcpServer.Ready)
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf("create health handler: %w", err),
+			closeListeners(tcpListener, healthListener),
+		)
+	}
+
+	healthServer, err := health.NewServer(healthListener, healthHandler)
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf("create health server: %w", err),
+			closeListeners(tcpListener, healthListener),
+		)
 	}
 
 	ctx, stop := notifyContext(
@@ -126,41 +163,166 @@ func runWith(
 	)
 	defer stop()
 
-	serveResult := make(chan error, 1)
+	serveResults := make(chan serveResult, 2)
 
 	go func() {
-		serveResult <- server.Serve()
+		serveResults <- serveResult{
+			name: "TCP",
+			err:  tcpServer.Serve(),
+		}
 	}()
 
-	log.Printf("MemoryDB listening on %s", listener.Addr())
+	go func() {
+		serveResults <- serveResult{
+			name: "health HTTP",
+			err:  healthServer.Serve(),
+		}
+	}()
+
+	log.Printf("MemoryDB TCP listening on %s", tcpListener.Addr())
+	log.Printf("MemoryDB health HTTP listening on %s", healthListener.Addr())
 
 	select {
-	case err := <-serveResult:
-		if err != nil {
-			return fmt.Errorf("serve: %w", err)
-		}
-		return nil
+	case result := <-serveResults:
+		serveErr := unexpectedServeError(result)
+
+		shutdownErr := shutdownServers(
+			tcpServer,
+			healthServer,
+			config.ShutdownTimeout,
+		)
+
+		remainingErrors := collectServeErrors(serveResults, 1)
+
+		return errors.Join(
+			serveErr,
+			wrapShutdownError(shutdownErr),
+			errors.Join(remainingErrors...),
+		)
 
 	case <-ctx.Done():
 		log.Println("Shutdown signal received")
 
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(),
+		shutdownErr := shutdownServers(
+			tcpServer,
+			healthServer,
 			config.ShutdownTimeout,
 		)
-		defer cancel()
 
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("shutdown server: %w", err)
+		serveErrors := collectServeErrors(serveResults, 2)
+
+		if shutdownErr == nil && len(serveErrors) == 0 {
+			log.Println("MemoryDB stopped")
+			return nil
 		}
 
-		if err := <-serveResult; err != nil {
-			return fmt.Errorf("stop server: %w", err)
-		}
+		return errors.Join(
+			wrapShutdownError(shutdownErr),
+			errors.Join(serveErrors...),
+		)
+	}
+}
 
-		log.Println("MemoryDB stopped")
+// shutdownServers encerra os servidores usando um único prazo global.
+//
+// O servidor TCP é encerrado primeiro para interromper a aceitação de novas
+// conexões e permitir que o readiness indique indisponibilidade enquanto
+// o servidor HTTP permanece ativo durante a drenagem.
+//
+// Se o encerramento HTTP falhar, Close força o fechamento das conexões.
+func shutdownServers(
+	tcpServer *tcp.Server,
+	healthServer *health.Server,
+	timeout time.Duration,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var shutdownErrors []error
+
+	if err := tcpServer.Shutdown(ctx); err != nil {
+		shutdownErrors = append(
+			shutdownErrors,
+			fmt.Errorf("shutdown TCP server: %w", err),
+		)
+	}
+
+	if err := healthServer.Shutdown(ctx); err != nil {
+		shutdownErrors = append(
+			shutdownErrors,
+			fmt.Errorf("shutdown health server: %w", err),
+		)
+
+		if closeErr := healthServer.Close(); closeErr != nil {
+			shutdownErrors = append(
+				shutdownErrors,
+				fmt.Errorf("force close health server: %w", closeErr),
+			)
+		}
+	}
+
+	return errors.Join(shutdownErrors...)
+}
+
+// unexpectedServeError converte o retorno de Serve em erro quando o servidor
+// termina antes de um encerramento solicitado.
+func unexpectedServeError(result serveResult) error {
+	if result.err == nil {
+		return fmt.Errorf(
+			"%s serve: %w",
+			result.name,
+			errServerStoppedUnexpectedly,
+		)
+	}
+
+	return fmt.Errorf("%s serve: %w", result.name, result.err)
+}
+
+// collectServeErrors aguarda a quantidade indicada de resultados e preserva
+// erros inesperados de encerramento.
+func collectServeErrors(
+	results <-chan serveResult,
+	count int,
+) []error {
+	var serveErrors []error
+
+	for range count {
+		result := <-results
+		if result.err != nil {
+			serveErrors = append(
+				serveErrors,
+				fmt.Errorf("%s serve: %w", result.name, result.err),
+			)
+		}
+	}
+
+	return serveErrors
+}
+
+// wrapShutdownError adiciona contexto ao erro de encerramento.
+func wrapShutdownError(err error) error {
+	if err == nil {
 		return nil
 	}
+
+	return fmt.Errorf("shutdown servers: %w", err)
+}
+
+// closeListeners fecha todos os listeners recebidos e preserva os erros.
+func closeListeners(listeners ...net.Listener) error {
+	var closeErrors []error
+
+	for _, listener := range listeners {
+		if err := listener.Close(); err != nil &&
+			!errors.Is(err, net.ErrClosed) {
+			closeErrors = append(
+				closeErrors,
+				fmt.Errorf("close listener %s: %w", listener.Addr(), err),
+			)
+		}
+	}
+
+	return errors.Join(closeErrors...)
 }
 
 // resourceEntriesToInt converte um limite de entradas para int,

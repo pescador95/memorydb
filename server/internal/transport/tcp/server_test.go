@@ -511,13 +511,7 @@ func TestServerShutdownForceClosesIdleConnections(t *testing.T) {
 		t.Fatal("Serve() did not terminate after forced shutdown")
 	}
 
-	server.mu.Lock()
-	remainingConnections := len(server.activeConns)
-	server.mu.Unlock()
-
-	if remainingConnections != 0 {
-		t.Errorf("active connections = %d, want 0", remainingConnections)
-	}
+	waitForActiveConnections(t, server, 0)
 }
 
 func TestNewServerUsesDefaultMaxConnections(t *testing.T) {

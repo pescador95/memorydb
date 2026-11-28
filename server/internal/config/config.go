@@ -13,7 +13,9 @@ const (
 	envShutdownTimeout = "MEMORYDB_SHUTDOWN_TIMEOUT"
 	envReadTimeout     = "MEMORYDB_READ_TIMEOUT"
 	envWriteTimeout    = "MEMORYDB_WRITE_TIMEOUT"
+	envHealthAddress   = "MEMORYDB_HEALTH_ADDR"
 
+	defaultHealthAddress   = ":8081"
 	defaultShutdownTimeout = 10 * time.Second
 )
 
@@ -27,8 +29,8 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
-
-	Resources resources.ResourceConfig
+	HealthAddress   string
+	Resources       resources.ResourceConfig
 }
 
 // Load carrega as configurações operacionais e detecta os recursos
@@ -62,6 +64,11 @@ func loadWithResourceConfig(
 		sharedconfig.DefaultServerAddress,
 	)
 
+	healthAddress := environmentValue(
+		envHealthAddress,
+		defaultHealthAddress,
+	)
+
 	shutdownTimeout, err := loadDuration(
 		envShutdownTimeout,
 		defaultShutdownTimeout,
@@ -91,6 +98,7 @@ func loadWithResourceConfig(
 		ShutdownTimeout: shutdownTimeout,
 		ReadTimeout:     readTimeout,
 		WriteTimeout:    writeTimeout,
+		HealthAddress:   healthAddress,
 		Resources:       resourceConfig,
 	}, nil
 }

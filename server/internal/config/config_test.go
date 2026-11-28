@@ -16,6 +16,7 @@ func setDefaultEnvironment(t *testing.T) {
 	t.Setenv(envShutdownTimeout, "")
 	t.Setenv(envReadTimeout, "")
 	t.Setenv(envWriteTimeout, "")
+	t.Setenv(envHealthAddress, "")
 }
 
 func validResourceConfig() resources.ResourceConfig {
@@ -74,6 +75,14 @@ func TestLoadAppliesDefaultConfig(t *testing.T) {
 			"Address = %q, want %q",
 			got.Address,
 			sharedconfig.DefaultServerAddress,
+		)
+	}
+
+	if got.HealthAddress != defaultHealthAddress {
+		t.Errorf(
+			"HealthAddress = %q, want %q",
+			got.HealthAddress,
+			defaultHealthAddress,
 		)
 	}
 
@@ -146,6 +155,7 @@ func TestLoadUsesEnvironmentConfig(t *testing.T) {
 	setDefaultEnvironment(t)
 
 	t.Setenv(sharedconfig.EnvServerAddress, "0.0.0.0:6381")
+	t.Setenv(envHealthAddress, "127.0.0.1:8082")
 	t.Setenv(envShutdownTimeout, "15s")
 	t.Setenv(envReadTimeout, "45s")
 	t.Setenv(envWriteTimeout, "20s")
@@ -157,6 +167,14 @@ func TestLoadUsesEnvironmentConfig(t *testing.T) {
 
 	if got.Address != "0.0.0.0:6381" {
 		t.Errorf("Address = %q, want %q", got.Address, "0.0.0.0:6381")
+	}
+
+	if got.HealthAddress != "127.0.0.1:8082" {
+		t.Errorf(
+			"HealthAddress = %q, want %q",
+			got.HealthAddress,
+			"127.0.0.1:8082",
+		)
 	}
 
 	if got.ShutdownTimeout != 15*time.Second {

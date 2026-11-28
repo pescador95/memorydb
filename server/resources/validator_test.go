@@ -136,6 +136,21 @@ func TestResourceConfigValidateRejectsInvalidConfigurations(t *testing.T) {
 				c.Storage.MaxValueSize = c.Network.MaxFramePayloadSize + 1
 			},
 		},
+		{
+			name: "processing budget cannot accommodate one maximum-sized frame",
+			mutate: func(c *ResourceConfig) {
+				setProcessingMemoryBudget(
+					c,
+					3*c.Network.MaxFramePayloadSize-1,
+				)
+			},
+		},
+		{
+			name: "processing budget validation avoids multiplication overflow",
+			mutate: func(c *ResourceConfig) {
+				c.Network.MaxFramePayloadSize = math.MaxInt64 / 2
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -149,4 +164,57 @@ func TestResourceConfigValidateRejectsInvalidConfigurations(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResourceConfigValidateAcceptsProcessingBudgetForOneMaximumFrame(t *testing.T) {
+	tests := []struct {
+		name                   string
+		processingMemoryBudget int64
+		maxInFlightRequests    int
+	}{
+		{
+			name:                   "exact minimum budget",
+			processingMemoryBudget: 3 * 1024,
+			maxInFlightRequests:    1,
+		},
+		{
+			name:                   "budget above minimum",
+			processingMemoryBudget: 4 * 1024,
+			maxInFlightRequests:    1,
+		},
+		{
+			name:                   "in-flight limit exceeds maximum-sized frame concurrency",
+			processingMemoryBudget: 3 * 1024,
+			maxInFlightRequests:    1024,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := defaultResourceProfiles[ResourceProfileMid]
+
+			config.Network.MaxFramePayloadSize = 1024
+			config.Network.MaxInFlightRequests = tt.maxInFlightRequests
+			config.Storage.MaxKeySize = 512
+			config.Storage.MaxValueSize = 512
+
+			setProcessingMemoryBudget(
+				&config,
+				tt.processingMemoryBudget,
+			)
+
+			if err := config.Validate(); err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+		})
+	}
+}
+
+// setProcessingMemoryBudget adjusts the runtime budget to preserve
+// the total process memory budget.
+func setProcessingMemoryBudget(config *ResourceConfig, budget int64) {
+	difference := config.Processing.MemoryBudget - budget
+
+	config.Processing.MemoryBudget = budget
+	config.Runtime.MemoryBudget += difference
 }

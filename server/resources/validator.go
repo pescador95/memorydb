@@ -98,6 +98,17 @@ func (c ResourceConfig) Validate() error {
 		)
 	}
 
+	// A reserva atual do Handler considera o frame recebido e dois
+	// payloads adicionais para processamento e resposta.
+	//
+	// A divisão evita overflow que poderia ocorrer ao multiplicar
+	// MaxFramePayloadSize por três.
+	if c.Network.MaxFramePayloadSize > c.Processing.MemoryBudget/3 {
+		return invalidConfig(
+			"processing memory budget must accommodate at least one maximum-sized frame",
+		)
+	}
+
 	return nil
 }
 

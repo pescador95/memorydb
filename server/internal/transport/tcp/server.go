@@ -13,6 +13,21 @@ import (
 var (
 	// ErrServerAlreadyServing indica que o servidor já está em execução.
 	ErrServerAlreadyServing = errors.New("server is already serving")
+
+	// ErrServerNotRestartable indica que o servidor já iniciou seu ciclo de vida
+	// e não pode ser iniciado novamente.
+	ErrServerNotRestartable = errors.New("server cannot be restarted")
+)
+
+// ServerState representa o estado do ciclo de vida do servidor TCP.
+type ServerState uint8
+
+const (
+	ServerStateStarting ServerState = iota
+	ServerStateRunning
+	ServerStateStopping
+	ServerStateStopped
+	ServerStateFailed
 )
 
 // Server aceita conexões TCP e delega seu processamento ao Handler.
@@ -20,12 +35,16 @@ type Server struct {
 	listener net.Listener
 	handler  *Handler
 
-	mu             sync.Mutex
-	serving        bool
-	shuttingDown   bool
-	activeConns    map[net.Conn]struct{}
-	connections    sync.WaitGroup
-	maxConnections int
+	mu              sync.Mutex
+	state           ServerState
+	serving         bool
+	serveStarted    bool
+	shuttingDown    bool
+	activeConns     map[net.Conn]struct{}
+	connections     sync.WaitGroup
+	connectionsDone chan struct{}
+	waitOnce        sync.Once
+	maxConnections  int
 }
 
 // ServerConfig define os limites operacionais do servidor TCP.
@@ -57,30 +76,82 @@ func NewServerWithConfig(
 	}
 
 	return &Server{
-		listener:       listener,
-		handler:        handler,
-		maxConnections: config.MaxConnections,
-		activeConns:    make(map[net.Conn]struct{}),
+		listener:        listener,
+		handler:         handler,
+		state:           ServerStateStarting,
+		maxConnections:  config.MaxConnections,
+		activeConns:     make(map[net.Conn]struct{}),
+		connectionsDone: make(chan struct{}),
 	}, nil
 }
 
-// Serve aceita conexões e inicia uma goroutine para cada cliente.
-func (s *Server) Serve() error {
+// State retorna o estado atual do ciclo de vida do servidor.
+func (s *Server) State() ServerState {
 	s.mu.Lock()
-	if s.shuttingDown {
-		s.mu.Unlock()
-		return nil
+	defer s.mu.Unlock()
+
+	return s.state
+}
+
+// Ready indica se o servidor está em execução e aceitando conexões.
+func (s *Server) Ready() bool {
+	return s.State() == ServerStateRunning
+}
+
+// updateStoppedLocked atualiza o estado para STOPPED quando não há mais
+// loop de aceitação nem conexões ativas.
+// O chamador deve manter s.mu bloqueado.
+func (s *Server) updateStoppedLocked() {
+	if s.shuttingDown &&
+		!s.serving &&
+		len(s.activeConns) == 0 &&
+		s.state != ServerStateFailed {
+		s.state = ServerStateStopped
 	}
-	if s.serving {
+}
+
+// Serve aceita conexões e inicia uma goroutine para cada cliente.
+func (s *Server) Serve() (serveErr error) {
+	s.mu.Lock()
+
+	switch s.state {
+	case ServerStateStarting:
+		s.serving = true
+		s.serveStarted = true
+		s.state = ServerStateRunning
+
+	case ServerStateRunning:
 		s.mu.Unlock()
 		return ErrServerAlreadyServing
+
+	case ServerStateStopped:
+		// Preserva o comportamento anterior quando Shutdown é chamado
+		// antes da primeira execução de Serve.
+		if s.shuttingDown && !s.serveStarted {
+			s.mu.Unlock()
+			return nil
+		}
+
+		s.mu.Unlock()
+		return ErrServerNotRestartable
+
+	case ServerStateStopping, ServerStateFailed:
+		s.mu.Unlock()
+		return ErrServerNotRestartable
 	}
-	s.serving = true
+
 	s.mu.Unlock()
 
 	defer func() {
 		s.mu.Lock()
 		s.serving = false
+
+		if serveErr != nil {
+			s.state = ServerStateFailed
+		} else {
+			s.updateStoppedLocked()
+		}
+
 		s.mu.Unlock()
 	}()
 
@@ -99,6 +170,7 @@ func (s *Server) Serve() error {
 		}
 
 		s.mu.Lock()
+
 		if s.shuttingDown {
 			s.mu.Unlock()
 			_ = conn.Close()
@@ -113,13 +185,13 @@ func (s *Server) Serve() error {
 
 		s.activeConns[conn] = struct{}{}
 		s.connections.Add(1)
-
 		s.mu.Unlock()
 
 		go func(conn net.Conn) {
 			defer func() {
 				s.mu.Lock()
 				delete(s.activeConns, conn)
+				s.updateStoppedLocked()
 				s.mu.Unlock()
 
 				s.connections.Done()
@@ -131,7 +203,8 @@ func (s *Server) Serve() error {
 }
 
 // Shutdown interrompe a aceitação de conexões e aguarda as ativas terminarem.
-// Se o contexto expirar, fecha as conexões restantes e aguarda suas goroutines.
+// Se o contexto expirar, fecha as conexões restantes e retorna sem aguardar
+// indefinidamente o término de suas goroutines.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("shutdown context cannot be nil")
@@ -139,6 +212,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	s.mu.Lock()
 	s.shuttingDown = true
+
+	if s.state == ServerStateStarting || s.state == ServerStateRunning {
+		s.state = ServerStateStopping
+	}
 	s.mu.Unlock()
 
 	closeErr := s.listener.Close()
@@ -148,15 +225,27 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		closeErr = nil
 	}
 
-	done := make(chan struct{})
+	if closeErr == nil {
+		s.mu.Lock()
+		s.updateStoppedLocked()
+		s.mu.Unlock()
+	}
 
-	go func() {
-		s.connections.Wait()
-		close(done)
-	}()
+	// O encerramento impede novos Add() no WaitGroup. Portanto, a espera
+	// pode ser iniciada com segurança depois de marcar shuttingDown.
+	s.waitOnce.Do(func() {
+		go func() {
+			s.connections.Wait()
+			close(s.connectionsDone)
+		}()
+	})
 
 	select {
-	case <-done:
+	case <-s.connectionsDone:
+		s.mu.Lock()
+		s.updateStoppedLocked()
+		s.mu.Unlock()
+
 		return closeErr
 
 	case <-ctx.Done():
@@ -171,10 +260,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			_ = conn.Close()
 		}
 
-		// O fechamento das conexões deve desbloquear as operações de I/O.
-		// Aguardamos as goroutines para não retornar com processamento pendente.
-		<-done
-
+		// O fechamento interrompe operações de I/O, mas não garante
+		// o término de processamento interno não cancelável.
+		// O estado permanece STOPPING até o encerramento efetivo.
 		return errors.Join(closeErr, ctx.Err())
 	}
 }
