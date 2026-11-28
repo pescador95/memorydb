@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: memorydb-config
+data:
+  MEMORYDB_ADDR: ":6380"
+  MEMORYDB_HEALTH_ADDR: ":8081"
+
+  MEMORYDB_RESOURCE_PROFILE: "mid"
+
+  MEMORYDB_READ_TIMEOUT: "30s"
+  MEMORYDB_WRITE_TIMEOUT: "10s"
+  MEMORYDB_SHUTDOWN_TIMEOUT: "10s"
