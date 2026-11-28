@@ -1,0 +1,23 @@
+name: memorydb
+
+services:
+  memorydb:
+    image: memorydb:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "6380:6380"
+      - "8081:8081"
+    networks:
+      - memorydb-network
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  memorydb-network:
+    driver: bridge

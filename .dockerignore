@@ -1,0 +1,17 @@
+.git
+.github
+.vscode
+.idea
+
+
+docs/
+*.pdf
+
+**/bin/
+**/dist/
+**/coverage/
+**/coverage.out
+**/.test
+**/.prof
+**/*.log
+**/tmp/
